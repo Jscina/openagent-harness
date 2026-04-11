@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-6";
 
 pub struct AppState {
     pub dag: Mutex<DagState>,
@@ -108,13 +108,24 @@ impl AppState {
                     }
                 };
 
-                let mut dag = self.dag.lock().await;
-                if let Some(node) = dag.nodes.get_mut(&task_id) {
-                    if matches!(node.task.status, TaskStatus::Running) {
+                {
+                    let mut dag = self.dag.lock().await;
+                    if let Some(node) = dag.nodes.get_mut(&task_id)
+                        && matches!(node.task.status, TaskStatus::Running)
+                    {
                         node.task.status = TaskStatus::Done;
                         node.task.updated_at = Utc::now();
                         tracing::info!(%task_id, "task done");
                     }
+                }
+
+                self.session_to_task.remove(&event.session_id);
+                if let Err(e) = self.acp.delete_session(&event.session_id).await {
+                    tracing::warn!(
+                        session_id = %event.session_id,
+                        error = %e,
+                        "failed to delete ACP session on completion"
+                    );
                 }
             }
 
@@ -131,22 +142,60 @@ impl AppState {
                     .unwrap_or("unknown error")
                     .to_string();
 
-                let mut dag = self.dag.lock().await;
-                if let Some(node) = dag.nodes.get_mut(&task_id) {
-                    if matches!(node.task.status, TaskStatus::Running) {
+                {
+                    let mut dag = self.dag.lock().await;
+                    if let Some(node) = dag.nodes.get_mut(&task_id)
+                        && matches!(node.task.status, TaskStatus::Running)
+                    {
                         node.task.status = TaskStatus::Failed(error_msg);
                         node.task.updated_at = Utc::now();
                         tracing::error!(%task_id, "task failed via session.error");
                     }
                 }
+
+                self.session_to_task.remove(&event.session_id);
+                if let Err(e) = self.acp.delete_session(&event.session_id).await {
+                    tracing::warn!(
+                        session_id = %event.session_id,
+                        error = %e,
+                        "failed to delete ACP session on error"
+                    );
+                }
             }
 
-            "tool.execute.before" | "tool.execute.after" => {
+            "tool.execute.before" => {
                 tracing::debug!(
-                    event_type = %event.event_type,
                     session_id = %event.session_id,
-                    "tool event"
+                    "tool.execute.before"
                 );
+            }
+
+            "tool.execute.after" => {
+                let task_id = match self.session_to_task.get(&event.session_id) {
+                    Some(entry) => *entry,
+                    None => {
+                        tracing::debug!(
+                            session_id = %event.session_id,
+                            "tool.execute.after for untracked session"
+                        );
+                        return;
+                    }
+                };
+
+                let result = match event.payload.get("result").and_then(|v| v.as_str()) {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => return,
+                };
+
+                let mut dag = self.dag.lock().await;
+                if let Some(node) = dag.nodes.get_mut(&task_id) {
+                    let output = node.task.output.get_or_insert_with(String::new);
+                    if !output.is_empty() {
+                        output.push('\n');
+                    }
+                    output.push_str(&result);
+                    node.task.updated_at = Utc::now();
+                }
             }
 
             other => {
@@ -200,12 +249,7 @@ pub async fn tick(state: &Arc<AppState>) {
     }
 }
 
-async fn execute_task(
-    state: &AppState,
-    task_id: Uuid,
-    prompt: &str,
-    model: &str,
-) -> Result<()> {
+async fn execute_task(state: &AppState, task_id: Uuid, prompt: &str, model: &str) -> Result<()> {
     let session_id = state.acp.create_session().await?;
     tracing::info!(%task_id, %session_id, "ACP session created");
 
@@ -252,10 +296,7 @@ mod tests {
     use crate::types::CreateTaskRequest;
 
     fn make_state() -> AppState {
-        AppState::new(AcpClient::new(
-            "http://localhost:1".to_string(),
-            None,
-        ))
+        AppState::new(AcpClient::new("http://localhost:1".to_string(), None))
     }
 
     #[tokio::test]
@@ -358,6 +399,184 @@ mod tests {
             payload: serde_json::Value::Null,
         };
         state.process_event(&event).await;
+    }
+
+    #[tokio::test]
+    async fn session_idle_cleans_up_session_mapping() {
+        let state = make_state();
+        let id = state
+            .add_task(CreateTaskRequest {
+                prompt: "p".to_string(),
+                model: None,
+                depends_on: None,
+            })
+            .await;
+
+        {
+            let mut dag = state.dag.lock().await;
+            let node = dag.nodes.get_mut(&id).unwrap();
+            node.task.status = TaskStatus::Running;
+            node.task.session_id = Some("ses_cleanup".to_string());
+        }
+        state.session_to_task.insert("ses_cleanup".to_string(), id);
+
+        let event = PluginEvent {
+            event_type: "session.idle".to_string(),
+            session_id: "ses_cleanup".to_string(),
+            payload: serde_json::Value::Null,
+        };
+        state.process_event(&event).await;
+
+        assert!(!state.session_to_task.contains_key("ses_cleanup"));
+        assert_eq!(state.get_task(id).await.unwrap().status, TaskStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn session_error_cleans_up_session_mapping() {
+        let state = make_state();
+        let id = state
+            .add_task(CreateTaskRequest {
+                prompt: "p".to_string(),
+                model: None,
+                depends_on: None,
+            })
+            .await;
+
+        {
+            let mut dag = state.dag.lock().await;
+            let node = dag.nodes.get_mut(&id).unwrap();
+            node.task.status = TaskStatus::Running;
+            node.task.session_id = Some("ses_err2".to_string());
+        }
+        state.session_to_task.insert("ses_err2".to_string(), id);
+
+        let event = PluginEvent {
+            event_type: "session.error".to_string(),
+            session_id: "ses_err2".to_string(),
+            payload: serde_json::json!({"error": "timeout"}),
+        };
+        state.process_event(&event).await;
+
+        assert!(!state.session_to_task.contains_key("ses_err2"));
+        assert_eq!(
+            state.get_task(id).await.unwrap().status,
+            TaskStatus::Failed("timeout".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_after_appends_to_task_output() {
+        let state = make_state();
+        let id = state
+            .add_task(CreateTaskRequest {
+                prompt: "p".to_string(),
+                model: None,
+                depends_on: None,
+            })
+            .await;
+
+        {
+            let mut dag = state.dag.lock().await;
+            let node = dag.nodes.get_mut(&id).unwrap();
+            node.task.status = TaskStatus::Running;
+            node.task.session_id = Some("ses_tool".to_string());
+        }
+        state.session_to_task.insert("ses_tool".to_string(), id);
+
+        let ev1 = PluginEvent {
+            event_type: "tool.execute.after".to_string(),
+            session_id: "ses_tool".to_string(),
+            payload: serde_json::json!({"result": "line one"}),
+        };
+        state.process_event(&ev1).await;
+
+        let ev2 = PluginEvent {
+            event_type: "tool.execute.after".to_string(),
+            session_id: "ses_tool".to_string(),
+            payload: serde_json::json!({"result": "line two"}),
+        };
+        state.process_event(&ev2).await;
+
+        let task = state.get_task(id).await.unwrap();
+        assert_eq!(task.output, Some("line one\nline two".to_string()));
+    }
+
+    #[tokio::test]
+    async fn tool_after_ignores_empty_result() {
+        let state = make_state();
+        let id = state
+            .add_task(CreateTaskRequest {
+                prompt: "p".to_string(),
+                model: None,
+                depends_on: None,
+            })
+            .await;
+
+        {
+            let mut dag = state.dag.lock().await;
+            let node = dag.nodes.get_mut(&id).unwrap();
+            node.task.status = TaskStatus::Running;
+            node.task.session_id = Some("ses_empty".to_string());
+        }
+        state.session_to_task.insert("ses_empty".to_string(), id);
+
+        let ev = PluginEvent {
+            event_type: "tool.execute.after".to_string(),
+            session_id: "ses_empty".to_string(),
+            payload: serde_json::json!({"result": ""}),
+        };
+        state.process_event(&ev).await;
+
+        assert!(state.get_task(id).await.unwrap().output.is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_after_for_unknown_session_is_noop() {
+        let state = make_state();
+        let ev = PluginEvent {
+            event_type: "tool.execute.after".to_string(),
+            session_id: "ses_ghost".to_string(),
+            payload: serde_json::json!({"result": "data"}),
+        };
+        state.process_event(&ev).await;
+    }
+
+    #[tokio::test]
+    async fn session_idle_preserves_accumulated_output() {
+        let state = make_state();
+        let id = state
+            .add_task(CreateTaskRequest {
+                prompt: "p".to_string(),
+                model: None,
+                depends_on: None,
+            })
+            .await;
+
+        {
+            let mut dag = state.dag.lock().await;
+            let node = dag.nodes.get_mut(&id).unwrap();
+            node.task.status = TaskStatus::Running;
+            node.task.session_id = Some("ses_snap".to_string());
+        }
+        state.session_to_task.insert("ses_snap".to_string(), id);
+
+        let tool_ev = PluginEvent {
+            event_type: "tool.execute.after".to_string(),
+            session_id: "ses_snap".to_string(),
+            payload: serde_json::json!({"result": "tool output"}),
+        };
+        state.process_event(&tool_ev).await;
+
+        let idle_ev = PluginEvent {
+            event_type: "session.idle".to_string(),
+            session_id: "ses_snap".to_string(),
+            payload: serde_json::Value::Null,
+        };
+        state.process_event(&idle_ev).await;
+
+        let task = state.get_task(id).await.unwrap();
+        assert_eq!(task.status, TaskStatus::Done);
+        assert_eq!(task.output, Some("tool output".to_string()));
     }
 
     #[tokio::test]
