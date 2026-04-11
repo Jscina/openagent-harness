@@ -1,0 +1,11 @@
+{
+  "name": "harness-plugin",
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "@opencode-ai/plugin": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0"
+  }
+}
