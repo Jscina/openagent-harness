@@ -28,20 +28,13 @@ plugin fires session.idle        →  marks task Done, deletes ACP session
 ## Quickstart
 
 ```sh
-# 1. Build and install
-cargo build --release
-cp target/release/openagent-harness ~/.local/bin/
+# 1. Install the harness, agents, and plugin
+curl -sSL https://raw.githubusercontent.com/Jscina/openagent-harness/main/install.sh | bash
 
-# 2. Install the bundled agent team
-openagent-harness install
+# 2. Add the binary to your PATH (the installer will warn you if needed)
+export PATH="$HOME/.local/bin:$PATH"
 
-# 3. Install plugin deps
-cd plugin && bun install && cd ..
-
-# 4. Register the plugin in opencode.json:
-#    { "plugins": ["./plugin/harness.ts"] }
-
-# 5. Start OpenCode — plugin auto-starts the harness
+# 3. Start OpenCode — plugin auto-starts the harness
 opencode
 ```
 
