@@ -6,7 +6,7 @@ Deterministic agent harness for [OpenCode](https://opencode.ai). Control flow li
 
 ```
 OpenCode loads plugin  →  plugin checks harness health
-                       →  if not running: spawns `cargo run`, waits for ready
+                       →  if not running: spawns `openagent-harness` (or `$HARNESS_BIN`), waits for ready
                        →  if already running: attaches
 
 POST /tasks  →  Rust schedules task  →  creates OpenCode session via ACP
@@ -20,13 +20,14 @@ plugin fires session.idle        →  Rust snapshots accumulated output
                                  →  starts next eligible task
 ```
 
-The TypeScript plugin (`plugin/harness.ts`) owns the harness process lifecycle — it spawns and destroys the Rust harness automatically. No manual `cargo run` needed.
+The TypeScript plugin (`plugin/harness.ts`) owns the harness process lifecycle — it spawns and destroys the Rust harness automatically. No manual execution needed.
 
 ## Quickstart
 
 ```sh
-# 1. Build the harness (plugin will start it on demand, but pre-building is faster)
-cargo build
+# 1. Build the harness and add it to your PATH
+cargo build --release
+cp target/release/openagent-harness ~/.local/bin/
 
 # 2. Install plugin deps
 cd plugin && bun install && cd ..

@@ -41,13 +41,14 @@ export default (async () => {
 
   if (!(await isHarnessRunning())) {
     console.log("[harness-plugin] harness not running, spawning...");
-    child = spawn("cargo", ["run"], {
+    const harnessBin = process.env.HARNESS_BIN ?? "openagent-harness";
+    child = spawn(harnessBin, [], {
       cwd: harnessRoot,
       stdio: "inherit",
     });
 
     child.on("error", (err) => {
-      console.error("[harness-plugin] failed to spawn harness:", err.message);
+      console.error(`[harness-plugin] failed to spawn harness (${harnessBin}):`, err.message);
     });
 
     const ready = await waitForHarness();
