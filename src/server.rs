@@ -1,6 +1,6 @@
 use crate::dag::{AgentNotFound, AppState};
 use crate::events::PluginEvent;
-use crate::types::{CreateTaskRequest, CreateTaskResponse};
+use crate::types::{CreateTaskRequest, CreateTaskResponse, SubmitWorkflowRequest, SubmitWorkflowResponse};
 
 use axum::{
     extract::{Json, Path, State},
@@ -48,11 +48,37 @@ where
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/events", post(handle_event))
+        .route("/workflows", post(submit_workflow))
+        .route("/workflows/{id}", get(get_workflow))
         .route("/tasks", post(create_task))
         .route("/tasks", get(list_tasks))
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}", delete(cancel_task))
         .with_state(state)
+}
+
+async fn submit_workflow(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SubmitWorkflowRequest>,
+) -> Result<(StatusCode, Json<SubmitWorkflowResponse>), AppError> {
+    let resp = state.submit_workflow(req).await.map_err(|e| {
+        if e.is::<AgentNotFound>() {
+            AppError::bad_request(e)
+        } else {
+            AppError::Internal(e)
+        }
+    })?;
+    Ok((StatusCode::CREATED, Json(resp)))
+}
+
+async fn get_workflow(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    match state.get_workflow(id).await {
+        Some(workflow) => Ok(Json(workflow).into_response()),
+        None => Ok(StatusCode::NOT_FOUND.into_response()),
+    }
 }
 
 async fn handle_event(
@@ -209,6 +235,85 @@ mod tests {
                 Request::builder()
                     .method(Method::GET)
                     .uri(format!("/tasks/{}", fake_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn post_workflows_empty_tasks_returns_500() {
+        let app = test_app();
+        let body = serde_json::json!({"tasks": []});
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/workflows")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn post_workflows_out_of_bounds_dep_returns_500() {
+        let app = test_app();
+        let body = serde_json::json!({
+            "tasks": [{"agent": "explorer", "prompt": "p", "depends_on": [5]}]
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/workflows")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn post_workflows_with_agent_unreachable_acp_returns_500() {
+        let app = test_app();
+        let body = serde_json::json!({
+            "tasks": [{"agent": "explorer", "prompt": "map it", "depends_on": []}]
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/workflows")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn get_workflow_not_found_returns_404() {
+        let app = test_app();
+        let fake_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/workflows/{}", fake_id))
                     .body(Body::empty())
                     .unwrap(),
             )

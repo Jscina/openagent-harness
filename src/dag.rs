@@ -1,6 +1,9 @@
 use crate::acp::AcpClient;
 use crate::events::PluginEvent;
-use crate::types::{CreateTaskRequest, Node, Task, TaskStatus};
+use crate::types::{
+    CreateTaskRequest, Node, SubmitWorkflowRequest, SubmitWorkflowResponse, Task, TaskStatus,
+    Workflow, WorkflowStatus,
+};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -32,6 +35,52 @@ pub struct AppState {
 
 pub struct DagState {
     pub nodes: HashMap<Uuid, Node>,
+    pub workflows: HashMap<Uuid, Workflow>,
+}
+
+impl DagState {
+    fn update_workflow_status(&mut self, task_id: Uuid) {
+        let workflow_id = match self.nodes.get(&task_id).and_then(|n| n.workflow_id) {
+            Some(id) => id,
+            None => return,
+        };
+
+        let task_ids: Vec<Uuid> = match self.workflows.get(&workflow_id) {
+            Some(w) if matches!(w.status, WorkflowStatus::Running) => w.tasks.clone(),
+            _ => return,
+        };
+
+        let mut all_terminal = true;
+        let mut first_failure: Option<(Uuid, String)> = None;
+
+        for tid in &task_ids {
+            match self.nodes.get(tid).map(|n| &n.task.status) {
+                Some(TaskStatus::Done) => {}
+                Some(TaskStatus::Failed(reason)) => {
+                    if first_failure.is_none() {
+                        first_failure = Some((*tid, reason.clone()));
+                    }
+                }
+                _ => {
+                    all_terminal = false;
+                }
+            }
+        }
+
+        if !all_terminal {
+            return;
+        }
+
+        let workflow = self.workflows.get_mut(&workflow_id).unwrap();
+        workflow.status = match first_failure {
+            Some((failed_task_id, reason)) => WorkflowStatus::Failed {
+                task_id: failed_task_id,
+                reason,
+            },
+            None => WorkflowStatus::Done,
+        };
+        workflow.updated_at = Utc::now();
+    }
 }
 
 impl AppState {
@@ -39,6 +88,7 @@ impl AppState {
         Self {
             dag: Mutex::new(DagState {
                 nodes: HashMap::new(),
+                workflows: HashMap::new(),
             }),
             session_to_task: DashMap::new(),
             acp,
@@ -68,6 +118,7 @@ impl AppState {
                 updated_at: now,
             },
             depends_on: req.depends_on.unwrap_or_default(),
+            workflow_id: None,
         };
 
         let mut dag = self.dag.lock().await;
@@ -76,9 +127,84 @@ impl AppState {
         Ok(id)
     }
 
+    pub async fn submit_workflow(
+        &self,
+        req: SubmitWorkflowRequest,
+    ) -> Result<SubmitWorkflowResponse> {
+        if req.tasks.is_empty() {
+            anyhow::bail!("workflow must have at least one task");
+        }
+
+        for (i, task) in req.tasks.iter().enumerate() {
+            for &dep_idx in &task.depends_on {
+                if dep_idx >= req.tasks.len() {
+                    anyhow::bail!(
+                        "task {} depends_on index {} is out of bounds (only {} tasks)",
+                        i,
+                        dep_idx,
+                        req.tasks.len()
+                    );
+                }
+            }
+        }
+
+        for task in &req.tasks {
+            if !self.acp.agent_exists(&task.agent).await? {
+                anyhow::bail!(AgentNotFound(task.agent.clone()));
+            }
+        }
+
+        let ids: Vec<Uuid> = req.tasks.iter().map(|_| Uuid::new_v4()).collect();
+        let workflow_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        let mut dag = self.dag.lock().await;
+
+        for (i, task) in req.tasks.iter().enumerate() {
+            let dep_ids: Vec<Uuid> = task.depends_on.iter().map(|&idx| ids[idx]).collect();
+            let node = Node {
+                id: ids[i],
+                task: Task {
+                    id: ids[i],
+                    prompt: task.prompt.clone(),
+                    model: task.model.clone().unwrap_or_default(),
+                    agent: Some(task.agent.clone()),
+                    session_id: None,
+                    status: TaskStatus::Pending,
+                    output: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                depends_on: dep_ids,
+                workflow_id: Some(workflow_id),
+            };
+            dag.nodes.insert(ids[i], node);
+        }
+
+        let workflow = Workflow {
+            id: workflow_id,
+            status: WorkflowStatus::Running,
+            tasks: ids.clone(),
+            created_at: now,
+            updated_at: now,
+        };
+        dag.workflows.insert(workflow_id, workflow);
+
+        tracing::info!(%workflow_id, tasks = ids.len(), "workflow submitted");
+        Ok(SubmitWorkflowResponse {
+            workflow_id,
+            task_ids: ids,
+        })
+    }
+
     pub async fn get_task(&self, id: Uuid) -> Option<Task> {
         let dag = self.dag.lock().await;
         dag.nodes.get(&id).map(|n| n.task.clone())
+    }
+
+    pub async fn get_workflow(&self, id: Uuid) -> Option<Workflow> {
+        let dag = self.dag.lock().await;
+        dag.workflows.get(&id).cloned()
     }
 
     pub async fn list_tasks(&self) -> Vec<Task> {
@@ -136,6 +262,7 @@ impl AppState {
                         node.task.updated_at = Utc::now();
                         tracing::info!(%task_id, "task done");
                     }
+                    dag.update_workflow_status(task_id);
                 }
 
                 self.session_to_task.remove(&event.session_id);
@@ -170,6 +297,7 @@ impl AppState {
                         node.task.updated_at = Utc::now();
                         tracing::error!(%task_id, "task failed via session.error");
                     }
+                    dag.update_workflow_status(task_id);
                 }
 
                 self.session_to_task.remove(&event.session_id);
@@ -270,6 +398,7 @@ pub async fn tick(state: &Arc<AppState>) {
                     node.task.status = TaskStatus::Failed(e.to_string());
                     node.task.updated_at = Utc::now();
                 }
+                dag.update_workflow_status(task_id);
             }
         });
     }
@@ -328,10 +457,39 @@ mod tests {
     use super::*;
     use crate::acp::AcpClient;
     use crate::events::PluginEvent;
-    use crate::types::CreateTaskRequest;
+    use crate::types::{CreateTaskRequest, SubmitWorkflowRequest, WorkflowTask};
 
     fn make_state() -> AppState {
         AppState::new(AcpClient::new("http://localhost:1".to_string(), None))
+    }
+
+    fn make_workflow_node(
+        dag: &mut DagState,
+        workflow_id: Uuid,
+        status: TaskStatus,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        dag.nodes.insert(
+            id,
+            Node {
+                id,
+                task: Task {
+                    id,
+                    prompt: "p".to_string(),
+                    model: "m".to_string(),
+                    agent: Some("builder".to_string()),
+                    session_id: None,
+                    status,
+                    output: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                depends_on: vec![],
+                workflow_id: Some(workflow_id),
+            },
+        );
+        id
     }
 
     #[tokio::test]
@@ -400,6 +558,218 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_workflow_rejects_empty_task_list() {
+        let state = make_state();
+        let result = state
+            .submit_workflow(SubmitWorkflowRequest { tasks: vec![] })
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("at least one task"));
+    }
+
+    #[tokio::test]
+    async fn submit_workflow_rejects_out_of_bounds_dep() {
+        let state = make_state();
+        let result = state
+            .submit_workflow(SubmitWorkflowRequest {
+                tasks: vec![WorkflowTask {
+                    agent: "explorer".to_string(),
+                    prompt: "p".to_string(),
+                    depends_on: vec![5],
+                    model: None,
+                }],
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("out of bounds"));
+    }
+
+    #[tokio::test]
+    async fn submit_workflow_fails_when_acp_unreachable() {
+        let state = make_state();
+        let result = state
+            .submit_workflow(SubmitWorkflowRequest {
+                tasks: vec![WorkflowTask {
+                    agent: "explorer".to_string(),
+                    prompt: "map it".to_string(),
+                    depends_on: vec![],
+                    model: None,
+                }],
+            })
+            .await;
+        assert!(result.is_err(), "agent validation requires live ACP");
+    }
+
+    #[tokio::test]
+    async fn get_workflow_returns_none_for_unknown() {
+        let state = make_state();
+        assert!(state.get_workflow(Uuid::new_v4()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn workflow_advances_to_done_when_all_tasks_complete() {
+        let state = make_state();
+        let wf_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        let (tid_a, tid_b) = {
+            let mut dag = state.dag.lock().await;
+            let ta = make_workflow_node(&mut dag, wf_id, TaskStatus::Running);
+            let tb = make_workflow_node(&mut dag, wf_id, TaskStatus::Pending);
+            dag.workflows.insert(
+                wf_id,
+                Workflow {
+                    id: wf_id,
+                    status: WorkflowStatus::Running,
+                    tasks: vec![ta, tb],
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
+            (ta, tb)
+        };
+
+        state.session_to_task.insert("s_a".to_string(), tid_a);
+        state.session_to_task.insert("s_b".to_string(), tid_b);
+
+        {
+            let mut dag = state.dag.lock().await;
+            dag.nodes.get_mut(&tid_b).unwrap().task.status = TaskStatus::Running;
+        }
+
+        state
+            .process_event(&PluginEvent {
+                event_type: "session.idle".to_string(),
+                session_id: "s_a".to_string(),
+                payload: serde_json::Value::Null,
+            })
+            .await;
+
+        let wf = state.get_workflow(wf_id).await.unwrap();
+        assert_eq!(wf.status, WorkflowStatus::Running, "still one running task");
+
+        state
+            .process_event(&PluginEvent {
+                event_type: "session.idle".to_string(),
+                session_id: "s_b".to_string(),
+                payload: serde_json::Value::Null,
+            })
+            .await;
+
+        let wf = state.get_workflow(wf_id).await.unwrap();
+        assert_eq!(wf.status, WorkflowStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn workflow_advances_to_failed_when_task_errors() {
+        let state = make_state();
+        let wf_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        let tid = {
+            let mut dag = state.dag.lock().await;
+            let t = make_workflow_node(&mut dag, wf_id, TaskStatus::Running);
+            dag.workflows.insert(
+                wf_id,
+                Workflow {
+                    id: wf_id,
+                    status: WorkflowStatus::Running,
+                    tasks: vec![t],
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
+            t
+        };
+
+        state.session_to_task.insert("s_fail".to_string(), tid);
+
+        state
+            .process_event(&PluginEvent {
+                event_type: "session.error".to_string(),
+                session_id: "s_fail".to_string(),
+                payload: serde_json::json!({"error": "model refused"}),
+            })
+            .await;
+
+        let wf = state.get_workflow(wf_id).await.unwrap();
+        assert!(matches!(
+            wf.status,
+            WorkflowStatus::Failed { reason, .. } if reason == "model refused"
+        ));
+    }
+
+    #[tokio::test]
+    async fn workflow_partial_completion_stays_running() {
+        let state = make_state();
+        let wf_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        let (tid_done, _tid_pending) = {
+            let mut dag = state.dag.lock().await;
+            let ta = make_workflow_node(&mut dag, wf_id, TaskStatus::Running);
+            let tb = make_workflow_node(&mut dag, wf_id, TaskStatus::Pending);
+            dag.workflows.insert(
+                wf_id,
+                Workflow {
+                    id: wf_id,
+                    status: WorkflowStatus::Running,
+                    tasks: vec![ta, tb],
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
+            (ta, tb)
+        };
+
+        state
+            .session_to_task
+            .insert("s_partial".to_string(), tid_done);
+
+        state
+            .process_event(&PluginEvent {
+                event_type: "session.idle".to_string(),
+                session_id: "s_partial".to_string(),
+                payload: serde_json::Value::Null,
+            })
+            .await;
+
+        let wf = state.get_workflow(wf_id).await.unwrap();
+        assert_eq!(wf.status, WorkflowStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn solo_task_without_workflow_doesnt_affect_workflows() {
+        let state = make_state();
+        let id = state
+            .add_task(CreateTaskRequest {
+                prompt: "solo".to_string(),
+                model: None,
+                agent: None,
+                depends_on: None,
+            })
+            .await
+            .unwrap();
+
+        {
+            let mut dag = state.dag.lock().await;
+            dag.nodes.get_mut(&id).unwrap().task.status = TaskStatus::Running;
+        }
+        state.session_to_task.insert("s_solo".to_string(), id);
+
+        state
+            .process_event(&PluginEvent {
+                event_type: "session.idle".to_string(),
+                session_id: "s_solo".to_string(),
+                payload: serde_json::Value::Null,
+            })
+            .await;
+
+        let dag = state.dag.lock().await;
+        assert!(dag.workflows.is_empty());
+    }
+
+    #[tokio::test]
     async fn session_idle_marks_running_task_done() {
         let state = make_state();
         let id = state
@@ -420,12 +790,13 @@ mod tests {
         }
         state.session_to_task.insert("ses_test".to_string(), id);
 
-        let event = PluginEvent {
-            event_type: "session.idle".to_string(),
-            session_id: "ses_test".to_string(),
-            payload: serde_json::Value::Null,
-        };
-        state.process_event(&event).await;
+        state
+            .process_event(&PluginEvent {
+                event_type: "session.idle".to_string(),
+                session_id: "ses_test".to_string(),
+                payload: serde_json::Value::Null,
+            })
+            .await;
 
         assert_eq!(state.get_task(id).await.unwrap().status, TaskStatus::Done);
     }
@@ -451,12 +822,13 @@ mod tests {
         }
         state.session_to_task.insert("ses_err".to_string(), id);
 
-        let event = PluginEvent {
-            event_type: "session.error".to_string(),
-            session_id: "ses_err".to_string(),
-            payload: serde_json::json!({"error": "rate limit"}),
-        };
-        state.process_event(&event).await;
+        state
+            .process_event(&PluginEvent {
+                event_type: "session.error".to_string(),
+                session_id: "ses_err".to_string(),
+                payload: serde_json::json!({"error": "rate limit"}),
+            })
+            .await;
 
         let task = state.get_task(id).await.unwrap();
         assert_eq!(task.status, TaskStatus::Failed("rate limit".to_string()));
@@ -465,12 +837,13 @@ mod tests {
     #[tokio::test]
     async fn session_idle_for_unknown_session_is_noop() {
         let state = make_state();
-        let event = PluginEvent {
-            event_type: "session.idle".to_string(),
-            session_id: "ses_unknown".to_string(),
-            payload: serde_json::Value::Null,
-        };
-        state.process_event(&event).await;
+        state
+            .process_event(&PluginEvent {
+                event_type: "session.idle".to_string(),
+                session_id: "ses_unknown".to_string(),
+                payload: serde_json::Value::Null,
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -496,12 +869,13 @@ mod tests {
             .session_to_task
             .insert("ses_cleanup".to_string(), id);
 
-        let event = PluginEvent {
-            event_type: "session.idle".to_string(),
-            session_id: "ses_cleanup".to_string(),
-            payload: serde_json::Value::Null,
-        };
-        state.process_event(&event).await;
+        state
+            .process_event(&PluginEvent {
+                event_type: "session.idle".to_string(),
+                session_id: "ses_cleanup".to_string(),
+                payload: serde_json::Value::Null,
+            })
+            .await;
 
         assert!(!state.session_to_task.contains_key("ses_cleanup"));
         assert_eq!(state.get_task(id).await.unwrap().status, TaskStatus::Done);
@@ -528,12 +902,13 @@ mod tests {
         }
         state.session_to_task.insert("ses_err2".to_string(), id);
 
-        let event = PluginEvent {
-            event_type: "session.error".to_string(),
-            session_id: "ses_err2".to_string(),
-            payload: serde_json::json!({"error": "timeout"}),
-        };
-        state.process_event(&event).await;
+        state
+            .process_event(&PluginEvent {
+                event_type: "session.error".to_string(),
+                session_id: "ses_err2".to_string(),
+                payload: serde_json::json!({"error": "timeout"}),
+            })
+            .await;
 
         assert!(!state.session_to_task.contains_key("ses_err2"));
         assert_eq!(
@@ -563,19 +938,21 @@ mod tests {
         }
         state.session_to_task.insert("ses_tool".to_string(), id);
 
-        let ev1 = PluginEvent {
-            event_type: "tool.execute.after".to_string(),
-            session_id: "ses_tool".to_string(),
-            payload: serde_json::json!({"result": "line one"}),
-        };
-        state.process_event(&ev1).await;
+        state
+            .process_event(&PluginEvent {
+                event_type: "tool.execute.after".to_string(),
+                session_id: "ses_tool".to_string(),
+                payload: serde_json::json!({"result": "line one"}),
+            })
+            .await;
 
-        let ev2 = PluginEvent {
-            event_type: "tool.execute.after".to_string(),
-            session_id: "ses_tool".to_string(),
-            payload: serde_json::json!({"result": "line two"}),
-        };
-        state.process_event(&ev2).await;
+        state
+            .process_event(&PluginEvent {
+                event_type: "tool.execute.after".to_string(),
+                session_id: "ses_tool".to_string(),
+                payload: serde_json::json!({"result": "line two"}),
+            })
+            .await;
 
         let task = state.get_task(id).await.unwrap();
         assert_eq!(task.output, Some("line one\nline two".to_string()));
@@ -602,12 +979,13 @@ mod tests {
         }
         state.session_to_task.insert("ses_empty".to_string(), id);
 
-        let ev = PluginEvent {
-            event_type: "tool.execute.after".to_string(),
-            session_id: "ses_empty".to_string(),
-            payload: serde_json::json!({"result": ""}),
-        };
-        state.process_event(&ev).await;
+        state
+            .process_event(&PluginEvent {
+                event_type: "tool.execute.after".to_string(),
+                session_id: "ses_empty".to_string(),
+                payload: serde_json::json!({"result": ""}),
+            })
+            .await;
 
         assert!(state.get_task(id).await.unwrap().output.is_none());
     }
@@ -615,12 +993,13 @@ mod tests {
     #[tokio::test]
     async fn tool_after_for_unknown_session_is_noop() {
         let state = make_state();
-        let ev = PluginEvent {
-            event_type: "tool.execute.after".to_string(),
-            session_id: "ses_ghost".to_string(),
-            payload: serde_json::json!({"result": "data"}),
-        };
-        state.process_event(&ev).await;
+        state
+            .process_event(&PluginEvent {
+                event_type: "tool.execute.after".to_string(),
+                session_id: "ses_ghost".to_string(),
+                payload: serde_json::json!({"result": "data"}),
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -644,19 +1023,21 @@ mod tests {
         }
         state.session_to_task.insert("ses_snap".to_string(), id);
 
-        let tool_ev = PluginEvent {
-            event_type: "tool.execute.after".to_string(),
-            session_id: "ses_snap".to_string(),
-            payload: serde_json::json!({"result": "tool output"}),
-        };
-        state.process_event(&tool_ev).await;
+        state
+            .process_event(&PluginEvent {
+                event_type: "tool.execute.after".to_string(),
+                session_id: "ses_snap".to_string(),
+                payload: serde_json::json!({"result": "tool output"}),
+            })
+            .await;
 
-        let idle_ev = PluginEvent {
-            event_type: "session.idle".to_string(),
-            session_id: "ses_snap".to_string(),
-            payload: serde_json::Value::Null,
-        };
-        state.process_event(&idle_ev).await;
+        state
+            .process_event(&PluginEvent {
+                event_type: "session.idle".to_string(),
+                session_id: "ses_snap".to_string(),
+                payload: serde_json::Value::Null,
+            })
+            .await;
 
         let task = state.get_task(id).await.unwrap();
         assert_eq!(task.status, TaskStatus::Done);
@@ -731,8 +1112,7 @@ mod tests {
 
         {
             let dag = state.dag.lock().await;
-            let dep_status = &dag.nodes[&dep_id].task.status;
-            assert_eq!(*dep_status, TaskStatus::Pending);
+            assert_eq!(dag.nodes[&dep_id].task.status, TaskStatus::Pending);
         }
 
         let ready: Vec<Uuid> = {
@@ -776,8 +1156,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tasks = state.list_tasks().await;
-        assert_eq!(tasks.len(), 2);
+        assert_eq!(state.list_tasks().await.len(), 2);
     }
 
     #[tokio::test]

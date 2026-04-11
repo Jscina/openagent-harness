@@ -1,4 +1,4 @@
-import type { Plugin } from "@opencode-ai/plugin";
+import { tool, type Plugin } from "@opencode-ai/plugin";
 import { spawn, type ChildProcess } from "child_process";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
@@ -48,7 +48,10 @@ export default (async () => {
     });
 
     child.on("error", (err) => {
-      console.error(`[harness-plugin] failed to spawn harness (${harnessBin}):`, err.message);
+      console.error(
+        `[harness-plugin] failed to spawn harness (${harnessBin}):`,
+        err.message,
+      );
     });
 
     const ready = await waitForHarness();
@@ -77,6 +80,50 @@ export default (async () => {
   }
 
   return {
+    tool: {
+      submit_workflow: tool({
+        description:
+          "Submit a workflow plan to the harness DAG for execution. Input is the tasks array from planner output. Returns a workflow_id for tracking.",
+        args: {
+          tasks: tool.schema.array(
+            tool.schema.object({
+              agent: tool.schema.string(),
+              prompt: tool.schema.string(),
+              depends_on: tool.schema.array(tool.schema.number()),
+              model: tool.schema.string().optional(),
+            }),
+          ),
+        },
+        async execute({ tasks }) {
+          const resp = await fetch(`${HARNESS_URL}/workflows`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ tasks }),
+          });
+          if (!resp.ok) {
+            const text = await resp.text();
+            throw new Error(`submit_workflow failed: ${resp.status} ${text}`);
+          }
+          return JSON.stringify(await resp.json());
+        },
+      }),
+
+      get_workflow_status: tool({
+        description:
+          "Get the current status of a workflow by ID. Poll this after submit_workflow to track progress.",
+        args: {
+          workflow_id: tool.schema.string(),
+        },
+        async execute({ workflow_id }) {
+          const resp = await fetch(`${HARNESS_URL}/workflows/${workflow_id}`);
+          if (!resp.ok) {
+            throw new Error(`get_workflow_status failed: ${resp.status}`);
+          }
+          return JSON.stringify(await resp.json());
+        },
+      }),
+    },
+
     event: async ({ event }) => {
       if (event.type === "session.idle") {
         await emit(

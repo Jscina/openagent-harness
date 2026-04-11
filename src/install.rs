@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 
 const AGENTS: &[(&str, &str)] = &[
+    ("orchestrator", include_str!("../agents/orchestrator.md")),
     ("planner", include_str!("../agents/planner.md")),
     ("explorer", include_str!("../agents/explorer.md")),
     ("researcher", include_str!("../agents/researcher.md")),
@@ -19,7 +20,7 @@ const AGENTS: &[(&str, &str)] = &[
 pub fn run(force: bool) -> Result<()> {
     let config_dir =
         dirs::config_dir().ok_or_else(|| anyhow::anyhow!("cannot determine config directory"))?;
-    let agents_dir = config_dir.join("opencode").join("agent");
+    let agents_dir = config_dir.join("opencode").join("agents");
 
     std::fs::create_dir_all(&agents_dir)
         .with_context(|| format!("failed to create {}", agents_dir.display()))?;
@@ -60,8 +61,9 @@ mod tests {
 
     #[test]
     fn all_agent_files_are_embedded() {
-        assert_eq!(AGENTS.len(), 10);
+        assert_eq!(AGENTS.len(), 11);
         let names: Vec<&str> = AGENTS.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"orchestrator"));
         assert!(names.contains(&"planner"));
         assert!(names.contains(&"explorer"));
         assert!(names.contains(&"researcher"));
