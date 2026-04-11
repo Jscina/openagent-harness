@@ -19,6 +19,7 @@ pub struct Task {
     pub prompt: String,
     /// "provider/model", e.g. "anthropic/claude-sonnet-4-20250514"
     pub model: String,
+    pub agent: Option<String>,
     pub session_id: Option<String>,
     pub status: TaskStatus,
     pub output: Option<String>,
@@ -38,6 +39,7 @@ pub struct Node {
 pub struct CreateTaskRequest {
     pub prompt: String,
     pub model: Option<String>,
+    pub agent: Option<String>,
     pub depends_on: Option<Vec<Uuid>>,
 }
 
@@ -83,6 +85,14 @@ mod tests {
         let req: CreateTaskRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.prompt, "hello");
         assert!(req.model.is_none());
+        assert!(req.agent.is_none());
         assert!(req.depends_on.is_none());
+    }
+
+    #[test]
+    fn create_task_request_with_agent() {
+        let json = r#"{"prompt":"map the codebase","agent":"explorer"}"#;
+        let req: CreateTaskRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.agent.as_deref(), Some("explorer"));
     }
 }

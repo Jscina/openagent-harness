@@ -22,11 +22,18 @@ pub struct AcpSessionStatus {
     pub status_type: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AcpAgent {
+    pub name: String,
+}
+
 #[derive(Debug, Serialize)]
 struct PromptAsyncBody {
     parts: Vec<MessagePart>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<ModelSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,13 +86,20 @@ impl AcpClient {
         Ok(session.id)
     }
 
-    pub async fn send_message(&self, session_id: &str, prompt: &str, model: &str) -> Result<()> {
+    pub async fn send_message(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        model: &str,
+        agent: Option<&str>,
+    ) -> Result<()> {
         let body = PromptAsyncBody {
             parts: vec![MessagePart {
                 part_type: "text".to_string(),
                 text: prompt.to_string(),
             }],
             model: parse_model_string(model),
+            agent: agent.map(str::to_owned),
         };
 
         self.request(
@@ -100,6 +114,25 @@ impl AcpClient {
         .context("ACP: prompt_async error status")?;
 
         Ok(())
+    }
+
+    pub async fn list_agents(&self) -> Result<Vec<AcpAgent>> {
+        let resp = self
+            .request(reqwest::Method::GET, "/agent")
+            .send()
+            .await
+            .context("ACP: failed to GET /agent")?
+            .error_for_status()
+            .context("ACP: list agents error status")?;
+
+        resp.json()
+            .await
+            .context("ACP: failed to parse agents response")
+    }
+
+    pub async fn agent_exists(&self, name: &str) -> Result<bool> {
+        let agents = self.list_agents().await?;
+        Ok(agents.iter().any(|a| a.name == name))
     }
 
     pub async fn get_session_status(&self) -> Result<HashMap<String, AcpSessionStatus>> {
@@ -183,9 +216,11 @@ mod tests {
                 text: "hello".to_string(),
             }],
             model: None,
+            agent: None,
         };
         let json = serde_json::to_value(&body).unwrap();
         assert!(json.get("model").is_none());
+        assert!(json.get("agent").is_none());
         assert_eq!(json["parts"][0]["type"], "text");
         assert_eq!(json["parts"][0]["text"], "hello");
     }
@@ -198,9 +233,26 @@ mod tests {
                 text: "test".to_string(),
             }],
             model: parse_model_string("anthropic/claude-opus-4-5"),
+            agent: None,
         };
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["model"]["providerID"], "anthropic");
         assert_eq!(json["model"]["modelID"], "claude-opus-4-5");
+        assert!(json.get("agent").is_none());
+    }
+
+    #[test]
+    fn prompt_async_body_with_agent_serializes_correctly() {
+        let body = PromptAsyncBody {
+            parts: vec![MessagePart {
+                part_type: "text".to_string(),
+                text: "explore".to_string(),
+            }],
+            model: None,
+            agent: Some("explorer".to_string()),
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["agent"], "explorer");
+        assert!(json.get("model").is_none());
     }
 }

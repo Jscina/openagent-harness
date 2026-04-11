@@ -6,11 +6,23 @@ use anyhow::Result;
 use chrono::Utc;
 use dashmap::DashMap;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-6";
+const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+
+#[derive(Debug)]
+pub struct AgentNotFound(pub String);
+
+impl fmt::Display for AgentNotFound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "agent '{}' not found", self.0)
+    }
+}
+
+impl std::error::Error for AgentNotFound {}
 
 pub struct AppState {
     pub dag: Mutex<DagState>,
@@ -33,7 +45,13 @@ impl AppState {
         }
     }
 
-    pub async fn add_task(&self, req: CreateTaskRequest) -> Uuid {
+    pub async fn add_task(&self, req: CreateTaskRequest) -> Result<Uuid> {
+        if let Some(ref agent) = req.agent
+            && !self.acp.agent_exists(agent).await?
+        {
+            anyhow::bail!(AgentNotFound(agent.clone()));
+        }
+
         let id = Uuid::new_v4();
         let now = Utc::now();
         let node = Node {
@@ -42,6 +60,7 @@ impl AppState {
                 id,
                 prompt: req.prompt,
                 model: req.model.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+                agent: req.agent,
                 session_id: None,
                 status: TaskStatus::Pending,
                 output: None,
@@ -54,7 +73,7 @@ impl AppState {
         let mut dag = self.dag.lock().await;
         dag.nodes.insert(id, node);
         tracing::info!(%id, "task added");
-        id
+        Ok(id)
     }
 
     pub async fn get_task(&self, id: Uuid) -> Option<Task> {
@@ -206,7 +225,7 @@ impl AppState {
 }
 
 pub async fn tick(state: &Arc<AppState>) {
-    let ready_tasks: Vec<(Uuid, String, String)> = {
+    let ready_tasks: Vec<(Uuid, String, String, Option<String>)> = {
         let mut dag = state.dag.lock().await;
 
         let ready_ids: Vec<Uuid> = dag
@@ -228,16 +247,23 @@ pub async fn tick(state: &Arc<AppState>) {
             if let Some(node) = dag.nodes.get_mut(&id) {
                 node.task.status = TaskStatus::Running;
                 node.task.updated_at = Utc::now();
-                result.push((id, node.task.prompt.clone(), node.task.model.clone()));
+                result.push((
+                    id,
+                    node.task.prompt.clone(),
+                    node.task.model.clone(),
+                    node.task.agent.clone(),
+                ));
             }
         }
         result
     };
 
-    for (task_id, prompt, model) in ready_tasks {
+    for (task_id, prompt, model, agent) in ready_tasks {
         let state = Arc::clone(state);
         tokio::spawn(async move {
-            if let Err(e) = execute_task(&state, task_id, &prompt, &model).await {
+            if let Err(e) =
+                execute_task(&state, task_id, &prompt, &model, agent.as_deref()).await
+            {
                 tracing::error!(%task_id, error = %e, "task execution failed");
                 let mut dag = state.dag.lock().await;
                 if let Some(node) = dag.nodes.get_mut(&task_id) {
@@ -249,7 +275,13 @@ pub async fn tick(state: &Arc<AppState>) {
     }
 }
 
-async fn execute_task(state: &AppState, task_id: Uuid, prompt: &str, model: &str) -> Result<()> {
+async fn execute_task(
+    state: &AppState,
+    task_id: Uuid,
+    prompt: &str,
+    model: &str,
+    agent: Option<&str>,
+) -> Result<()> {
     let session_id = state.acp.create_session().await?;
     tracing::info!(%task_id, %session_id, "ACP session created");
 
@@ -267,7 +299,10 @@ async fn execute_task(state: &AppState, task_id: Uuid, prompt: &str, model: &str
         tracing::warn!(%task_id, error = %e, "tmux pane spawn failed (continuing)");
     }
 
-    state.acp.send_message(&session_id, prompt, model).await?;
+    state
+        .acp
+        .send_message(&session_id, prompt, model, agent)
+        .await?;
     tracing::info!(%task_id, "message sent");
 
     Ok(())
@@ -306,14 +341,17 @@ mod tests {
             .add_task(CreateTaskRequest {
                 prompt: "hello".to_string(),
                 model: None,
+                agent: None,
                 depends_on: None,
             })
-            .await;
+            .await
+            .unwrap();
 
         let task = state.get_task(id).await.unwrap();
         assert_eq!(task.status, TaskStatus::Pending);
         assert_eq!(task.model, "anthropic/claude-sonnet-4-20250514");
         assert!(task.session_id.is_none());
+        assert!(task.agent.is_none());
     }
 
     #[tokio::test]
@@ -323,12 +361,42 @@ mod tests {
             .add_task(CreateTaskRequest {
                 prompt: "test".to_string(),
                 model: Some("openai/gpt-4o".to_string()),
+                agent: None,
                 depends_on: None,
             })
-            .await;
+            .await
+            .unwrap();
 
         let task = state.get_task(id).await.unwrap();
         assert_eq!(task.model, "openai/gpt-4o");
+    }
+
+    #[tokio::test]
+    async fn add_task_agent_validation_fails_when_acp_unreachable() {
+        let state = make_state();
+        let result = state
+            .add_task(CreateTaskRequest {
+                prompt: "map codebase".to_string(),
+                model: None,
+                agent: Some("explorer".to_string()),
+                depends_on: None,
+            })
+            .await;
+        assert!(result.is_err(), "should fail when ACP is unreachable");
+    }
+
+    #[tokio::test]
+    async fn add_task_no_agent_skips_validation() {
+        let state = make_state();
+        let result = state
+            .add_task(CreateTaskRequest {
+                prompt: "do work".to_string(),
+                model: None,
+                agent: None,
+                depends_on: None,
+            })
+            .await;
+        assert!(result.is_ok(), "no agent means no ACP call");
     }
 
     #[tokio::test]
@@ -338,9 +406,11 @@ mod tests {
             .add_task(CreateTaskRequest {
                 prompt: "p".to_string(),
                 model: None,
+                agent: None,
                 depends_on: None,
             })
-            .await;
+            .await
+            .unwrap();
 
         {
             let mut dag = state.dag.lock().await;
@@ -367,9 +437,11 @@ mod tests {
             .add_task(CreateTaskRequest {
                 prompt: "p".to_string(),
                 model: None,
+                agent: None,
                 depends_on: None,
             })
-            .await;
+            .await
+            .unwrap();
 
         {
             let mut dag = state.dag.lock().await;
@@ -408,9 +480,11 @@ mod tests {
             .add_task(CreateTaskRequest {
                 prompt: "p".to_string(),
                 model: None,
+                agent: None,
                 depends_on: None,
             })
-            .await;
+            .await
+            .unwrap();
 
         {
             let mut dag = state.dag.lock().await;
@@ -418,7 +492,9 @@ mod tests {
             node.task.status = TaskStatus::Running;
             node.task.session_id = Some("ses_cleanup".to_string());
         }
-        state.session_to_task.insert("ses_cleanup".to_string(), id);
+        state
+            .session_to_task
+            .insert("ses_cleanup".to_string(), id);
 
         let event = PluginEvent {
             event_type: "session.idle".to_string(),
@@ -438,9 +514,11 @@ mod tests {
             .add_task(CreateTaskRequest {
                 prompt: "p".to_string(),
                 model: None,
+                agent: None,
                 depends_on: None,
             })
-            .await;
+            .await
+            .unwrap();
 
         {
             let mut dag = state.dag.lock().await;
@@ -471,9 +549,11 @@ mod tests {
             .add_task(CreateTaskRequest {
                 prompt: "p".to_string(),
                 model: None,
+                agent: None,
                 depends_on: None,
             })
-            .await;
+            .await
+            .unwrap();
 
         {
             let mut dag = state.dag.lock().await;
@@ -508,9 +588,11 @@ mod tests {
             .add_task(CreateTaskRequest {
                 prompt: "p".to_string(),
                 model: None,
+                agent: None,
                 depends_on: None,
             })
-            .await;
+            .await
+            .unwrap();
 
         {
             let mut dag = state.dag.lock().await;
@@ -548,9 +630,11 @@ mod tests {
             .add_task(CreateTaskRequest {
                 prompt: "p".to_string(),
                 model: None,
+                agent: None,
                 depends_on: None,
             })
-            .await;
+            .await
+            .unwrap();
 
         {
             let mut dag = state.dag.lock().await;
@@ -586,9 +670,11 @@ mod tests {
             .add_task(CreateTaskRequest {
                 prompt: "go".to_string(),
                 model: None,
+                agent: None,
                 depends_on: None,
             })
-            .await;
+            .await
+            .unwrap();
 
         let ready: Vec<Uuid> = {
             let mut dag = state.dag.lock().await;
@@ -627,17 +713,21 @@ mod tests {
             .add_task(CreateTaskRequest {
                 prompt: "dep".to_string(),
                 model: None,
+                agent: None,
                 depends_on: None,
             })
-            .await;
+            .await
+            .unwrap();
 
         let child_id = state
             .add_task(CreateTaskRequest {
                 prompt: "child".to_string(),
                 model: None,
+                agent: None,
                 depends_on: Some(vec![dep_id]),
             })
-            .await;
+            .await
+            .unwrap();
 
         {
             let dag = state.dag.lock().await;
@@ -671,16 +761,20 @@ mod tests {
             .add_task(CreateTaskRequest {
                 prompt: "a".to_string(),
                 model: None,
+                agent: None,
                 depends_on: None,
             })
-            .await;
+            .await
+            .unwrap();
         state
             .add_task(CreateTaskRequest {
                 prompt: "b".to_string(),
                 model: None,
+                agent: None,
                 depends_on: None,
             })
-            .await;
+            .await
+            .unwrap();
 
         let tasks = state.list_tasks().await;
         assert_eq!(tasks.len(), 2);

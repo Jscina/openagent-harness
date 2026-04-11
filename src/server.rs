@@ -1,4 +1,4 @@
-use crate::dag::AppState;
+use crate::dag::{AgentNotFound, AppState};
 use crate::events::PluginEvent;
 use crate::types::{CreateTaskRequest, CreateTaskResponse};
 
@@ -12,15 +12,27 @@ use axum::{
 use std::sync::Arc;
 use uuid::Uuid;
 
-pub struct AppError(anyhow::Error);
+pub enum AppError {
+    BadRequest(anyhow::Error),
+    Internal(anyhow::Error),
+}
+
+impl AppError {
+    pub fn bad_request(e: impl Into<anyhow::Error>) -> Self {
+        Self::BadRequest(e.into())
+    }
+}
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("error: {}", self.0),
-        )
-            .into_response()
+        match self {
+            AppError::BadRequest(e) => {
+                (StatusCode::BAD_REQUEST, format!("error: {}", e)).into_response()
+            }
+            AppError::Internal(e) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", e)).into_response()
+            }
+        }
     }
 }
 
@@ -29,7 +41,7 @@ where
     E: Into<anyhow::Error>,
 {
     fn from(err: E) -> Self {
-        Self(err.into())
+        Self::Internal(err.into())
     }
 }
 
@@ -56,7 +68,13 @@ async fn create_task(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateTaskRequest>,
 ) -> Result<(StatusCode, Json<CreateTaskResponse>), AppError> {
-    let id = state.add_task(req).await;
+    let id = state.add_task(req).await.map_err(|e| {
+        if e.is::<AgentNotFound>() {
+            AppError::bad_request(e)
+        } else {
+            AppError::Internal(e)
+        }
+    })?;
     Ok((StatusCode::CREATED, Json(CreateTaskResponse { id })))
 }
 
@@ -122,6 +140,25 @@ mod tests {
             .unwrap();
         let resp_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(resp_json["id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn post_tasks_with_agent_unreachable_acp_returns_500() {
+        let app = test_app();
+        let body = serde_json::json!({"prompt": "do work", "agent": "explorer"});
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

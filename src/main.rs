@@ -1,6 +1,7 @@
 mod acp;
 mod dag;
 mod events;
+mod install;
 mod server;
 mod tmux;
 mod types;
@@ -14,6 +15,13 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.get(1).map(String::as_str) == Some("install") {
+        let force = args.contains(&"--force".to_string());
+        return install::run(force);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
