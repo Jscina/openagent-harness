@@ -88,7 +88,14 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 tmp_file=$(mktemp)
-jq --arg path "$PLUGIN_PATH" '.plugin = ((.plugin // []) | if type == "array" then (if index($path) == null then . + [$path] else . end) else [., $path] end) | .agent.build.disable = true | .agent.plan.disable = true' "$CONFIG_FILE" >"$tmp_file"
+jq --arg path "$PLUGIN_PATH" '
+	.plugin = ((.plugin // []) | if type == "array" then (if index($path) == null then . + [$path] else . end) else [., $path] end) |
+	.agent.build.disable = true |
+	.agent.plan.disable = true |
+	.mcp.websearch = {"type": "url", "url": "https://mcp.exa.ai/mcp"} |
+	.mcp.context7 = {"type": "url", "url": "https://mcp.context7.com/mcp"} |
+	.mcp.grep_app = {"type": "url", "url": "https://mcp.grep.app"}
+' "$CONFIG_FILE" >"$tmp_file"
 mv "$tmp_file" "$CONFIG_FILE"
 
 echo ""
