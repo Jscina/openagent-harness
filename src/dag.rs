@@ -274,20 +274,27 @@ impl AppState {
                     );
                 }
             }
-
             "session.error" => {
                 let task_id = match self.session_to_task.get(&event.session_id) {
                     Some(entry) => *entry,
                     None => return,
                 };
 
+                tracing::error!(
+                    %task_id,
+                    session_id = %event.session_id,
+                    payload = %event.payload,
+                    "session.error received"
+                );
+
                 let error_msg = event
                     .payload
                     .get("error")
                     .and_then(|e| e.as_str())
+                    .or_else(|| event.payload.get("message").and_then(|e| e.as_str()))
+                    .or_else(|| event.payload.as_str())
                     .unwrap_or("unknown error")
                     .to_string();
-
                 {
                     let mut dag = self.dag.lock().await;
                     if let Some(node) = dag.nodes.get_mut(&task_id)
@@ -389,9 +396,7 @@ pub async fn tick(state: &Arc<AppState>) {
     for (task_id, prompt, model, agent) in ready_tasks {
         let state = Arc::clone(state);
         tokio::spawn(async move {
-            if let Err(e) =
-                execute_task(&state, task_id, &prompt, &model, agent.as_deref()).await
-            {
+            if let Err(e) = execute_task(&state, task_id, &prompt, &model, agent.as_deref()).await {
                 tracing::error!(%task_id, error = %e, "task execution failed");
                 let mut dag = state.dag.lock().await;
                 if let Some(node) = dag.nodes.get_mut(&task_id) {
@@ -463,11 +468,7 @@ mod tests {
         AppState::new(AcpClient::new("http://localhost:1".to_string(), None))
     }
 
-    fn make_workflow_node(
-        dag: &mut DagState,
-        workflow_id: Uuid,
-        status: TaskStatus,
-    ) -> Uuid {
+    fn make_workflow_node(dag: &mut DagState, workflow_id: Uuid, status: TaskStatus) -> Uuid {
         let id = Uuid::new_v4();
         let now = Utc::now();
         dag.nodes.insert(
@@ -564,7 +565,12 @@ mod tests {
             .submit_workflow(SubmitWorkflowRequest { tasks: vec![] })
             .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("at least one task"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("at least one task")
+        );
     }
 
     #[tokio::test]
@@ -865,9 +871,7 @@ mod tests {
             node.task.status = TaskStatus::Running;
             node.task.session_id = Some("ses_cleanup".to_string());
         }
-        state
-            .session_to_task
-            .insert("ses_cleanup".to_string(), id);
+        state.session_to_task.insert("ses_cleanup".to_string(), id);
 
         state
             .process_event(&PluginEvent {
