@@ -39,15 +39,15 @@ pub struct DagState {
 }
 
 impl DagState {
-    fn update_workflow_status(&mut self, task_id: Uuid) {
+    fn update_workflow_status(&mut self, task_id: Uuid) -> Option<WorkflowStatus> {
         let workflow_id = match self.nodes.get(&task_id).and_then(|n| n.workflow_id) {
             Some(id) => id,
-            None => return,
+            None => return None,
         };
 
         let task_ids: Vec<Uuid> = match self.workflows.get(&workflow_id) {
             Some(w) if matches!(w.status, WorkflowStatus::Running) => w.tasks.clone(),
-            _ => return,
+            _ => return None,
         };
 
         let mut all_terminal = true;
@@ -68,7 +68,7 @@ impl DagState {
         }
 
         if !all_terminal {
-            return;
+            return None;
         }
 
         let workflow = self.workflows.get_mut(&workflow_id).unwrap();
@@ -80,6 +80,7 @@ impl DagState {
             None => WorkflowStatus::Done,
         };
         workflow.updated_at = Utc::now();
+        Some(workflow.status.clone())
     }
 }
 
@@ -253,7 +254,7 @@ impl AppState {
                     }
                 };
 
-                {
+                let completed_workflow_status = {
                     let mut dag = self.dag.lock().await;
                     if let Some(node) = dag.nodes.get_mut(&task_id)
                         && matches!(node.task.status, TaskStatus::Running)
@@ -262,7 +263,30 @@ impl AppState {
                         node.task.updated_at = Utc::now();
                         tracing::info!(%task_id, "task done");
                     }
-                    dag.update_workflow_status(task_id);
+                    dag.update_workflow_status(task_id)
+                };
+
+                if let Some(wf_status) = completed_workflow_status {
+                    match wf_status {
+                        WorkflowStatus::Done => {
+                            let _ = self.acp.show_toast(
+                                "Workflow complete",
+                                "All tasks finished successfully",
+                                "success",
+                                None,
+                            ).await;
+                        }
+                        WorkflowStatus::Failed { ref reason, .. } => {
+                            let short = reason.chars().take(80).collect::<String>();
+                            let _ = self.acp.show_toast(
+                                "Workflow failed",
+                                &short,
+                                "error",
+                                Some(12000),
+                            ).await;
+                        }
+                        _ => {}
+                    }
                 }
 
                 self.session_to_task.remove(&event.session_id);
@@ -287,24 +311,57 @@ impl AppState {
                     "session.error received"
                 );
 
-                let error_msg = event
-                    .payload
-                    .get("error")
+                let error_msg = event.payload.get("error")
+                    .or_else(|| event.payload.get("message"))
+                    .or_else(|| event.payload.get("reason"))
                     .and_then(|e| e.as_str())
-                    .or_else(|| event.payload.get("message").and_then(|e| e.as_str()))
-                    .or_else(|| event.payload.as_str())
-                    .unwrap_or("unknown error")
+                    .unwrap_or_else(|| {
+                        event.payload.as_str().unwrap_or("unknown error")
+                    })
                     .to_string();
-                {
+
+                let (completed_workflow_status, is_workflow) = {
                     let mut dag = self.dag.lock().await;
+                    let is_workflow = dag.nodes.get(&task_id).and_then(|n| n.workflow_id).is_some();
                     if let Some(node) = dag.nodes.get_mut(&task_id)
                         && matches!(node.task.status, TaskStatus::Running)
                     {
-                        node.task.status = TaskStatus::Failed(error_msg);
+                        node.task.status = TaskStatus::Failed(error_msg.clone());
                         node.task.updated_at = Utc::now();
                         tracing::error!(%task_id, "task failed via session.error");
                     }
-                    dag.update_workflow_status(task_id);
+                    (dag.update_workflow_status(task_id), is_workflow)
+                };
+
+                if let Some(wf_status) = completed_workflow_status {
+                    match wf_status {
+                        WorkflowStatus::Done => {
+                            let _ = self.acp.show_toast(
+                                "Workflow complete",
+                                "All tasks finished successfully",
+                                "success",
+                                None,
+                            ).await;
+                        }
+                        WorkflowStatus::Failed { ref reason, .. } => {
+                            let short = reason.chars().take(80).collect::<String>();
+                            let _ = self.acp.show_toast(
+                                "Workflow failed",
+                                &short,
+                                "error",
+                                Some(12000),
+                            ).await;
+                        }
+                        _ => {}
+                    }
+                } else if !is_workflow {
+                    let short = error_msg.chars().take(80).collect::<String>();
+                    let _ = self.acp.show_toast(
+                        "Task failed",
+                        &short,
+                        "error",
+                        Some(12000),
+                    ).await;
                 }
 
                 self.session_to_task.remove(&event.session_id);
@@ -429,7 +486,15 @@ async fn execute_task(
         }
     }
 
-    if let Err(e) = crate::tmux::spawn_pane(&session_id) {
+    tokio::time::sleep(std::time::Duration::from_millis(
+        std::env::var("HARNESS_TMUX_DELAY_MS")
+            .unwrap_or_else(|_| "500".to_string())
+            .parse()
+            .unwrap_or(500),
+    ))
+    .await;
+
+    if let Err(e) = crate::tmux::spawn_pane(&session_id, state.acp.base_url()) {
         tracing::warn!(%task_id, error = %e, "tmux pane spawn failed (continuing)");
     }
 

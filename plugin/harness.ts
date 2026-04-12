@@ -107,21 +107,6 @@ export default (async () => {
           return JSON.stringify(await resp.json());
         },
       }),
-
-      get_workflow_status: tool({
-        description:
-          "Get the current status of a workflow by ID. Poll this after submit_workflow to track progress.",
-        args: {
-          workflow_id: tool.schema.string(),
-        },
-        async execute({ workflow_id }) {
-          const resp = await fetch(`${HARNESS_URL}/workflows/${workflow_id}`);
-          if (!resp.ok) {
-            throw new Error(`get_workflow_status failed: ${resp.status}`);
-          }
-          return JSON.stringify(await resp.json());
-        },
-      }),
     },
 
     event: async ({ event }) => {

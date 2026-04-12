@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use std::process::Command;
 
-pub fn spawn_pane(session_id: &str) -> Result<()> {
-    let attach_cmd = format!("opencode attach {}", session_id);
+pub fn spawn_pane(session_id: &str, acp_base_url: &str) -> Result<()> {
+    let attach_cmd = format!("opencode attach {} --session {}", acp_base_url, session_id);
     let output = Command::new("tmux")
         .args(["split-window", "-h", &attach_cmd])
         .output()

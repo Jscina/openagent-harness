@@ -60,6 +60,32 @@ impl AcpClient {
         }
     }
 
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub async fn show_toast(
+        &self,
+        title: &str,
+        message: &str,
+        variant: &str,
+        duration: Option<u32>,
+    ) -> Result<()> {
+        self.request(reqwest::Method::POST, "/tui/show-toast")
+            .json(&serde_json::json!({
+                "title": title,
+                "message": message,
+                "variant": variant,
+                "duration": duration.unwrap_or(8000),
+            }))
+            .send()
+            .await
+            .context("ACP: failed to POST /tui/show-toast")?
+            .error_for_status()
+            .context("ACP: show-toast error status")?;
+        Ok(())
+    }
+
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         let url = format!("{}{}", self.base_url, path);
         let mut req = self.client.request(method, &url);
