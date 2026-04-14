@@ -17,6 +17,7 @@
 # Requires: wasm-pack  (cargo install wasm-pack)
 wasm:
 	wasm-pack build --target web --out-dir plugin/wasm
+	rm -f plugin/wasm/.gitignore plugin/wasm/package.json plugin/wasm/README.md
 	@echo "✓  WASM rebuilt → plugin/wasm/"
 
 # ── Native binary ─────────────────────────────────────────────────────────────

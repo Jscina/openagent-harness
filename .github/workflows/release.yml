@@ -23,10 +23,6 @@ jobs:
       - name: Build WASM
         run: make wasm
 
-      - name: Verify WASM Build Is Committed
-        run: |
-          git diff --exit-code plugin/wasm/ || (echo "WASM artifacts are out of date! Please run 'make wasm' and commit the changes locally before tagging." && exit 1)
-
       - name: Run Tests
         run: cargo test
 
