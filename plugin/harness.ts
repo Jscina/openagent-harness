@@ -1,83 +1,254 @@
-import { tool, type Plugin } from "@opencode-ai/plugin";
-import { spawn, type ChildProcess } from "child_process";
+/**
+ * harness.ts — OpenCode server plugin (WASM edition)
+ *
+ * The Rust DAG state machine is compiled to WASM and loaded directly into
+ * this process.  No separate binary is spawned; no HTTP server is started.
+ *
+ * Data flow:
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │  OpenCode                                                           │
+ *   │    └─ loads plugin/harness.ts                                       │
+ *   │         └─ initSync(readFileSync("...wasm"))  → DagEngine in-proc  │
+ *   │         └─ get_agent_configs() → write .md files on first boot     │
+ *   │         └─ setInterval 500ms → dag.tick() → session + prompt       │
+ *   │         └─ session.idle / session.error → dag.process_event()      │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ */
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from "fs";
 import { dirname, join } from "path";
+import { homedir } from "os";
 import { fileURLToPath } from "url";
 
-const HARNESS_URL = process.env.HARNESS_URL ?? "http://localhost:7837";
+import { tool, type Plugin, type PluginInput } from "@opencode-ai/plugin";
+import {
+  DagEngine,
+  get_agent_configs,
+  initSync,
+} from "./wasm/openagent_harness.js";
 
-async function isHarnessRunning(): Promise<boolean> {
+// ─── WASM initialisation ──────────────────────────────────────────────────────
+
+const __dir = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Load and initialise the WASM module synchronously so the plugin is ready
+ * before the first hook fires.
+ */
+function loadWasm(): DagEngine {
+  const wasmPath = join(__dir, "wasm", "openagent_harness_bg.wasm");
+  const wasmBytes = readFileSync(wasmPath);
+  initSync({ module: wasmBytes });
+  return new DagEngine();
+}
+
+// ─── Agent config installation ────────────────────────────────────────────────
+
+/**
+ * Write all embedded agent configs to `~/.config/opencode/agents/` the first
+ * time the plugin loads.  Skips existing files so user edits are preserved.
+ *
+ * This replaces the need to run `openagent-harness install` manually — the
+ * configs are embedded in the WASM binary and installed automatically.
+ */
+function installAgentsIfNeeded(): void {
   try {
-    const resp = await fetch(`${HARNESS_URL}/tasks`, {
-      signal: AbortSignal.timeout(1000),
-    });
-    return resp.status < 500;
-  } catch {
-    return false;
+    const agentsDir = join(homedir(), ".config", "opencode", "agents");
+    mkdirSync(agentsDir, { recursive: true });
+
+    const configs: Record<string, string> = JSON.parse(get_agent_configs());
+    let installed = 0;
+    for (const [name, content] of Object.entries(configs)) {
+      const dest = join(agentsDir, `${name}.md`);
+      if (!existsSync(dest)) {
+        writeFileSync(dest, content, "utf8");
+        installed++;
+      }
+    }
+    if (installed > 0) {
+      console.log(
+        `[harness-plugin] installed ${installed} agent config(s) to ${agentsDir}`,
+      );
+    }
+  } catch (e) {
+    console.error("[harness-plugin] agent install failed (non-fatal):", e);
   }
 }
 
-async function waitForHarness(maxAttempts = 30): Promise<boolean> {
-  for (let i = 0; i < maxAttempts; i++) {
-    await new Promise((r) => setTimeout(r, 1000));
-    if (await isHarnessRunning()) return true;
-  }
-  return false;
+// ─── OpenCode ACP helpers ─────────────────────────────────────────────────────
+
+/**
+ * Parse "provider/model" → `{ providerID, modelID }` for prompt_async.
+ * No slash → defaults to `anthropic`.  Empty string → no model sent.
+ */
+function parseModel(
+  model: string,
+): { providerID: string; modelID: string } | undefined {
+  if (!model) return undefined;
+  const slash = model.indexOf("/");
+  return slash >= 0
+    ? { providerID: model.slice(0, slash), modelID: model.slice(slash + 1) }
+    : { providerID: "anthropic", modelID: model };
 }
 
-async function emit(type: string, session_id: string, payload: unknown) {
-  await fetch(`${HARNESS_URL}/events`, {
+/** Common request headers; injects Basic-auth when the env var is set. */
+function makeHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const pw = process.env.OPENCODE_SERVER_PASSWORD;
+  if (pw) {
+    headers["Authorization"] =
+      "Basic " + Buffer.from(`opencode:${pw}`).toString("base64");
+  }
+  return headers;
+}
+
+async function createSession(baseUrl: string): Promise<string> {
+  const resp = await fetch(`${baseUrl}/session`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ type, session_id, payload }),
-  }).catch((err) => {
-    console.error(`[harness-plugin] emit ${type} failed:`, err.message);
+    headers: makeHeaders(),
+    body: "{}",
+  });
+  if (!resp.ok) throw new Error(`createSession failed: ${resp.status}`);
+  const data = (await resp.json()) as { id: string };
+  return data.id;
+}
+
+async function sendMessage(
+  baseUrl: string,
+  sessionId: string,
+  prompt: string,
+  model: string,
+  agent?: string | null,
+): Promise<void> {
+  const body: Record<string, unknown> = {
+    parts: [{ type: "text", text: prompt }],
+  };
+  const modelSpec = parseModel(model);
+  if (modelSpec) body["model"] = modelSpec;
+  if (agent) body["agent"] = agent;
+  await fetch(`${baseUrl}/session/${sessionId}/prompt_async`, {
+    method: "POST",
+    headers: makeHeaders(),
+    body: JSON.stringify(body),
   });
 }
 
-export default (async () => {
-  const harnessRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+async function deleteSession(baseUrl: string, sessionId: string): Promise<void> {
+  await fetch(`${baseUrl}/session/${sessionId}`, {
+    method: "DELETE",
+    headers: makeHeaders(),
+  }).catch((e: unknown) => {
+    console.error("[harness-plugin] deleteSession failed:", e);
+  });
+}
 
-  let child: ChildProcess | undefined;
+async function showToast(
+  baseUrl: string,
+  title: string,
+  message: string,
+  variant: string,
+  duration?: number,
+): Promise<void> {
+  await fetch(`${baseUrl}/tui/show-toast`, {
+    method: "POST",
+    headers: makeHeaders(),
+    body: JSON.stringify({ title, message, variant, duration: duration ?? 8000 }),
+  }).catch((e: unknown) => {
+    console.error("[harness-plugin] showToast failed:", e);
+  });
+}
 
-  if (!(await isHarnessRunning())) {
-    console.log("[harness-plugin] harness not running, spawning...");
-    const harnessBin = process.env.HARNESS_BIN ?? "openagent-harness";
-    child = spawn(harnessBin, [], {
-      cwd: harnessRoot,
-      stdio: "inherit",
-    });
+// ─── Notification handling ────────────────────────────────────────────────────
 
-    child.on("error", (err) => {
-      console.error(
-        `[harness-plugin] failed to spawn harness (${harnessBin}):`,
-        err.message,
-      );
-    });
+interface ToastNotification {
+  type: "toast";
+  title: string;
+  message: string;
+  variant: string;
+  duration?: number;
+}
+type Notification = ToastNotification;
 
-    const ready = await waitForHarness();
-    if (ready) {
-      console.log("[harness-plugin] harness ready");
-    } else {
-      console.error("[harness-plugin] harness did not become ready in 30s");
+interface EventResult {
+  notifications: Notification[];
+  delete_session: string | null;
+}
+
+async function handleEventResult(
+  result: EventResult,
+  baseUrl: string,
+): Promise<void> {
+  for (const n of result.notifications) {
+    if (n.type === "toast") {
+      await showToast(baseUrl, n.title, n.message, n.variant, n.duration);
     }
-
-    const cleanup = () => {
-      if (child && !child.killed) {
-        child.kill();
-      }
-    };
-    process.on("exit", cleanup);
-    process.on("SIGTERM", () => {
-      cleanup();
-      process.exit(0);
-    });
-    process.on("SIGINT", () => {
-      cleanup();
-      process.exit(0);
-    });
-  } else {
-    console.log(`[harness-plugin] harness already running at ${HARNESS_URL}`);
   }
+  if (result.delete_session) {
+    await deleteSession(baseUrl, result.delete_session);
+  }
+}
+
+// ─── Plugin ───────────────────────────────────────────────────────────────────
+
+export default (async (input: PluginInput) => {
+  const baseUrl = input.serverUrl.toString().replace(/\/$/, "");
+
+  // Load WASM DAG engine.
+  const dag = loadWasm();
+  console.log("[harness-plugin] WASM DAG engine loaded");
+
+  // Install agent configs the first time this plugin runs.
+  installAgentsIfNeeded();
+
+  // ── Tick loop ──────────────────────────────────────────────────────────────
+  // Every 500 ms, find unblocked tasks and start them in OpenCode sessions.
+
+  let ticking = false;
+
+  const tickInterval = setInterval(async () => {
+    if (ticking) return;
+    ticking = true;
+    try {
+      const readyTasks = JSON.parse(dag.tick()) as Array<{
+        id: string;
+        prompt: string;
+        model: string;
+        agent: string | null;
+      }>;
+
+      for (const task of readyTasks) {
+        try {
+          const sessionId = await createSession(baseUrl);
+          dag.task_started(task.id, sessionId);
+          await sendMessage(baseUrl, sessionId, task.prompt, task.model, task.agent);
+          console.log(`[harness-plugin] task ${task.id} → session ${sessionId}`);
+        } catch (e) {
+          console.error(`[harness-plugin] failed to start task ${task.id}:`, e);
+          // Mark the task failed so dependent tasks aren't permanently blocked.
+          try {
+            const { session_id } = JSON.parse(dag.cancel_task(task.id)) as {
+              session_id: string | null;
+            };
+            if (session_id) await deleteSession(baseUrl, session_id);
+          } catch {
+            // already terminal — ignore
+          }
+        }
+      }
+    } finally {
+      ticking = false;
+    }
+  }, 500);
+
+  // Cleanup on process exit.
+  const cleanup = () => {
+    clearInterval(tickInterval);
+    dag.free();
+  };
+  process.on("exit", cleanup);
+  process.on("SIGTERM", () => { cleanup(); process.exit(0); });
+  process.on("SIGINT",  () => { cleanup(); process.exit(0); });
+
+  // ── Hooks ──────────────────────────────────────────────────────────────────
 
   return {
     tool: {
@@ -95,51 +266,43 @@ export default (async () => {
           ),
         },
         async execute({ tasks }) {
-          const resp = await fetch(`${HARNESS_URL}/workflows`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ tasks }),
-          });
-          if (!resp.ok) {
-            const text = await resp.text();
-            throw new Error(`submit_workflow failed: ${resp.status} ${text}`);
-          }
-          return JSON.stringify(await resp.json());
+          return dag.submit_workflow(JSON.stringify(tasks));
         },
       }),
     },
 
     event: async ({ event }) => {
       if (event.type === "session.idle") {
-        await emit(
-          "session.idle",
-          event.properties.sessionID,
-          event.properties,
+        const sessionId: string = event.properties.sessionID;
+        const result: EventResult = JSON.parse(
+          dag.process_event("session.idle", sessionId, JSON.stringify(event.properties)),
         );
+        await handleEventResult(result, baseUrl);
       } else if (event.type === "session.error") {
-        await emit(
-          "session.error",
-          event.properties.sessionID ?? "",
-          event.properties,
+        const sessionId: string = event.properties.sessionID ?? "";
+        if (!sessionId) return;
+        const result: EventResult = JSON.parse(
+          dag.process_event("session.error", sessionId, JSON.stringify(event.properties)),
         );
+        await handleEventResult(result, baseUrl);
       }
     },
 
-    "tool.execute.before": async (input, output) => {
-      await emit("tool.execute.before", input.sessionID, {
-        tool: input.tool,
-        callID: input.callID,
-        args: output.args,
-      });
+    "tool.execute.before": async (_input) => {
+      // No state change on before-hook; reserved for future use.
     },
 
     "tool.execute.after": async (input, output) => {
-      await emit("tool.execute.after", input.sessionID, {
-        tool: input.tool,
-        callID: input.callID,
-        args: input.args,
-        result: output.output,
-      });
+      dag.process_event(
+        "tool.execute.after",
+        input.sessionID,
+        JSON.stringify({
+          tool: input.tool,
+          callID: input.callID,
+          args: input.args,
+          result: output.output,
+        }),
+      );
     },
   };
 }) satisfies Plugin;

@@ -1,41 +1,64 @@
 # openagent-harness
 
-Deterministic agent harness for [OpenCode](https://opencode.ai). Control flow lives in Rust. OpenCode is a worker. The LLM never decides what runs next.
+Deterministic agent harness for [OpenCode](https://opencode.ai). The DAG state machine compiles to WebAssembly (WASM) and runs directly inside the OpenCode TypeScript plugin. No separate native binary or HTTP server is required at runtime!
 
 ## How it works
 
 ```
-OpenCode loads plugin  →  plugin checks harness health
-                       →  if not running: spawns binary, waits for ready
-
-orchestrator receives user request
-  → spawns @planner (for coding tasks)
-  → calls submit_workflow tool with planner's JSON output
-  → harness creates all tasks atomically with UUID dependency graph
-  → polls get_workflow_status until terminal
-  → reports completion or failure
-
-tick loop (500ms)
-  → starts pending tasks whose deps are Done
-  → sends prompt + agent to OpenCode session via ACP
-
-plugin fires tool.execute.after  →  appends result to task.output
-plugin fires session.idle        →  marks task Done, deletes ACP session
-                                 →  updates workflow status if all tasks terminal
-                                 →  starts next eligible task
+OpenCode process
+  └─ loads plugin/harness.ts
+       └─ initSync(readFileSync("...wasm"))  → DagEngine (in-process)
+       └─ get_agent_configs()               → install .md files on first boot
+       └─ setInterval 500ms
+            └─ dag.tick()          → ready tasks
+            └─ POST /session        → create OpenCode session
+            └─ POST /session/{id}/prompt_async
+            └─ dag.task_started()
+       └─ event hook (session.idle / session.error)
+            └─ dag.process_event()  → notifications + session to delete
+            └─ DELETE /session/{id}
+            └─ POST /tui/show-toast (on workflow completion/failure)
 ```
+
+1. The `orchestrator` agent receives a user request.
+2. It spawns the `@planner` (for coding tasks).
+3. The planner uses the `submit_workflow` tool with its JSON output.
+4. The WASM `DagEngine` creates all tasks atomically in its in-memory DAG.
+5. The 500ms tick loop automatically kicks off pending tasks when their dependencies finish.
+6. The TS plugin listens for `session.idle` and `session.error` events and feeds them to the DAG to advance the workflow state.
 
 ## Quickstart
 
+### Building the WASM plugin
+
+You need [wasm-pack](https://rustwasm.github.io/wasm-pack/) installed.
+
 ```sh
-# 1. Install the harness, agents, and plugin
-curl -sSL https://raw.githubusercontent.com/Jscina/openagent-harness/main/install.sh | bash
+cargo install wasm-pack
+make wasm
+```
 
-# 2. Add the binary to your PATH (the installer will warn you if needed)
-export PATH="$HOME/.local/bin:$PATH"
+This compiles the Rust DAG to `plugin/wasm/` and generates the JS/TS glue.
 
-# 3. Start OpenCode — plugin auto-starts the harness
-opencode
+### Using the plugin
+
+Add the plugin to your `opencode.json`:
+
+```json
+{
+  "plugin": ["/path/to/openagent-harness/plugin/harness.ts"]
+}
+```
+
+The very first time the plugin loads, it automatically calls the WASM library to write 11 embedded agent `.md` files to `~/.config/opencode/agents/`.
+
+## Install subcommand (Optional)
+
+If you don't want to use the WASM auto-installer, you can build and use the native CLI to install the agent configs:
+
+```sh
+cargo run -- install           # skip agents that already exist
+cargo run -- install --force   # overwrite existing agents
 ```
 
 ## Agent team
@@ -54,71 +77,16 @@ opencode
 | `debugger` | subagent | `google/gemini-2.5-flash` | Failure diagnosis |
 | `docs-writer` | subagent | `openai/gpt-5-nano` | Documentation updates |
 
-## Install subcommand
-
-```sh
-openagent-harness install           # skip agents that already exist
-openagent-harness install --force   # overwrite existing agents
-```
-
-Writes 11 agent definitions to `~/.config/opencode/agents/`. Embedded in the binary — no separate asset directory.
-
-## API
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/workflows` | Submit planner output, create all tasks atomically |
-| `GET` | `/workflows/{id}` | Get workflow status + task list |
-| `POST` | `/tasks` | Create individual task |
-| `GET` | `/tasks` | List all tasks |
-| `GET` | `/tasks/{id}` | Get task by ID |
-| `DELETE` | `/tasks/{id}` | Cancel task |
-| `POST` | `/events` | Plugin event receiver (internal) |
-
-**Submit workflow:**
-```json
-{
-  "tasks": [
-    { "agent": "explorer", "prompt": "map the auth module", "depends_on": [] },
-    { "agent": "builder", "prompt": "implement OAuth routes", "depends_on": [0] }
-  ]
-}
-```
-
-`depends_on` uses zero-based indices into the `tasks` array. All agents are validated against OpenCode before the workflow is accepted. Returns 400 if an agent is not found; 500 for other errors.
-
-**Workflow response:**
-```json
-{ "workflow_id": "uuid", "task_ids": ["uuid-0", "uuid-1"] }
-```
-
-**Workflow status:**
-```json
-{ "id": "uuid", "status": { "type": "running" }, "tasks": ["..."], ... }
-{ "id": "uuid", "status": { "type": "done" }, "tasks": ["..."], ... }
-{ "id": "uuid", "status": { "type": "failed", "task_id": "uuid", "reason": "..." }, ... }
-```
-
-**Plugin tools** (available inside OpenCode sessions):
-- `submit_workflow(tasks)` — submit planner's tasks array, returns `{workflow_id, task_ids}`
-- `get_workflow_status(workflow_id)` — poll current workflow state
-
 ## Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENCODE_PORT` | `4096` | OpenCode ACP port |
-| `OPENCODE_SERVER_PASSWORD` | — | Basic auth password for OpenCode |
-| `HARNESS_PORT` | `7837` | Harness HTTP port |
-| `HARNESS_URL` | `http://localhost:7837` | URL the plugin posts events to |
-| `HARNESS_BIN` | `openagent-harness` | Harness binary path (used by plugin) |
-| `RUST_LOG` | `openagent_harness=info` | Log filter |
+| `OPENCODE_SERVER_PASSWORD` | — | Basic auth password for OpenCode ACP |
 
 ## Development
 
 ```sh
-cargo build
-cargo test       # 54 tests, no live services needed
-cargo fmt
+make wasm        # rebuild the WASM plugin module
+cargo test       # 24 tests, no live services needed
 cargo clippy
 ```

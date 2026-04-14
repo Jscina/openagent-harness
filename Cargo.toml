@@ -3,20 +3,28 @@ name = "openagent-harness"
 version = "0.1.0"
 edition = "2024"
 
+# cdylib  → wasm-pack builds the .wasm file
+# rlib    → the native install binary links against this lib
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "openagent-harness"
+path = "src/main.rs"
+
+# ── Shared (both targets) ──────────────────────────────────────────────────────
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "signal", "time"] }
-axum = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-dashmap = "6"
-anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-dirs = "5"
 
-[dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
+# ── WASM-only ─────────────────────────────────────────────────────────────────
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+uuid = { version = "1", features = ["v4", "js"] }
+
+# ── Native-only (install binary + tests) ──────────────────────────────────────
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+uuid = { version = "1", features = ["v4"] }
+dirs = "5"
+anyhow = "1"

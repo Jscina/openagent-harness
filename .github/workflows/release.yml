@@ -6,58 +6,49 @@ on:
       - 'v*'
 
 jobs:
-  build:
-    name: Build Release Binaries
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            use-cross: true
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: macos-latest
-            target: aarch64-apple-darwin
-
+  build-and-test:
+    name: Build WASM & Run Tests
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: wasm32-unknown-unknown
 
-      - name: Install Cross
-        if: matrix.use-cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Install wasm-pack
+        run: cargo install wasm-pack
 
-      - name: Build Target
-        if: ${{ !matrix.use-cross }}
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build WASM
+        run: make wasm
 
-      - name: Build Target (Cross)
-        if: matrix.use-cross
-        run: cross build --release --target ${{ matrix.target }}
-
-      - name: Package Release
-        shell: bash
+      - name: Verify WASM Build Is Committed
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czvf openagent-harness-${{ matrix.target }}.tar.gz openagent-harness
-          mv openagent-harness-${{ matrix.target }}.tar.gz ../../../
+          git diff --exit-code plugin/wasm/ || (echo "WASM artifacts are out of date! Please run 'make wasm' and commit the changes locally before tagging." && exit 1)
+
+      - name: Run Tests
+        run: cargo test
+
+      - name: Run Clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Package Plugin
+        run: |
+          cd plugin
+          # We don't need node_modules or local locks in the release artifact
+          rm -rf node_modules bun.lockb package-lock.json
+          tar czvf ../openagent-harness-plugin.tar.gz .
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
-          path: openagent-harness-${{ matrix.target }}.tar.gz
+          name: plugin-bundle
+          path: openagent-harness-plugin.tar.gz
 
   release:
     name: Create GitHub Release
-    needs: build
+    needs: build-and-test
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -67,11 +58,11 @@ jobs:
       - name: Download Artifacts
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
-          merge-multiple: true
+          name: plugin-bundle
+          path: .
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.tar.gz
+          files: openagent-harness-plugin.tar.gz
           generate_release_notes: true

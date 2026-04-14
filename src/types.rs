@@ -1,61 +1,50 @@
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "message")]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "type", content = "message", rename_all = "snake_case")]
 pub enum TaskStatus {
     Pending,
     Running,
-    Idle,
     Done,
     Failed(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
-    pub id: Uuid,
+    pub id: String,
     pub prompt: String,
-    /// "provider/model", e.g. "anthropic/claude-sonnet-4-20250514"
     pub model: String,
     pub agent: Option<String>,
     pub session_id: Option<String>,
     pub status: TaskStatus,
     pub output: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Node {
-    pub id: Uuid,
+pub(crate) struct Node {
+    pub id: String,
     pub task: Task,
-    /// Empty vec = no deps, task is eligible to run immediately.
-    pub depends_on: Vec<Uuid>,
-    pub workflow_id: Option<Uuid>,
+    pub depends_on: Vec<String>,
+    pub workflow_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkflowStatus {
     Running,
     Done,
-    Failed { task_id: Uuid, reason: String },
+    Failed { task_id: String, reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workflow {
-    pub id: Uuid,
+    pub id: String,
     pub status: WorkflowStatus,
-    pub tasks: Vec<Uuid>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub tasks: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct WorkflowTask {
+pub(crate) struct WorkflowTaskInput {
     pub agent: String,
     pub prompt: String,
     #[serde(default)]
@@ -63,28 +52,30 @@ pub struct WorkflowTask {
     pub model: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct SubmitWorkflowRequest {
-    pub tasks: Vec<WorkflowTask>,
-}
-
 #[derive(Debug, Serialize)]
-pub struct SubmitWorkflowResponse {
-    pub workflow_id: Uuid,
-    pub task_ids: Vec<Uuid>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CreateTaskRequest {
+pub(crate) struct ReadyTask {
+    pub id: String,
     pub prompt: String,
-    pub model: Option<String>,
+    pub model: String,
     pub agent: Option<String>,
-    pub depends_on: Option<Vec<Uuid>>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct CreateTaskResponse {
-    pub id: Uuid,
+pub struct EventResult {
+    pub notifications: Vec<Notification>,
+    pub delete_session: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Notification {
+    Toast {
+        title: String,
+        message: String,
+        variant: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration: Option<u32>,
+    },
 }
 
 #[cfg(test)]
@@ -93,96 +84,43 @@ mod tests {
 
     #[test]
     fn task_status_pending_roundtrip() {
-        let s = TaskStatus::Pending;
-        let json = serde_json::to_string(&s).unwrap();
-        assert_eq!(json, r#"{"type":"pending"}"#);
-        let back: TaskStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, s);
+        let s = serde_json::to_string(&TaskStatus::Pending).unwrap();
+        assert_eq!(s, r#"{"type":"pending"}"#);
+        assert_eq!(
+            serde_json::from_str::<TaskStatus>(&s).unwrap(),
+            TaskStatus::Pending
+        );
     }
 
     #[test]
     fn task_status_failed_roundtrip() {
-        let s = TaskStatus::Failed("timeout".to_string());
-        let json = serde_json::to_string(&s).unwrap();
-        assert_eq!(json, r#"{"type":"failed","message":"timeout"}"#);
-        let back: TaskStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, s);
+        let s = serde_json::to_string(&TaskStatus::Failed("boom".into())).unwrap();
+        assert_eq!(s, r#"{"type":"failed","message":"boom"}"#);
+        let back: TaskStatus = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, TaskStatus::Failed("boom".into()));
     }
 
     #[test]
     fn task_status_done_roundtrip() {
-        let s = TaskStatus::Done;
-        let json = serde_json::to_string(&s).unwrap();
-        assert_eq!(json, r#"{"type":"done"}"#);
-        let back: TaskStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, s);
+        let s = serde_json::to_string(&TaskStatus::Done).unwrap();
+        assert_eq!(s, r#"{"type":"done"}"#);
     }
 
     #[test]
-    fn workflow_status_running_roundtrip() {
-        let s = WorkflowStatus::Running;
-        let json = serde_json::to_string(&s).unwrap();
-        assert_eq!(json, r#"{"type":"running"}"#);
-        let back: WorkflowStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, s);
-    }
+    fn workflow_status_roundtrips() {
+        let s = serde_json::to_string(&WorkflowStatus::Running).unwrap();
+        assert_eq!(s, r#"{"type":"running"}"#);
 
-    #[test]
-    fn workflow_status_done_roundtrip() {
-        let s = WorkflowStatus::Done;
-        let json = serde_json::to_string(&s).unwrap();
-        assert_eq!(json, r#"{"type":"done"}"#);
-        let back: WorkflowStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, s);
-    }
+        let s = serde_json::to_string(&WorkflowStatus::Done).unwrap();
+        assert_eq!(s, r#"{"type":"done"}"#);
 
-    #[test]
-    fn workflow_status_failed_roundtrip() {
-        let id = Uuid::new_v4();
-        let s = WorkflowStatus::Failed {
-            task_id: id,
-            reason: "timed out".to_string(),
-        };
-        let json = serde_json::to_value(&s).unwrap();
-        assert_eq!(json["type"], "failed");
-        assert_eq!(json["task_id"], id.to_string());
-        assert_eq!(json["reason"], "timed out");
-        let back: WorkflowStatus = serde_json::from_value(json).unwrap();
-        assert_eq!(back, s);
-    }
-
-    #[test]
-    fn create_task_request_optional_fields() {
-        let json = r#"{"prompt":"hello"}"#;
-        let req: CreateTaskRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.prompt, "hello");
-        assert!(req.model.is_none());
-        assert!(req.agent.is_none());
-        assert!(req.depends_on.is_none());
-    }
-
-    #[test]
-    fn create_task_request_with_agent() {
-        let json = r#"{"prompt":"map the codebase","agent":"explorer"}"#;
-        let req: CreateTaskRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.agent.as_deref(), Some("explorer"));
-    }
-
-    #[test]
-    fn submit_workflow_request_deserializes() {
-        let json = r#"{
-            "tasks": [
-                {"agent": "explorer", "prompt": "map auth", "depends_on": []},
-                {"agent": "builder", "prompt": "implement oauth", "depends_on": [0], "model": "anthropic/claude-opus-4-6"}
-            ]
-        }"#;
-        let req: SubmitWorkflowRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.tasks.len(), 2);
-        assert_eq!(req.tasks[0].agent, "explorer");
-        assert_eq!(req.tasks[1].depends_on, vec![0usize]);
-        assert_eq!(
-            req.tasks[1].model.as_deref(),
-            Some("anthropic/claude-opus-4-6")
-        );
+        let v = serde_json::to_value(&WorkflowStatus::Failed {
+            task_id: "tid-1".into(),
+            reason: "oops".into(),
+        })
+        .unwrap();
+        assert_eq!(v["type"], "failed");
+        assert_eq!(v["task_id"], "tid-1");
+        assert_eq!(v["reason"], "oops");
     }
 }
