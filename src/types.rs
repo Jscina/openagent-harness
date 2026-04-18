@@ -43,6 +43,35 @@ pub struct Workflow {
     pub tasks: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowTaskSnapshot {
+    pub id: String,
+    pub agent: Option<String>,
+    pub model: String,
+    pub session_id: Option<String>,
+    pub status: TaskStatus,
+    pub depends_on: Vec<String>,
+    pub blocked_on: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowSnapshot {
+    pub id: String,
+    pub status: WorkflowStatus,
+    pub tasks: Vec<WorkflowTaskSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowSummary {
+    pub id: String,
+    pub status: WorkflowStatus,
+    pub task_count: usize,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct WorkflowTaskInput {
     pub agent: String,

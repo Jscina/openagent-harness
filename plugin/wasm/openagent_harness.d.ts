@@ -8,9 +8,12 @@ export class DagEngine {
     free(): void;
     [Symbol.dispose](): void;
     cancel_task(id: string): string;
+    fail_task(id: string, reason: string): string;
     get_task(id: string): string;
     get_workflow(id: string): string;
+    get_workflow_snapshot(id: string): string;
     list_tasks(): string;
+    list_workflow_summaries(): string;
     constructor();
     process_event(event_type: string, session_id: string, payload_json: string): string;
     submit_workflow(tasks_json: string): string;
@@ -40,6 +43,9 @@ export interface InitOutput {
     readonly wasmdagengine_get_task: (a: number, b: number, c: number) => [number, number];
     readonly wasmdagengine_list_tasks: (a: number) => [number, number];
     readonly wasmdagengine_get_workflow: (a: number, b: number, c: number) => [number, number];
+    readonly wasmdagengine_get_workflow_snapshot: (a: number, b: number, c: number) => [number, number];
+    readonly wasmdagengine_list_workflow_summaries: (a: number) => [number, number];
+    readonly wasmdagengine_fail_task: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly wasmdagengine_cancel_task: (a: number, b: number, c: number) => [number, number, number, number];
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_exn_store: (a: number) => void;

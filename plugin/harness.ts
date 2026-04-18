@@ -173,6 +173,46 @@ interface EventResult {
   delete_session: string | null;
 }
 
+function parseJson(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function listHarnessWorkflows(dag: DagEngine): unknown {
+  return parseJson(dag.list_workflow_summaries());
+}
+
+function getHarnessWorkflowSnapshot(dag: DagEngine, workflowId: string): unknown {
+  return parseJson(dag.get_workflow_snapshot(workflowId));
+}
+
+function extractWorkflowStatus(snapshot: unknown): string | null {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  const obj = snapshot as {
+    status?: unknown;
+    state?: unknown;
+    workflow?: { status?: unknown; state?: unknown };
+  };
+
+  const status =
+    obj.status ?? obj.state ?? obj.workflow?.status ?? obj.workflow?.state;
+  if (typeof status === "string") {
+    return status.toLowerCase();
+  }
+  if (status && typeof status === "object") {
+    const tagged = status as { type?: unknown };
+    return typeof tagged.type === "string" ? tagged.type.toLowerCase() : null;
+  }
+  return null;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function handleEventResult(
   result: EventResult,
   baseUrl: string,
@@ -216,16 +256,18 @@ export default (async (input: PluginInput) => {
       }>;
 
       for (const task of readyTasks) {
+        let sessionId: string | null = null;
         try {
-          const sessionId = await createSession(baseUrl);
+          sessionId = await createSession(baseUrl);
           dag.task_started(task.id, sessionId);
           await sendMessage(baseUrl, sessionId, task.prompt, task.model, task.agent);
           console.log(`[harness-plugin] task ${task.id} → session ${sessionId}`);
         } catch (e) {
           console.error(`[harness-plugin] failed to start task ${task.id}:`, e);
-          // Mark the task failed so dependent tasks aren't permanently blocked.
+          const message = e instanceof Error ? e.message : String(e);
+          // Mark the task failed so visibility reflects the startup error.
           try {
-            const { session_id } = JSON.parse(dag.cancel_task(task.id)) as {
+            const { session_id } = JSON.parse(dag.fail_task(task.id, message)) as {
               session_id: string | null;
             };
             if (session_id) await deleteSession(baseUrl, session_id);
@@ -267,6 +309,73 @@ export default (async (input: PluginInput) => {
         },
         async execute({ tasks }) {
           return dag.submit_workflow(JSON.stringify(tasks));
+        },
+      }),
+
+      harness_state: tool({
+        description:
+          "Read-only harness visibility. Without workflow_id lists workflows; with workflow_id returns workflow snapshot.",
+        args: {
+          workflow_id: tool.schema.string().optional(),
+        },
+        async execute({ workflow_id }) {
+          const payload = workflow_id
+            ? { workflow_id, snapshot: getHarnessWorkflowSnapshot(dag, workflow_id) }
+            : { workflows: listHarnessWorkflows(dag) };
+          return JSON.stringify(payload);
+        },
+      }),
+
+      wait_for_workflow: tool({
+        description:
+          "Poll a workflow internally until terminal state (done/failed) or timeout.",
+        args: {
+          workflow_id: tool.schema.string(),
+          timeout_ms: tool.schema.number().optional(),
+          interval_ms: tool.schema.number().optional(),
+        },
+        async execute({ workflow_id, timeout_ms, interval_ms }) {
+          const timeoutMs = Math.max(1, timeout_ms ?? 60_000);
+          const intervalMs = Math.max(50, interval_ms ?? 1_000);
+          const startedAt = Date.now();
+
+          let snapshot: unknown = null;
+          let status: string | null = null;
+
+          while (Date.now() - startedAt < timeoutMs) {
+            snapshot = getHarnessWorkflowSnapshot(dag, workflow_id);
+            if (snapshot === null) {
+              return JSON.stringify({
+                workflow_id,
+                terminal: false,
+                timed_out: false,
+                missing: true,
+                elapsed_ms: Date.now() - startedAt,
+              });
+            }
+            status = extractWorkflowStatus(snapshot);
+
+            if (status === "done" || status === "failed") {
+              return JSON.stringify({
+                workflow_id,
+                terminal: true,
+                status,
+                elapsed_ms: Date.now() - startedAt,
+                snapshot,
+              });
+            }
+
+            await sleep(intervalMs);
+          }
+
+          return JSON.stringify({
+            workflow_id,
+            terminal: false,
+            timed_out: true,
+            status,
+            elapsed_ms: Date.now() - startedAt,
+            snapshot,
+          });
         },
       }),
     },

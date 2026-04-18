@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::types::*;
 
 const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-6";
+const SNAPSHOT_PREVIEW_CHARS: usize = 240;
 
 /// Synchronous DAG state machine.
 ///
@@ -268,6 +269,32 @@ impl DagEngine {
         }
     }
 
+    /// JSON `WorkflowSnapshot` for `id`, or `"null"`.
+    pub fn get_workflow_snapshot(&self, id: &str) -> String {
+        match self.build_workflow_snapshot(id) {
+            Some(snapshot) => {
+                serde_json::to_string(&snapshot).unwrap_or_else(|_| "null".to_string())
+            }
+            None => "null".to_string(),
+        }
+    }
+
+    /// JSON array of `WorkflowSummary` for all workflows.
+    pub fn list_workflow_summaries(&self) -> String {
+        let mut summaries: Vec<WorkflowSummary> = self
+            .workflows
+            .values()
+            .map(|wf| WorkflowSummary {
+                id: wf.id.clone(),
+                status: wf.status.clone(),
+                task_count: wf.tasks.len(),
+            })
+            .collect();
+
+        summaries.sort_by(|a, b| a.id.cmp(&b.id));
+        serde_json::to_string(&summaries).unwrap_or_else(|_| "[]".to_string())
+    }
+
     /// Cancel a task.  Returns JSON `{session_id: string|null}` or an error string.
     pub fn cancel_task(&mut self, id: &str) -> Result<String, String> {
         let node = self
@@ -284,6 +311,30 @@ impl DagEngine {
         if let Some(ref sid) = session_id {
             self.session_to_task.remove(sid);
         }
+        self.update_workflow_status(id);
+
+        Ok(serde_json::json!({ "session_id": session_id }).to_string())
+    }
+
+    /// Mark a task failed with a specific reason and propagate workflow status.
+    ///
+    /// Returns JSON `{session_id: string|null}` or an error string.
+    pub fn fail_task(&mut self, id: &str, reason: &str) -> Result<String, String> {
+        let node = self
+            .nodes
+            .get_mut(id)
+            .ok_or_else(|| format!("task {id} not found"))?;
+
+        if matches!(node.task.status, TaskStatus::Done | TaskStatus::Failed(_)) {
+            return Err(format!("task {id} is already terminal"));
+        }
+
+        node.task.status = TaskStatus::Failed(reason.to_string());
+        let session_id = node.task.session_id.clone();
+        if let Some(ref sid) = session_id {
+            self.session_to_task.remove(sid);
+        }
+        self.update_workflow_status(id);
 
         Ok(serde_json::json!({ "session_id": session_id }).to_string())
     }
@@ -296,8 +347,8 @@ impl DagEngine {
             _ => return None,
         };
 
-        let mut all_terminal = true;
         let mut first_failure: Option<(String, String)> = None;
+        let mut all_done = true;
 
         for tid in &task_ids {
             match self.nodes.get(tid).map(|n| &n.task.status) {
@@ -306,25 +357,29 @@ impl DagEngine {
                     if first_failure.is_none() {
                         first_failure = Some((tid.clone(), reason.clone()));
                     }
+                    all_done = false;
                 }
                 _ => {
-                    all_terminal = false;
+                    all_done = false;
                 }
             }
         }
 
-        if !all_terminal {
+        if let Some((fid, reason)) = first_failure {
+            let wf = self.workflows.get_mut(&workflow_id).unwrap();
+            wf.status = WorkflowStatus::Failed {
+                task_id: fid,
+                reason,
+            };
+            return Some(wf.status.clone());
+        }
+
+        if !all_done {
             return None;
         }
 
         let wf = self.workflows.get_mut(&workflow_id).unwrap();
-        wf.status = match first_failure {
-            Some((fid, reason)) => WorkflowStatus::Failed {
-                task_id: fid,
-                reason,
-            },
-            None => WorkflowStatus::Done,
-        };
+        wf.status = WorkflowStatus::Done;
         Some(wf.status.clone())
     }
 
@@ -351,6 +406,55 @@ impl DagEngine {
             }
             _ => {}
         }
+    }
+
+    fn build_workflow_snapshot(&self, id: &str) -> Option<WorkflowSnapshot> {
+        let wf = self.workflows.get(id)?;
+
+        let tasks = wf
+            .tasks
+            .iter()
+            .filter_map(|task_id| self.nodes.get(task_id))
+            .map(|node| WorkflowTaskSnapshot {
+                id: node.task.id.clone(),
+                agent: node.task.agent.clone(),
+                model: node.task.model.clone(),
+                session_id: node.task.session_id.clone(),
+                status: node.task.status.clone(),
+                depends_on: node.depends_on.clone(),
+                blocked_on: node
+                    .depends_on
+                    .iter()
+                    .filter(|dep_id| {
+                        !self
+                            .nodes
+                            .get(*dep_id)
+                            .is_some_and(|dep| matches!(dep.task.status, TaskStatus::Done))
+                    })
+                    .cloned()
+                    .collect(),
+                output_preview: node.task.output.as_deref().and_then(Self::make_preview),
+                prompt_preview: Self::make_preview(&node.task.prompt),
+            })
+            .collect();
+
+        Some(WorkflowSnapshot {
+            id: wf.id.clone(),
+            status: wf.status.clone(),
+            tasks,
+        })
+    }
+
+    fn make_preview(text: &str) -> Option<String> {
+        if text.is_empty() {
+            return None;
+        }
+
+        let mut preview: String = text.chars().take(SNAPSHOT_PREVIEW_CHARS).collect();
+        if text.chars().count() > SNAPSHOT_PREVIEW_CHARS {
+            preview.push('…');
+        }
+        Some(preview)
     }
 
     #[inline]
@@ -644,6 +748,29 @@ mod tests {
     }
 
     #[test]
+    fn failing_a_task_updates_workflow_status_immediately() {
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([
+            {"agent": "a", "prompt": "first", "depends_on": []},
+            {"agent": "b", "prompt": "second", "depends_on": [0]},
+        ]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let wf_id = resp["workflow_id"].as_str().unwrap();
+        let task_id = resp["task_ids"][0].as_str().unwrap();
+
+        dag.tick();
+        let _: serde_json::Value = serde_json::from_str(
+            &dag.fail_task(task_id, "createSession failed: 503").unwrap(),
+        )
+        .unwrap();
+
+        let wf: serde_json::Value = serde_json::from_str(&dag.get_workflow(wf_id)).unwrap();
+        assert_eq!(wf["status"]["type"], "failed");
+        assert_eq!(wf["status"]["task_id"], task_id);
+    }
+
+    #[test]
     fn session_mapping_removed_after_idle() {
         let mut dag = DagEngine::new();
         let tasks = serde_json::json!([{"agent": "a", "prompt": "p", "depends_on": []}]);
@@ -659,5 +786,99 @@ mod tests {
         let r: serde_json::Value =
             serde_json::from_str(&dag.process_event("session.idle", "ses_clean", "null")).unwrap();
         assert!(r["delete_session"].is_null());
+    }
+
+    #[test]
+    fn workflow_snapshot_reports_blocked_on_dependencies() {
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([
+            {"agent": "a", "prompt": "first", "depends_on": []},
+            {"agent": "b", "prompt": "second", "depends_on": [0]},
+        ]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let wf_id = resp["workflow_id"].as_str().unwrap();
+        let first_id = resp["task_ids"][0].as_str().unwrap();
+        let second_id = resp["task_ids"][1].as_str().unwrap();
+
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&dag.get_workflow_snapshot(wf_id)).unwrap();
+        let tasks = snapshot["tasks"].as_array().unwrap();
+        let first = tasks
+            .iter()
+            .find(|t| t["id"] == first_id)
+            .expect("first task missing");
+        let second = tasks
+            .iter()
+            .find(|t| t["id"] == second_id)
+            .expect("second task missing");
+
+        assert_eq!(first["blocked_on"].as_array().unwrap().len(), 0);
+        assert_eq!(second["blocked_on"].as_array().unwrap().len(), 1);
+        assert_eq!(second["blocked_on"][0], first_id);
+
+        dag.tick();
+        dag.task_started(first_id, "ses_first");
+        dag.process_event("session.idle", "ses_first", "null");
+
+        let snapshot_after: serde_json::Value =
+            serde_json::from_str(&dag.get_workflow_snapshot(wf_id)).unwrap();
+        let second_after = snapshot_after["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == second_id)
+            .expect("second task missing after completion");
+        assert_eq!(second_after["blocked_on"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn workflow_snapshot_and_summary_include_status_and_previews() {
+        let mut dag = DagEngine::new();
+        let long_prompt = "p".repeat(SNAPSHOT_PREVIEW_CHARS + 30);
+        let long_output = "o".repeat(SNAPSHOT_PREVIEW_CHARS + 40);
+        let tasks = serde_json::json!([
+            {"agent": "a", "prompt": long_prompt, "depends_on": []},
+        ]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let wf_id = resp["workflow_id"].as_str().unwrap();
+        let task_id = resp["task_ids"][0].as_str().unwrap();
+
+        dag.tick();
+        dag.task_started(task_id, "ses_preview");
+        dag.process_event(
+            "tool.execute.after",
+            "ses_preview",
+            &serde_json::json!({"result": long_output}).to_string(),
+        );
+
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&dag.get_workflow_snapshot(wf_id)).unwrap();
+        assert_eq!(snapshot["id"], wf_id);
+        assert_eq!(snapshot["status"]["type"], "running");
+
+        let task = &snapshot["tasks"][0];
+        assert_eq!(task["id"], task_id);
+        assert_eq!(task["agent"], "a");
+        assert_eq!(task["status"]["type"], "running");
+        assert!(task["prompt_preview"].as_str().unwrap().ends_with('…'));
+        assert!(task["output_preview"].as_str().unwrap().ends_with('…'));
+        assert!(task["prompt_preview"].as_str().unwrap().chars().count() <= SNAPSHOT_PREVIEW_CHARS + 1);
+        assert!(task["output_preview"].as_str().unwrap().chars().count() <= SNAPSHOT_PREVIEW_CHARS + 1);
+
+        let summaries: serde_json::Value =
+            serde_json::from_str(&dag.list_workflow_summaries()).unwrap();
+        let summary = summaries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|wf| wf["id"] == wf_id)
+            .expect("workflow summary missing");
+        assert_eq!(summary["status"]["type"], "running");
+        assert_eq!(summary["task_count"], 1);
+
+        let missing: serde_json::Value = serde_json::from_str(&dag.get_workflow_snapshot("missing")).unwrap();
+        assert!(missing.is_null());
     }
 }

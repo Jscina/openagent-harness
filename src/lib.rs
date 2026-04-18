@@ -93,6 +93,20 @@ mod wasm {
             self.0.get_workflow(id)
         }
 
+        pub fn get_workflow_snapshot(&self, id: &str) -> String {
+            self.0.get_workflow_snapshot(id)
+        }
+
+        pub fn list_workflow_summaries(&self) -> String {
+            self.0.list_workflow_summaries()
+        }
+
+        pub fn fail_task(&mut self, id: &str, reason: &str) -> Result<String, JsValue> {
+            self.0
+                .fail_task(id, reason)
+                .map_err(|e| JsValue::from_str(&e))
+        }
+
         pub fn cancel_task(&mut self, id: &str) -> Result<String, JsValue> {
             self.0.cancel_task(id).map_err(|e| JsValue::from_str(&e))
         }

@@ -11,6 +11,9 @@ export const wasmdagengine_process_event: (a: number, b: number, c: number, d: n
 export const wasmdagengine_get_task: (a: number, b: number, c: number) => [number, number];
 export const wasmdagengine_list_tasks: (a: number) => [number, number];
 export const wasmdagengine_get_workflow: (a: number, b: number, c: number) => [number, number];
+export const wasmdagengine_get_workflow_snapshot: (a: number, b: number, c: number) => [number, number];
+export const wasmdagengine_list_workflow_summaries: (a: number) => [number, number];
+export const wasmdagengine_fail_task: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
 export const wasmdagengine_cancel_task: (a: number, b: number, c: number) => [number, number, number, number];
 export const __wbindgen_free: (a: number, b: number, c: number) => void;
 export const __wbindgen_exn_store: (a: number) => void;
