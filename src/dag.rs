@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::types::*;
 
-const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-6";
 
 /// Synchronous DAG state machine.
 ///
@@ -33,8 +33,8 @@ impl DagEngine {
     /// Submit a workflow.  Returns JSON `{workflow_id, task_ids}` or an error
     /// message string.
     pub fn submit_workflow(&mut self, tasks_json: &str) -> Result<String, String> {
-        let tasks: Vec<WorkflowTaskInput> = serde_json::from_str(tasks_json)
-            .map_err(|e| format!("invalid tasks JSON: {e}"))?;
+        let tasks: Vec<WorkflowTaskInput> =
+            serde_json::from_str(tasks_json).map_err(|e| format!("invalid tasks JSON: {e}"))?;
 
         if tasks.is_empty() {
             return Err("workflow must have at least one task".into());
@@ -58,8 +58,11 @@ impl DagEngine {
         let workflow_id = uuid::Uuid::new_v4().to_string();
 
         for (i, task) in tasks.iter().enumerate() {
-            let dep_ids: Vec<String> =
-                task.depends_on.iter().map(|&idx| ids[idx].clone()).collect();
+            let dep_ids: Vec<String> = task
+                .depends_on
+                .iter()
+                .map(|&idx| ids[idx].clone())
+                .collect();
             let model = task
                 .model
                 .as_deref()
@@ -285,15 +288,8 @@ impl DagEngine {
         Ok(serde_json::json!({ "session_id": session_id }).to_string())
     }
 
-    // ── Private helpers ───────────────────────────────────────────────────────
-
     fn update_workflow_status(&mut self, task_id: &str) -> Option<WorkflowStatus> {
-        let workflow_id = self
-            .nodes
-            .get(task_id)?
-            .workflow_id
-            .as_ref()?
-            .clone();
+        let workflow_id = self.nodes.get(task_id)?.workflow_id.as_ref()?.clone();
 
         let task_ids: Vec<String> = match self.workflows.get(&workflow_id) {
             Some(w) if matches!(w.status, WorkflowStatus::Running) => w.tasks.clone(),
@@ -323,7 +319,10 @@ impl DagEngine {
 
         let wf = self.workflows.get_mut(&workflow_id).unwrap();
         wf.status = match first_failure {
-            Some((fid, reason)) => WorkflowStatus::Failed { task_id: fid, reason },
+            Some((fid, reason)) => WorkflowStatus::Failed {
+                task_id: fid,
+                reason,
+            },
             None => WorkflowStatus::Done,
         };
         Some(wf.status.clone())

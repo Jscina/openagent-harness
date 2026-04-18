@@ -94,9 +94,7 @@ mod wasm {
         }
 
         pub fn cancel_task(&mut self, id: &str) -> Result<String, JsValue> {
-            self.0
-                .cancel_task(id)
-                .map_err(|e| JsValue::from_str(&e))
+            self.0.cancel_task(id).map_err(|e| JsValue::from_str(&e))
         }
     }
 }

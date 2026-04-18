@@ -56,9 +56,10 @@ if [ ! -f "$CONFIG_FILE" ]; then
 	echo "{}" >"$CONFIG_FILE"
 fi
 
+OLD_PLUGIN_PATH="$INSTALL_DIR/plugin/harness.ts"
 tmp_file=$(mktemp)
-jq --arg path "$PLUGIN_PATH" '
-	.plugin = ((.plugin // []) | if type == "array" then (if index($path) == null then . + [$path] else . end) else [., $path] end) |
+jq --arg path "$PLUGIN_PATH" --arg old_path "$OLD_PLUGIN_PATH" '
+	.plugin = ((.plugin // []) | if type == "array" then (map(select(. != $old_path)) | if index($path) == null then . + [$path] else . end) else [., $path] end) |
 	.agent.build.disable = true |
 	.agent.plan.disable = true |
 	.agent.explorer.fallback_models = ["ollama/qwen3-coder", "anthropic/claude-haiku-4-5"] |
