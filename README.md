@@ -63,19 +63,26 @@ cargo run -- install --force   # overwrite existing agents
 
 ## Agent team
 
-| Agent | Mode | Model | Role |
-|-------|------|-------|------|
-| `orchestrator` | **primary** | `anthropic/claude-haiku-4-5` | Human-facing entry point — classifies requests, drives pipeline |
-| `builder` | **primary** | `openai/gpt-5.2-codex` | Direct coding tasks, skip planning |
-| `planner` | subagent | `anthropic/claude-opus-4-6` | Decomposes tasks into DAG JSON |
-| `explorer` | subagent | `ollama/qwen3-coder` | Read-only codebase reconnaissance |
-| `researcher` | subagent | `google/gemini-2.5-flash` | External docs and examples |
-| `vision` | subagent | `google/gemini-2.5-flash` | Visual asset analysis |
-| `builder-junior` | subagent | `ollama/qwen3-coder` | Narrow-scope coding worker |
-| `consultant` | subagent | `openai/gpt-5.4` | Architecture advisor |
-| `reviewer` | subagent | `anthropic/claude-opus-4-6` | Quality gate for plans and diffs |
-| `debugger` | subagent | `google/gemini-2.5-flash` | Failure diagnosis |
-| `docs-writer` | subagent | `openai/gpt-5-nano` | Documentation updates |
+### Primary agents
+
+| Agent | Model | Role |
+|-------|-------|------|
+| `orchestrator` | `anthropic/claude-haiku-4-5` | Human-facing entry point. Classifies requests (ambiguous, direct question, codebase query, or coding task), drives the planner pipeline for complex tasks, answers simple questions directly. Workflow completion arrives as a toast — no polling needed. |
+| `builder` | `openai/gpt-5.4` | Senior engineer. Owns execution quality for a subtask end-to-end. Spawns `@explorer`, `@researcher`, and `@vision` in parallel to gather context. Breaks the subtask into atomic units. Spawns `@builder-junior` workers in parallel for each unit. Reviews their output, escalates to `@consultant` for design decisions and `@debugger` for failures. Delivers a completed result. |
+| `planner` | `anthropic/claude-opus-4-6` | Receives a raw task, gathers context from `@explorer` and `@researcher` in parallel, then produces a machine-readable DAG of subtasks. Output is JSON only — no preamble, no explanation. |
+
+### Subagents
+
+| Agent | Model | Role |
+|-------|-------|------|
+| `explorer` | `google/gemini-2.5-flash` | Read-only codebase reconnaissance. Maps files, traces call chains, identifies interfaces and patterns. Never modifies anything. |
+| `researcher` | `google/gemini-2.5-flash` | External knowledge retrieval. Searches web, fetches library docs, reads GitHub examples. No local file access. |
+| `vision` | `google/gemini-2.5-flash-image` | Analyzes visual assets — screenshots, wireframes, UI mockups, PDFs — and returns a structured description. Never writes code. |
+| `builder-junior` | `openai/gpt-5.3-codex` | Executes one narrowly scoped coding task given an exact spec by builder. Executes the spec exactly, does not explore or plan. Reports every file modified and expected outcome. |
+| `consultant` | `google/gemini-3.1-pro-preview` | Architecture advisor. Consulted by builder mid-task for design decisions with real tradeoffs. Returns a structured recommendation with rationale, tradeoffs, and risks. Read-only. |
+| `reviewer` | `anthropic/claude-sonnet-4-6` | Quality gate. Reviews planner output before execution and builder output after. Returns approved or a list of blocking issues. Read-only. |
+| `debugger` | `anthropic/claude-sonnet-4-6` | Failure investigation specialist. Diagnoses test failures and runtime errors. Returns root cause and a fix approach. Never makes code changes. |
+| `docs-writer` | `google/gemini-2.5-flash` | Documentation only. Writes READMEs, inline doc comments, API docs, and changelogs based on builder's completed diff. Never touches code files. |
 
 ## Environment variables
 
