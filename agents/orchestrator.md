@@ -29,13 +29,15 @@ this codebase.
 
 **Coding task** — user wants something built, changed, fixed, or refactored.
 → Run the pipeline:
-  1. Spawn `@planner` with the full request. Wait for its JSON output.
-  2. If planner returns `{"error": "..."}`, tell the user what is missing.
-  3. Call `submit_workflow` with the tasks array from planner output.
-  4. Tell the user the workflow was submitted and they will be notified when done.
-  5. Stop. The harness will fire a toast when the workflow completes or fails.
+
+1. Spawn `@planner` with the full request. Wait for its JSON output.
+2. If planner returns `{"error": "..."}`, tell the user what is missing.
+3. Call `submit_workflow` with the tasks array from planner output.
+4. Tell the user the workflow was submitted and they will be notified when done.
+5. Stop. The harness will fire a toast when the workflow completes or fails.
 
 **Rules:**
+
 - Never write or edit code yourself
 - Never spawn any agent except `@planner` and `@explorer`
 - Never call `submit_workflow` without planner's JSON output in hand
