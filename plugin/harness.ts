@@ -101,11 +101,17 @@ function makeHeaders(): Record<string, string> {
   return headers;
 }
 
-async function createSession(baseUrl: string): Promise<string> {
+async function createSession(
+  baseUrl: string,
+  parentSessionId?: string | null,
+): Promise<string> {
+  const body = parentSessionId
+    ? JSON.stringify({ parentID: parentSessionId })
+    : "{}";
   const resp = await fetch(`${baseUrl}/session`, {
     method: "POST",
     headers: makeHeaders(),
-    body: "{}",
+    body,
   });
   if (!resp.ok) throw new Error(`createSession failed: ${resp.status}`);
   const data = (await resp.json()) as { id: string };
@@ -253,12 +259,13 @@ export default (async (input: PluginInput) => {
         prompt: string;
         model: string;
         agent: string | null;
+        parent_session_id: string | null;
       }>;
 
       for (const task of readyTasks) {
         let sessionId: string | null = null;
         try {
-          sessionId = await createSession(baseUrl);
+          sessionId = await createSession(baseUrl, task.parent_session_id);
           dag.task_started(task.id, sessionId);
           await sendMessage(baseUrl, sessionId, task.prompt, task.model, task.agent);
           console.log(`[harness-plugin] task ${task.id} → session ${sessionId}`);
@@ -296,7 +303,7 @@ export default (async (input: PluginInput) => {
     tool: {
       submit_workflow: tool({
         description:
-          "Submit a workflow plan to the harness DAG for execution. Input is the tasks array from planner output. Returns a workflow_id for tracking.",
+          "Orchestrator-only: submit a workflow plan to the harness DAG for execution. Input is the tasks array from planner output. Returns a workflow_id for tracking.",
         args: {
           tasks: tool.schema.array(
             tool.schema.object({
@@ -307,8 +314,11 @@ export default (async (input: PluginInput) => {
             }),
           ),
         },
-        async execute({ tasks }) {
-          return dag.submit_workflow(JSON.stringify(tasks));
+        async execute({ tasks }, context) {
+          if (context.agent !== "orchestrator") {
+            throw new Error("submit_workflow can only be executed by the orchestrator agent");
+          }
+          return dag.submit_workflow(JSON.stringify(tasks), context.sessionID);
         },
       }),
 

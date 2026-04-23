@@ -41,6 +41,8 @@ pub struct Workflow {
     pub id: String,
     pub status: WorkflowStatus,
     pub tasks: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +89,8 @@ pub(crate) struct ReadyTask {
     pub prompt: String,
     pub model: String,
     pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

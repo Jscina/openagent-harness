@@ -31,9 +31,21 @@ impl DagEngine {
         }
     }
 
-    /// Submit a workflow.  Returns JSON `{workflow_id, task_ids}` or an error
-    /// message string.
+    /// Submit a workflow without a parent session.
+    ///
+    /// Returns JSON `{workflow_id, task_ids}` or an error message string.
     pub fn submit_workflow(&mut self, tasks_json: &str) -> Result<String, String> {
+        self.submit_workflow_with_parent_session(tasks_json, None)
+    }
+
+    /// Submit a workflow with an optional parent OpenCode session id.
+    ///
+    /// Returns JSON `{workflow_id, task_ids}` or an error message string.
+    pub fn submit_workflow_with_parent_session(
+        &mut self,
+        tasks_json: &str,
+        parent_session_id: Option<&str>,
+    ) -> Result<String, String> {
         let tasks: Vec<WorkflowTaskInput> =
             serde_json::from_str(tasks_json).map_err(|e| format!("invalid tasks JSON: {e}"))?;
 
@@ -95,6 +107,7 @@ impl DagEngine {
                 id: workflow_id.clone(),
                 status: WorkflowStatus::Running,
                 tasks: ids.clone(),
+                parent_session_id: parent_session_id.map(|session_id| session_id.to_string()),
             },
         );
 
@@ -128,6 +141,11 @@ impl DagEngine {
                     prompt: node.task.prompt.clone(),
                     model: node.task.model.clone(),
                     agent: node.task.agent.clone(),
+                    parent_session_id: node
+                        .workflow_id
+                        .as_ref()
+                        .and_then(|workflow_id| self.workflows.get(workflow_id))
+                        .and_then(|workflow| workflow.parent_session_id.clone()),
                 });
             }
         }
@@ -506,6 +524,32 @@ mod tests {
         let id = resp["task_ids"][0].as_str().unwrap();
         let task: serde_json::Value = serde_json::from_str(&dag.get_task(id)).unwrap();
         assert_eq!(task["model"], DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn tick_ready_task_includes_parent_session_id_when_provided() {
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([{"agent": "a", "prompt": "go", "depends_on": []}]);
+
+        dag.submit_workflow_with_parent_session(&tasks.to_string(), Some("ses_parent"))
+            .unwrap();
+
+        let ready: serde_json::Value = serde_json::from_str(&dag.tick()).unwrap();
+        assert_eq!(ready.as_array().unwrap().len(), 1);
+        assert_eq!(ready[0]["parent_session_id"], "ses_parent");
+    }
+
+    #[test]
+    fn tick_ready_task_omits_parent_session_id_when_absent() {
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([{"agent": "a", "prompt": "go", "depends_on": []}]);
+
+        dag.submit_workflow_with_parent_session(&tasks.to_string(), None)
+            .unwrap();
+
+        let ready: serde_json::Value = serde_json::from_str(&dag.tick()).unwrap();
+        assert_eq!(ready.as_array().unwrap().len(), 1);
+        assert!(ready[0].get("parent_session_id").is_none());
     }
 
     #[test]

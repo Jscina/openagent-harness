@@ -58,9 +58,13 @@ mod wasm {
             WasmDagEngine(crate::dag::DagEngine::new())
         }
 
-        pub fn submit_workflow(&mut self, tasks_json: &str) -> Result<String, JsValue> {
+        pub fn submit_workflow(
+            &mut self,
+            tasks_json: &str,
+            parent_session_id: Option<String>,
+        ) -> Result<String, JsValue> {
             self.0
-                .submit_workflow(tasks_json)
+                .submit_workflow_with_parent_session(tasks_json, parent_session_id.as_deref())
                 .map_err(|e| JsValue::from_str(&e))
         }
 

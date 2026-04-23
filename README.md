@@ -22,10 +22,11 @@ OpenCode process
 
 1. The `orchestrator` agent receives a user request.
 2. It spawns the `@planner` (for coding tasks).
-3. The planner uses the `submit_workflow` tool with its JSON output.
-4. The WASM `DagEngine` creates all tasks atomically in its in-memory DAG.
-5. The 500ms tick loop automatically kicks off pending tasks when their dependencies finish.
-6. The TS plugin listens for `session.idle` and `session.error` events and feeds them to the DAG to advance the workflow state.
+3. The planner returns JSON output to the orchestrator.
+4. The orchestrator submits that workflow JSON via `submit_workflow`.
+5. The WASM `DagEngine` creates all tasks atomically in its in-memory DAG.
+6. The 500ms tick loop automatically kicks off pending tasks when their dependencies finish.
+7. The TS plugin listens for `session.idle` and `session.error` events and feeds them to the DAG to advance the workflow state.
 
 ## Quickstart
 
@@ -69,7 +70,7 @@ cargo run -- install --force   # overwrite existing agents
 |-------|-------|------|
 | `orchestrator` | `anthropic/claude-haiku-4-5` | Human-facing entry point. Classifies requests (ambiguous, direct question, codebase query, or coding task), drives the planner pipeline for complex tasks, answers simple questions directly. Workflow completion arrives as a toast — no polling needed. |
 | `builder` | `openai/gpt-5.4` | Senior engineer. Owns execution quality for a subtask end-to-end. Spawns `@explorer`, `@researcher`, and `@vision` in parallel to gather context. Breaks the subtask into atomic units. Spawns `@builder-junior` workers in parallel for each unit. Reviews their output, escalates to `@consultant` for design decisions and `@debugger` for failures. Delivers a completed result. |
-| `planner` | `anthropic/claude-opus-4-6` | Receives a raw task, gathers context from `@explorer` and `@researcher` in parallel, then produces a machine-readable DAG of subtasks. Output is JSON only — no preamble, no explanation. |
+| `planner` | `anthropic/claude-opus-4-6` | Receives a raw task, gathers context from `@explorer` and `@researcher` in parallel, then produces a machine-readable DAG of subtasks for the orchestrator to submit. Output is JSON only — no preamble, no explanation. |
 
 ### Subagents
 

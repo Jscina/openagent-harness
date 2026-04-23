@@ -16,7 +16,7 @@ export class DagEngine {
     list_workflow_summaries(): string;
     constructor();
     process_event(event_type: string, session_id: string, payload_json: string): string;
-    submit_workflow(tasks_json: string): string;
+    submit_workflow(tasks_json: string, parent_session_id?: string | null): string;
     task_started(task_id: string, session_id: string): void;
     tick(): string;
 }
@@ -36,7 +36,7 @@ export interface InitOutput {
     readonly get_agent_configs: () => [number, number];
     readonly __wbg_dagengine_free: (a: number, b: number) => void;
     readonly wasmdagengine_new: () => number;
-    readonly wasmdagengine_submit_workflow: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly wasmdagengine_submit_workflow: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly wasmdagengine_tick: (a: number) => [number, number];
     readonly wasmdagengine_task_started: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly wasmdagengine_process_event: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];

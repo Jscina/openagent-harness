@@ -181,26 +181,29 @@ export class DagEngine {
     }
     /**
      * @param {string} tasks_json
+     * @param {string | null} [parent_session_id]
      * @returns {string}
      */
-    submit_workflow(tasks_json) {
-        let deferred3_0;
-        let deferred3_1;
+    submit_workflow(tasks_json, parent_session_id) {
+        let deferred4_0;
+        let deferred4_1;
         try {
             const ptr0 = passStringToWasm0(tasks_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             const len0 = WASM_VECTOR_LEN;
-            const ret = wasm.wasmdagengine_submit_workflow(this.__wbg_ptr, ptr0, len0);
-            var ptr2 = ret[0];
-            var len2 = ret[1];
+            var ptr1 = isLikeNone(parent_session_id) ? 0 : passStringToWasm0(parent_session_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            var len1 = WASM_VECTOR_LEN;
+            const ret = wasm.wasmdagengine_submit_workflow(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var ptr3 = ret[0];
+            var len3 = ret[1];
             if (ret[3]) {
-                ptr2 = 0; len2 = 0;
+                ptr3 = 0; len3 = 0;
                 throw takeFromExternrefTable0(ret[2]);
             }
-            deferred3_0 = ptr2;
-            deferred3_1 = len2;
-            return getStringFromWasm0(ptr2, len2);
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
         } finally {
-            wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+            wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
         }
     }
     /**
@@ -346,6 +349,10 @@ function handleError(f, args) {
         const idx = addToExternrefTable0(e);
         wasm.__wbindgen_exn_store(idx);
     }
+}
+
+function isLikeNone(x) {
+    return x === undefined || x === null;
 }
 
 function passStringToWasm0(arg, malloc, realloc) {
