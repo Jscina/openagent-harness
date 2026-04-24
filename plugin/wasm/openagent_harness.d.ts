@@ -16,9 +16,11 @@ export class DagEngine {
     list_workflow_summaries(): string;
     constructor();
     process_event(event_type: string, session_id: string, payload_json: string): string;
+    set_agent_fallbacks(json: string): void;
     submit_workflow(tasks_json: string, parent_session_id?: string | null): string;
     task_started(task_id: string, session_id: string): void;
     tick(): string;
+    try_fallback(task_id: string, error_msg: string): string;
 }
 
 /**
@@ -47,6 +49,8 @@ export interface InitOutput {
     readonly wasmdagengine_list_workflow_summaries: (a: number) => [number, number];
     readonly wasmdagengine_fail_task: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly wasmdagengine_cancel_task: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly wasmdagengine_set_agent_fallbacks: (a: number, b: number, c: number) => void;
+    readonly wasmdagengine_try_fallback: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_exn_store: (a: number) => void;
     readonly __externref_table_alloc: () => number;

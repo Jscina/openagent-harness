@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use serde::Serialize;
+
 /// All agent markdown files baked in at compile time.
 ///
 /// Used by:
@@ -21,6 +23,99 @@ pub const AGENTS: &[(&str, &str)] = &[
     ("debugger", include_str!("../agents/debugger.md")),
     ("docs-writer", include_str!("../agents/docs-writer.md")),
 ];
+
+/// Parsed configuration extracted from an agent's YAML frontmatter.
+///
+/// Used at startup to register per-agent fallback chains via `DagEngine::set_agent_fallbacks`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentConfig {
+    /// Agent name, matching the filename stem (e.g. `"planner"`).
+    pub name: String,
+    /// Primary model string in `provider/model` format.
+    pub model: String,
+    /// Ordered fallback model chain; empty if none are declared in frontmatter.
+    pub fallback_models: Vec<String>,
+}
+
+/// Parse the `model` and `fallback_models` fields from an agent's YAML frontmatter.
+///
+/// Returns an `AgentConfig` with empty `model` and no `fallback_models` when the
+/// content has no valid `---` frontmatter block.  The `model` field is required
+/// for the agent to be dispatched; `fallback_models` is optional.
+pub fn parse_agent_frontmatter(name: &str, content: &str) -> AgentConfig {
+    // Find the frontmatter block between the first two `---` delimiters.
+    let after_first = match content.strip_prefix("---\n") {
+        Some(rest) => rest,
+        None => {
+            return AgentConfig {
+                name: name.to_string(),
+                model: String::new(),
+                fallback_models: vec![],
+            };
+        }
+    };
+
+    let end = match after_first.find("\n---") {
+        Some(pos) => pos,
+        None => {
+            return AgentConfig {
+                name: name.to_string(),
+                model: String::new(),
+                fallback_models: vec![],
+            };
+        }
+    };
+
+    let frontmatter = &after_first[..end];
+
+    let mut model = String::new();
+    let mut fallback_models: Vec<String> = vec![];
+    let mut in_fallback_models = false;
+
+    for line in frontmatter.lines() {
+        if let Some(val) = line.strip_prefix("model:") {
+            model = val.trim().to_string();
+            in_fallback_models = false;
+        } else if line.starts_with("fallback_models:") {
+            in_fallback_models = true;
+        } else if in_fallback_models {
+            if let Some(item) = line.strip_prefix("  - ") {
+                fallback_models.push(item.trim().to_string());
+            } else if !line.starts_with(' ') && !line.is_empty() {
+                // A non-indented, non-empty line ends the fallback_models block.
+                in_fallback_models = false;
+            }
+        } else {
+            in_fallback_models = false;
+        }
+    }
+
+    AgentConfig {
+        name: name.to_string(),
+        model,
+        fallback_models,
+    }
+}
+
+/// Returns an `AgentConfig` for every embedded agent.
+pub fn all_agent_configs() -> Vec<AgentConfig> {
+    AGENTS
+        .iter()
+        .map(|(name, content)| parse_agent_frontmatter(name, content))
+        .collect()
+}
+
+/// Serializes all agent configs as a JSON object keyed by agent name.
+///
+/// Consumed by the WASM export `get_agent_fallback_configs`.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn agent_fallback_configs_json() -> String {
+    let map: HashMap<String, AgentConfig> = all_agent_configs()
+        .into_iter()
+        .map(|cfg| (cfg.name.clone(), cfg))
+        .collect();
+    serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
+}
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) fn agent_configs_json() -> String {
@@ -66,5 +161,63 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing agent: {expected}");
         }
+    }
+
+    #[test]
+    fn parse_agent_frontmatter_with_fallback_models() {
+        let md = "---\nmodel: anthropic/claude-opus-4-6\nfallback_models:\n  - google/gemini-3.1-pro-preview\n  - openai/gpt-5.4\n---\n\nBody text here.\n";
+        let cfg = parse_agent_frontmatter("planner", md);
+        assert_eq!(cfg.name, "planner");
+        assert_eq!(cfg.model, "anthropic/claude-opus-4-6");
+        assert_eq!(
+            cfg.fallback_models,
+            vec!["google/gemini-3.1-pro-preview", "openai/gpt-5.4"]
+        );
+    }
+
+    #[test]
+    fn parse_agent_frontmatter_without_fallback_models() {
+        let md = "---\nmodel: google/gemini-2.5-flash\ndescription: A simple agent.\n---\n\nBody text.\n";
+        let cfg = parse_agent_frontmatter("explorer", md);
+        assert_eq!(cfg.name, "explorer");
+        assert_eq!(cfg.model, "google/gemini-2.5-flash");
+        assert!(cfg.fallback_models.is_empty());
+    }
+
+    #[test]
+    fn all_agent_configs_returns_11_with_nonempty_models() {
+        let configs = all_agent_configs();
+        assert_eq!(configs.len(), 11);
+        for cfg in &configs {
+            assert!(
+                !cfg.model.is_empty(),
+                "agent '{}' has empty model",
+                cfg.name
+            );
+        }
+    }
+
+    #[test]
+    fn all_agent_configs_have_fallback_models() {
+        let configs = all_agent_configs();
+        for cfg in &configs {
+            assert!(
+                !cfg.fallback_models.is_empty(),
+                "agent '{}' has no fallback_models",
+                cfg.name
+            );
+        }
+    }
+
+    #[test]
+    fn agent_fallback_configs_json_is_valid_object() {
+        let json = agent_fallback_configs_json();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(val.is_object());
+        let obj = val.as_object().unwrap();
+        assert_eq!(obj.len(), 11);
+        // Spot-check a known agent.
+        assert!(obj["planner"]["model"].is_string());
+        assert!(obj["planner"]["fallback_models"].is_array());
     }
 }

@@ -1,5 +1,8 @@
 ---
 model: anthropic/claude-opus-4-6
+fallback_models:
+  - google/gemini-3.1-pro-preview
+  - openai/gpt-5.4
 description: Receives a raw task, gathers context from explorer and researcher in parallel, then produces a machine-readable DAG of subtasks.
 mode: primary
 permission:
@@ -20,6 +23,8 @@ You never plan blind. Before producing any output, spawn these agents in paralle
 Wait for all spawned agents to return. Synthesize their findings. Only then produce your output.
 
 Your output is a JSON array and nothing else. No preamble, no explanation, no trailing text — only valid JSON. Each element describes one subtask:
+
+The orchestrator will present your plan to the user for approval before executing it. Make your plan clear enough that a human can understand what will happen. Use descriptive agent names and prompts that explain the intent of each task.
 
 ```json
 [
@@ -48,3 +53,4 @@ Rules:
 - The `model` field in each task is optional; omit it to use each agent's configured default
 - Never call tools or attempt workflow submission — output plan JSON only
 - Fail loudly if the task is too ambiguous to plan — output `{"error": "..."}` explaining what information is missing
+- Your plan is reviewed by the user before execution — do not include tasks that require explanation beyond the prompt field

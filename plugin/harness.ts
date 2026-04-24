@@ -22,6 +22,7 @@ import { fileURLToPath } from "url";
 import { tool, type Plugin, type PluginInput } from "@opencode-ai/plugin";
 import {
   DagEngine,
+  agent_fallback_configs_json,
   get_agent_configs,
   initSync,
 } from "./wasm/openagent_harness.js";
@@ -50,7 +51,7 @@ function loadWasm(): DagEngine {
  * This replaces the need to run `openagent-harness install` manually — the
  * configs are embedded in the WASM binary and installed automatically.
  */
-function installAgentsIfNeeded(): void {
+function installAgentsIfNeeded(): number {
   try {
     const agentsDir = join(homedir(), ".config", "opencode", "agents");
     mkdirSync(agentsDir, { recursive: true });
@@ -64,13 +65,10 @@ function installAgentsIfNeeded(): void {
         installed++;
       }
     }
-    if (installed > 0) {
-      console.log(
-        `[harness-plugin] installed ${installed} agent config(s) to ${agentsDir}`,
-      );
-    }
+    return installed;
   } catch (e) {
     console.error("[harness-plugin] agent install failed (non-fatal):", e);
+    return 0;
   }
 }
 
@@ -174,9 +172,20 @@ interface ToastNotification {
 }
 type Notification = ToastNotification;
 
+interface SessionReuse {
+  session_id: string;
+  next_task_id: string;
+}
+
 interface EventResult {
   notifications: Notification[];
   delete_session: string | null;
+  fallback_hint?: {
+    task_id: string;
+    error_message: string;
+    has_fallbacks: boolean;
+  };
+  reuse_session?: SessionReuse;
 }
 
 function parseJson(raw: string): unknown {
@@ -222,15 +231,54 @@ function sleep(ms: number): Promise<void> {
 async function handleEventResult(
   result: EventResult,
   baseUrl: string,
+  dag: DagEngine,
 ): Promise<void> {
   for (const n of result.notifications) {
     if (n.type === "toast") {
       await showToast(baseUrl, n.title, n.message, n.variant, n.duration);
     }
   }
-  if (result.delete_session) {
+  if (result.reuse_session) {
+    // Pre-assign the session to the next task so the tick loop skips createSession.
+    // task_started also updates session_to_task in the WASM engine.
+    dag.task_started(result.reuse_session.next_task_id, result.reuse_session.session_id);
+  } else if (result.delete_session) {
     await deleteSession(baseUrl, result.delete_session);
   }
+}
+
+// ─── Error classification ─────────────────────────────────────────────────────
+
+/**
+ * Classify an error message as retryable (provider-side transient failure) or
+ * terminal (auth, content policy, invalid request, model not found, etc.).
+ */
+function classifyError(errorMsg: string): 'retryable' | 'terminal' {
+  const lower = errorMsg.toLowerCase();
+  const retryablePatterns = [
+    '429', '500', '502', '503', '504',
+    'rate limit', 'rate_limit',
+    'overloaded',
+    'server_error',
+    'timeout', 'timed out',
+    'temporarily unavailable',
+    'capacity',
+    'too many requests',
+    'service unavailable',
+    'internal server error',
+    'bad gateway',
+    'gateway timeout',
+    'econnrefused',
+    'econnreset',
+    'etimedout',
+    'fetch failed',
+  ];
+
+  const classification = retryablePatterns.some((pattern) => lower.includes(pattern))
+    ? 'retryable'
+    : 'terminal';
+
+  return classification;
 }
 
 // ─── Plugin ───────────────────────────────────────────────────────────────────
@@ -240,10 +288,22 @@ export default (async (input: PluginInput) => {
 
   // Load WASM DAG engine.
   const dag = loadWasm();
-  console.log("[harness-plugin] WASM DAG engine loaded");
+  void showToast(baseUrl, 'Harness Plugin', 'WASM DAG engine loaded', 'info', 5000);
 
   // Install agent configs the first time this plugin runs.
-  installAgentsIfNeeded();
+  const installed = installAgentsIfNeeded();
+  if (installed > 0) {
+    void showToast(baseUrl, 'Harness Plugin', `Installed ${installed} agent config(s)`, 'info');
+  }
+
+  // Load agent fallback configs from WASM and register with DAG engine.
+  try {
+    const fallbackConfigs = agent_fallback_configs_json();
+    dag.set_agent_fallbacks(fallbackConfigs);
+    void showToast(baseUrl, 'Harness Plugin', 'Agent fallback models registered', 'info', 5000);
+  } catch (e) {
+    console.error('[harness-plugin] fallback config load failed (non-fatal):', e);
+  }
 
   // ── Tick loop ──────────────────────────────────────────────────────────────
   // Every 500 ms, find unblocked tasks and start them in OpenCode sessions.
@@ -260,19 +320,43 @@ export default (async (input: PluginInput) => {
         model: string;
         agent: string | null;
         parent_session_id: string | null;
+        fallback_models: string[];
+        existing_session_id?: string | null;
       }>;
 
       for (const task of readyTasks) {
         let sessionId: string | null = null;
         try {
-          sessionId = await createSession(baseUrl, task.parent_session_id);
-          dag.task_started(task.id, sessionId);
+          if (task.existing_session_id) {
+            // Session was pre-assigned from a prior task's reuse — skip createSession.
+            sessionId = task.existing_session_id;
+            // task_started was already called in handleEventResult when reuse was set,
+            // but call again to be idempotent (it's a no-op if mapping already exists).
+            dag.task_started(task.id, sessionId);
+          } else {
+            sessionId = await createSession(baseUrl, task.parent_session_id);
+            dag.task_started(task.id, sessionId);
+          }
           await sendMessage(baseUrl, sessionId, task.prompt, task.model, task.agent);
-          console.log(`[harness-plugin] task ${task.id} → session ${sessionId}`);
+          void showToast(baseUrl, 'Task Started', `Task ${task.id} dispatched`, 'info', 5000);
         } catch (e) {
           console.error(`[harness-plugin] failed to start task ${task.id}:`, e);
           const message = e instanceof Error ? e.message : String(e);
-          // Mark the task failed so visibility reflects the startup error.
+          const classification = classifyError(message);
+          void showToast(baseUrl, 'Harness Plugin', `Error classified as ${classification}`, classification === 'retryable' ? 'warning' : 'error');
+
+          if (classification === 'retryable' && task.fallback_models && task.fallback_models.length > 0) {
+            try {
+              const fallbackResult = JSON.parse(dag.try_fallback(task.id, message));
+              void showToast(baseUrl, 'Fallback', `Task ${task.id} falling back to ${fallbackResult.new_model}`, 'warning');
+              if (sessionId) await deleteSession(baseUrl, sessionId);
+              // Task is Pending again — next tick will pick it up
+              continue;
+            } catch {
+              // No more fallbacks — fall through to fail
+            }
+          }
+
           try {
             const { session_id } = JSON.parse(dag.fail_task(task.id, message)) as {
               session_id: string | null;
@@ -388,6 +472,44 @@ export default (async (input: PluginInput) => {
           });
         },
       }),
+
+      submit_review: tool({
+        description:
+          "Submit structured review feedback for a completed task. Stores the review on the task so the orchestrator can check it via harness_state. Use status 'approved' to approve, 'blocked' for blocking issues, or 'requested_changes' for non-blocking suggestions.",
+        args: {
+          task_id: tool.schema.string(),
+          status: tool.schema.string(),
+          summary: tool.schema.string(),
+          findings: tool.schema
+            .array(
+              tool.schema.object({
+                message: tool.schema.string(),
+                file: tool.schema.string().optional(),
+                line: tool.schema.number().optional(),
+                severity: tool.schema.string().optional(),
+              }),
+            )
+            .optional(),
+        },
+        async execute({ task_id, status, summary, findings }, context) {
+          // Build the ReviewFeedback JSON that the Rust engine expects
+          const allTasks = JSON.parse(dag.list_tasks()) as Array<{
+            id: string;
+            session_id: string | null;
+          }>;
+          const match = allTasks.find((t) => t.session_id === context.sessionID);
+          const reviewerTaskId = match?.id ?? context.sessionID;
+
+          const review = {
+            status,
+            reviewer_task_id: reviewerTaskId,
+            summary,
+            findings: findings ?? [],
+          };
+
+          return dag.submit_review(task_id, JSON.stringify(review));
+        },
+      }),
     },
 
     event: async ({ event }) => {
@@ -396,14 +518,60 @@ export default (async (input: PluginInput) => {
         const result: EventResult = JSON.parse(
           dag.process_event("session.idle", sessionId, JSON.stringify(event.properties)),
         );
-        await handleEventResult(result, baseUrl);
+        await handleEventResult(result, baseUrl, dag);
       } else if (event.type === "session.error") {
-        const sessionId: string = event.properties.sessionID ?? "";
+        const sessionId: string = event.properties.sessionID ?? '';
         if (!sessionId) return;
-        const result: EventResult = JSON.parse(
-          dag.process_event("session.error", sessionId, JSON.stringify(event.properties)),
+
+        const result: EventResult & { fallback_hint?: { task_id: string; error_message: string; has_fallbacks: boolean } } = JSON.parse(
+          dag.process_event('session.error', sessionId, JSON.stringify(event.properties)),
         );
-        await handleEventResult(result, baseUrl);
+
+        // Check if this error is eligible for fallback
+        if (result.fallback_hint) {
+          const { task_id, error_message, has_fallbacks } = result.fallback_hint;
+          const classification = classifyError(error_message);
+
+          if (classification === 'retryable' && has_fallbacks) {
+            try {
+              const fallbackResult = JSON.parse(dag.try_fallback(task_id, error_message)) as {
+                fallback: boolean;
+                new_model: string;
+                attempt: number;
+                session_id: string | null;
+              };
+              void showToast(
+                baseUrl,
+                'Fallback',
+                `Task ${task_id} → ${fallbackResult.new_model} (attempt ${fallbackResult.attempt})`,
+                'warning',
+              );
+              // Clean up old session
+              if (fallbackResult.session_id) {
+                await deleteSession(baseUrl, fallbackResult.session_id);
+              }
+              // The task is now Pending again — the tick loop will pick it up
+              // Handle any notifications from the original event
+              await handleEventResult(result, baseUrl, dag);
+              return;
+            } catch (e) {
+              console.error(`[harness-plugin] fallback attempt failed for task ${task_id}:`, e);
+              // Fall through to fail the task
+            }
+          }
+
+          // Not retryable or no fallbacks — fail the task
+          try {
+            const { session_id } = JSON.parse(dag.fail_task(task_id, error_message)) as {
+              session_id: string | null;
+            };
+            if (session_id) await deleteSession(baseUrl, session_id);
+          } catch {
+            // already terminal — ignore
+          }
+        }
+
+        await handleEventResult(result, baseUrl, dag);
       }
     },
 

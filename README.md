@@ -22,11 +22,13 @@ OpenCode process
 
 1. The `orchestrator` agent receives a user request.
 2. It spawns the `@planner` (for coding tasks).
-3. The planner returns JSON output to the orchestrator.
-4. The orchestrator submits that workflow JSON via `submit_workflow`.
-5. The WASM `DagEngine` creates all tasks atomically in its in-memory DAG.
-6. The 500ms tick loop automatically kicks off pending tasks when their dependencies finish.
-7. The TS plugin listens for `session.idle` and `session.error` events and feeds them to the DAG to advance the workflow state.
+3. The planner returns a JSON plan to the orchestrator.
+4. The orchestrator presents the plan to the user and asks for approval via the `question` tool.
+5. If approved, the orchestrator submits the plan via `submit_workflow` and immediately calls `wait_for_workflow`.
+6. The WASM `DagEngine` creates all tasks atomically in its in-memory DAG.
+7. The 500ms tick loop automatically kicks off pending tasks when their dependencies finish.
+8. The TS plugin listens for `session.idle` and `session.error` events and feeds them to the DAG to advance the workflow state.
+9. When the workflow completes (or fails), `wait_for_workflow` returns and the orchestrator reports results to the user.
 
 ## Quickstart
 
@@ -68,7 +70,7 @@ cargo run -- install --force   # overwrite existing agents
 
 | Agent | Model | Role |
 |-------|-------|------|
-| `orchestrator` | `anthropic/claude-haiku-4-5` | Human-facing entry point. Classifies requests (ambiguous, direct question, codebase query, or coding task), drives the planner pipeline for complex tasks, answers simple questions directly. Workflow completion arrives as a toast — no polling needed. |
+| `orchestrator` | `anthropic/claude-haiku-4-5` | Human-facing entry point. Classifies requests, drives the planner pipeline for complex tasks, presents plans for user approval, waits for workflow completion, and reports results. |
 | `builder` | `openai/gpt-5.4` | Senior engineer. Owns execution quality for a subtask end-to-end. Spawns `@explorer`, `@researcher`, and `@vision` in parallel to gather context. Breaks the subtask into atomic units. Spawns `@builder-junior` workers in parallel for each unit. Reviews their output, escalates to `@consultant` for design decisions and `@debugger` for failures. Delivers a completed result. |
 | `planner` | `anthropic/claude-opus-4-6` | Receives a raw task, gathers context from `@explorer` and `@researcher` in parallel, then produces a machine-readable DAG of subtasks for the orchestrator to submit. Output is JSON only — no preamble, no explanation. |
 
@@ -84,6 +86,57 @@ cargo run -- install --force   # overwrite existing agents
 | `reviewer` | `anthropic/claude-sonnet-4-6` | Quality gate. Reviews planner output before execution and builder output after. Returns approved or a list of blocking issues. Read-only. |
 | `debugger` | `anthropic/claude-sonnet-4-6` | Failure investigation specialist. Diagnoses test failures and runtime errors. Returns root cause and a fix approach. Never makes code changes. |
 | `docs-writer` | `google/gemini-2.5-flash` | Documentation only. Writes READMEs, inline doc comments, API docs, and changelogs based on builder's completed diff. Never touches code files. |
+
+## Fallback model chains
+
+Each agent can declare an ordered list of fallback models in its `.md` frontmatter. When a task fails with a transient provider error (429, 5xx, timeout, etc.) the harness automatically re-queues it with the next model in the chain rather than immediately failing the workflow.
+
+### Why fallbacks exist
+
+Provider outages and rate limits are common at inference scale. Without fallbacks a single rate-limit on one provider fails the entire workflow. With a chain, the harness silently retries on the next provider and the workflow completes with no user intervention needed.
+
+### Configuring fallbacks in agent frontmatter
+
+Add a `fallback_models` list beneath the `model` field in any agent `.md` file:
+
+```yaml
+---
+model: anthropic/claude-opus-4-6
+fallback_models:
+  - google/gemini-3.1-pro-preview
+  - openai/gpt-5.4
+---
+```
+
+Model strings follow the same `provider/model` syntax as the `model` field. These fallbacks are loaded at startup and applied to every task that runs under this agent.
+
+### Resolution priority
+
+When a task is dispatched, its model is chosen in this order:
+
+1. **Task-level `fallback_models`** — an explicit list in the `submit_workflow` JSON payload overrides everything.
+2. **Agent's frontmatter `fallback_models`** — loaded from the `.md` file at startup via `set_agent_fallbacks()`.
+3. **Global `DEFAULT_MODEL`** — `anthropic/claude-sonnet-4-6`, used when no model is specified at all.
+
+### Error classification and fallback triggers
+
+Error classification runs in the TypeScript plugin (`classifyError` in `plugin/harness.ts`). Errors are classified as either **retryable** or **terminal**:
+
+- **Retryable** — HTTP 429, 5xx, `rate limit`, `overloaded`, `timeout`, `service unavailable`, connection errors. A retryable error with remaining fallbacks triggers `try_fallback()` and re-queues the task.
+- **Terminal** — auth failures, content policy violations, invalid requests, model-not-found. These fail the task immediately regardless of remaining fallbacks.
+
+A task is only marked `Failed` after all models in its chain are exhausted or a terminal error is received.
+
+### Observing fallback activity
+
+The plugin logs every fallback transition with the `[harness-plugin]` prefix:
+
+```
+[harness-plugin] error classified as retryable: rate limit hit (429)
+[harness-plugin] task <id> falling back to google/gemini-3.1-pro-preview (attempt 1)
+```
+
+Workflow snapshots (via the `harness_state` tool) include `model_attempt` and `fallback_models` on each task, showing exactly which model in the chain is currently active.
 
 ## Environment variables
 

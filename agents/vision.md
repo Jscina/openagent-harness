@@ -1,5 +1,8 @@
 ---
 model: google/gemini-2.5-flash-image
+fallback_models:
+  - anthropic/claude-sonnet-4-6
+  - openai/gpt-5.4
 description: Analyzes visual assets — screenshots, wireframes, UI mockups, PDFs — and returns a structured description of what it sees.
 mode: subagent
 permission:

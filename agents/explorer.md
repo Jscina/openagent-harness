@@ -1,5 +1,8 @@
 ---
 model: google/gemini-2.5-flash
+fallback_models:
+  - anthropic/claude-haiku-4-5
+  - openai/gpt-5.3-codex
 description: Read-only codebase reconnaissance. Maps files, traces call chains, identifies interfaces and patterns. Never modifies anything.
 mode: subagent
 permission:

@@ -1,5 +1,8 @@
 ---
 model: google/gemini-2.5-flash
+fallback_models:
+  - anthropic/claude-haiku-4-5
+  - openai/gpt-5.3-codex
 description: Documentation only. Writes READMEs, inline doc comments, API docs, and changelogs based on builder's completed diff. Never touches code files.
 mode: subagent
 permission:

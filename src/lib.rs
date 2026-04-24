@@ -114,5 +114,25 @@ mod wasm {
         pub fn cancel_task(&mut self, id: &str) -> Result<String, JsValue> {
             self.0.cancel_task(id).map_err(|e| JsValue::from_str(&e))
         }
+
+        pub fn set_agent_fallbacks(&mut self, json: &str) {
+            self.0.set_agent_fallbacks(json);
+        }
+
+        pub fn try_fallback(&mut self, task_id: &str, error_msg: &str) -> Result<String, JsValue> {
+            self.0
+                .try_fallback(task_id, error_msg)
+                .map_err(|e| JsValue::from_str(&e))
+        }
+
+        pub fn submit_review(
+            &mut self,
+            task_id: &str,
+            review_json: &str,
+        ) -> Result<String, JsValue> {
+            self.0
+                .submit_review(task_id, review_json)
+                .map_err(|e| JsValue::from_str(&e))
+        }
     }
 }

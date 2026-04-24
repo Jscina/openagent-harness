@@ -1,5 +1,8 @@
 ---
 model: google/gemini-3.1-pro-preview
+fallback_models:
+  - anthropic/claude-opus-4-6
+  - openai/gpt-5.4
 description: Read-only architecture advisor. Consulted by builder mid-task for design decisions. Returns a structured recommendation with tradeoffs. Never touches files.
 mode: subagent
 permission:
