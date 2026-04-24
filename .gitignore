@@ -29,3 +29,4 @@ target
 plugin/node_modules/
 plugin/bun.lockb
 plugin/package-lock.json
+plugin/wasm/
