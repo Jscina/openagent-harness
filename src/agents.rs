@@ -107,7 +107,7 @@ pub fn all_agent_configs() -> Vec<AgentConfig> {
 
 /// Serializes all agent configs as a JSON object keyed by agent name.
 ///
-/// Consumed by the WASM export `get_agent_fallback_configs`.
+/// Consumed by the WASM export `agent_fallback_configs_json`.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub fn agent_fallback_configs_json() -> String {
     let map: HashMap<String, AgentConfig> = all_agent_configs()

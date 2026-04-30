@@ -40,6 +40,15 @@ mod wasm {
         crate::agents::agent_configs_json()
     }
 
+    /// Return parsed agent fallback configs as a JSON object `{name: config, ...}`.
+    ///
+    /// The TypeScript plugin calls this on startup and registers per-agent
+    /// fallback chains in the DAG engine.
+    #[wasm_bindgen]
+    pub fn agent_fallback_configs_json() -> String {
+        crate::agents::agent_fallback_configs_json()
+    }
+
     /// WASM-exported DAG engine.  JavaScript sees this as `DagEngine`.
     #[wasm_bindgen(js_name = "DagEngine")]
     pub struct WasmDagEngine(crate::dag::DagEngine);

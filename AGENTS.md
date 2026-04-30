@@ -36,7 +36,7 @@ cargo fmt && cargo clippy     # default rustfmt/clippy config
 - Error classification happens in the TypeScript plugin (`classifyError` in `harness.ts`), not in WASM.
 - Fallback decisions are made in the plugin; the WASM engine exposes `try_fallback()` to atomically advance the model and reset task state to Pending.
 - Plugin errors are logged; they are not propagated to OpenCode.
-- Orchestrator flow: planner → user approval (via question tool) → submit_workflow → wait_for_workflow → report results. The orchestrator never submits a workflow without user confirmation.
+- Orchestrator flow: planner may clarify via question tool → planner saves a plan artifact under `.opencode/plans` → user approval (via question tool) → orchestrator calls `submit_plan` → `wait_for_workflow` → report results. The orchestrator never submits a workflow without user confirmation.
 
 ## Non-obvious gotchas
 
@@ -47,3 +47,4 @@ cargo fmt && cargo clippy     # default rustfmt/clippy config
 - `model_attempt` on a task tracks which model in the chain is active: `0` means the primary model, `1` means the first fallback, and so on. This field is visible in workflow snapshots.
 - Agent fallback configs are loaded from frontmatter at startup via `agent_fallback_configs_json()` + `set_agent_fallbacks()`; they apply to every task dispatched to that agent unless the task supplies its own `fallback_models`.
 - The orchestrator agent needs `permission: question: allow` in its frontmatter to use OpenCode's built-in question tool for plan approval. Without this, the question tool calls will be denied.
+- The planner agent now also needs `permission: question: allow` so it can resolve missing requirements before saving a plan artifact.

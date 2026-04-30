@@ -72,6 +72,52 @@ function installAgentsIfNeeded(): number {
   }
 }
 
+// ─── Plan artifact persistence ────────────────────────────────────────────────
+
+interface WorkflowTaskInput {
+  agent: string;
+  prompt: string;
+  depends_on: number[];
+  model?: string;
+}
+
+interface PlanArtifact {
+  id: string;
+  created_at: string;
+  summary: string[];
+  recommendations?: string[];
+  tasks: WorkflowTaskInput[];
+}
+
+function plansDirectory(): string {
+  const dir = join(process.cwd(), ".opencode", "plans");
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function planArtifactPath(planId: string): string {
+  return join(plansDirectory(), `${planId}.json`);
+}
+
+function savePlanArtifact(artifact: PlanArtifact): string {
+  const path = planArtifactPath(artifact.id);
+  writeFileSync(path, JSON.stringify(artifact, null, 2), "utf8");
+  return path;
+}
+
+function loadPlanArtifact(planId: string): PlanArtifact {
+  const path = planArtifactPath(planId);
+  if (!existsSync(path)) {
+    throw new Error(`plan artifact not found: ${planId}`);
+  }
+  const raw = readFileSync(path, "utf8");
+  const parsed = JSON.parse(raw) as PlanArtifact;
+  if (!parsed || !Array.isArray(parsed.tasks)) {
+    throw new Error(`invalid plan artifact: ${planId}`);
+  }
+  return parsed;
+}
+
 // ─── OpenCode ACP helpers ─────────────────────────────────────────────────────
 
 /**
@@ -387,7 +433,7 @@ export default (async (input: PluginInput) => {
     tool: {
       submit_workflow: tool({
         description:
-          "Orchestrator-only: submit a workflow plan to the harness DAG for execution. Input is the tasks array from planner output. Returns a workflow_id for tracking.",
+          "Orchestrator-only low-level escape hatch: submit a workflow tasks array directly to the harness DAG. Returns a workflow_id for tracking.",
         args: {
           tasks: tool.schema.array(
             tool.schema.object({
@@ -403,6 +449,65 @@ export default (async (input: PluginInput) => {
             throw new Error("submit_workflow can only be executed by the orchestrator agent");
           }
           return dag.submit_workflow(JSON.stringify(tasks), context.sessionID);
+        },
+      }),
+
+      save_plan: tool({
+        description:
+          "Planner-only: persist a plan artifact under .opencode/plans and return its reference metadata.",
+        args: {
+          tasks: tool.schema.array(
+            tool.schema.object({
+              agent: tool.schema.string(),
+              prompt: tool.schema.string(),
+              depends_on: tool.schema.array(tool.schema.number()),
+              model: tool.schema.string().optional(),
+            }),
+          ),
+          summary: tool.schema.array(tool.schema.string()),
+          recommendations: tool.schema.array(tool.schema.string()).optional(),
+        },
+        async execute({ tasks, summary, recommendations }, context) {
+          if (context.agent !== "planner") {
+            throw new Error("save_plan can only be executed by the planner agent");
+          }
+
+          const planId =
+            typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+              ? crypto.randomUUID()
+              : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+          const artifact: PlanArtifact = {
+            id: planId,
+            created_at: new Date().toISOString(),
+            summary,
+            recommendations,
+            tasks,
+          };
+
+          const path = savePlanArtifact(artifact);
+          return JSON.stringify({
+            plan_id: artifact.id,
+            path,
+            task_count: artifact.tasks.length,
+            summary: artifact.summary,
+            recommendations: artifact.recommendations,
+          });
+        },
+      }),
+
+      submit_plan: tool({
+        description:
+          "Orchestrator-only: load a saved plan artifact by plan_id and submit its tasks to the harness DAG.",
+        args: {
+          plan_id: tool.schema.string(),
+        },
+        async execute({ plan_id }, context) {
+          if (context.agent !== "orchestrator") {
+            throw new Error("submit_plan can only be executed by the orchestrator agent");
+          }
+          const artifact = loadPlanArtifact(plan_id);
+          return dag.submit_workflow(JSON.stringify(artifact.tasks), context.sessionID);
         },
       }),
 
