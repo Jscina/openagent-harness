@@ -32,6 +32,14 @@ OpenCode process
 
 ## Quickstart
 
+### Install a tagged release
+
+Install a pinned release tag (not `latest`) with the installer script:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Jscina/openagent-harness/v0.3.2/install.sh | OPENAGENT_HARNESS_TAG=v0.3.2 bash
+```
+
 ### Building the WASM plugin
 
 You need [wasm-pack](https://rustwasm.github.io/wasm-pack/) installed.

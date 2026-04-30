@@ -13,17 +13,22 @@ for cmd in bun jq curl tar; do
 	fi
 done
 
-echo "📦 Fetching latest release from $REPO..."
-RELEASE_JSON=$(curl -s "https://api.github.com/repos/$REPO/releases/latest")
-LATEST_TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name // empty')
+if [ -n "${OPENAGENT_HARNESS_TAG:-}" ]; then
+	LATEST_TAG="$OPENAGENT_HARNESS_TAG"
+	echo "🏷️  Using pinned release tag from OPENAGENT_HARNESS_TAG: $LATEST_TAG"
+else
+	echo "📦 Fetching latest release from $REPO..."
+	RELEASE_JSON=$(curl -s "https://api.github.com/repos/$REPO/releases/latest")
+	LATEST_TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name // empty')
 
-if [ -z "$LATEST_TAG" ]; then
-	echo "❌ Could not determine latest release tag."
-	echo "Please ensure you have created a GitHub Release with pre-built artifacts."
-	exit 1
+	if [ -z "$LATEST_TAG" ]; then
+		echo "❌ Could not determine latest release tag."
+		echo "Please ensure you have created a GitHub Release with pre-built artifacts."
+		exit 1
+	fi
+
+	echo "🏷️  Found release: $LATEST_TAG"
 fi
-
-echo "🏷️  Found release: $LATEST_TAG"
 
 # Start fresh by wiping old installations (the native binary is no longer needed)
 rm -rf "$INSTALL_DIR"
