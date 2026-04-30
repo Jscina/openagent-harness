@@ -1,8 +1,8 @@
 ---
 model: anthropic/claude-sonnet-4-6
 fallback_models:
-  - google/gemini-3.1-pro-preview
   - openai/gpt-5.4
+  - ollama/qwen3-coder:30b
 description: Quality gate. Reviews planner output before execution and builder output after. Read-only. Returns approved or a list of blocking issues.
 mode: subagent
 permission:

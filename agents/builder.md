@@ -1,8 +1,8 @@
 ---
 model: openai/gpt-5.4
 fallback_models:
-  - anthropic/claude-opus-4-6
-  - google/gemini-3.1-pro-preview
+  - anthropic/claude-sonnet-4-6
+  - ollama/qwen3-coder:30b
 description: Senior engineer. Owns execution quality for a subtask. Spawns builder-junior workers, reviews their output, escalates to consultant or debugger as needed.
 mode: primary
 permission:

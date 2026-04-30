@@ -165,23 +165,46 @@ mod tests {
 
     #[test]
     fn parse_agent_frontmatter_with_fallback_models() {
-        let md = "---\nmodel: anthropic/claude-opus-4-6\nfallback_models:\n  - google/gemini-3.1-pro-preview\n  - openai/gpt-5.4\n---\n\nBody text here.\n";
+        let md = "---\nmodel: anthropic/claude-opus-4-6\nfallback_models:\n  - openai/gpt-5.4\n  - ollama/qwen3-coder:30b\n---\n\nBody text here.\n";
         let cfg = parse_agent_frontmatter("planner", md);
         assert_eq!(cfg.name, "planner");
         assert_eq!(cfg.model, "anthropic/claude-opus-4-6");
         assert_eq!(
             cfg.fallback_models,
-            vec!["google/gemini-3.1-pro-preview", "openai/gpt-5.4"]
+            vec!["openai/gpt-5.4", "ollama/qwen3-coder:30b"]
         );
     }
 
     #[test]
     fn parse_agent_frontmatter_without_fallback_models() {
-        let md = "---\nmodel: google/gemini-2.5-flash\ndescription: A simple agent.\n---\n\nBody text.\n";
+        let md = "---\nmodel: anthropic/claude-sonnet-4-6\ndescription: A simple agent.\n---\n\nBody text.\n";
         let cfg = parse_agent_frontmatter("explorer", md);
         assert_eq!(cfg.name, "explorer");
-        assert_eq!(cfg.model, "google/gemini-2.5-flash");
+        assert_eq!(cfg.model, "anthropic/claude-sonnet-4-6");
         assert!(cfg.fallback_models.is_empty());
+    }
+
+    #[test]
+    fn planner_agent_is_subagent_mode() {
+        let planner = AGENTS
+            .iter()
+            .find(|(name, _)| *name == "planner")
+            .map(|(_, content)| *content)
+            .expect("planner agent should be embedded");
+        assert!(
+            planner.contains("mode: subagent"),
+            "planner agent frontmatter should contain 'mode: subagent'"
+        );
+    }
+
+    #[test]
+    fn no_embedded_agent_references_google_models() {
+        for (name, content) in AGENTS {
+            assert!(
+                !content.contains("google/"),
+                "agent '{name}' should not reference google/ models"
+            );
+        }
     }
 
     #[test]

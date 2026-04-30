@@ -1232,7 +1232,7 @@ mod tests {
         let fallbacks_json = serde_json::json!({
             "explorer": {
                 "model": "anthropic/claude-sonnet-4-6",
-                "fallback_models": ["openai/gpt-4o", "google/gemini-pro"]
+                "fallback_models": ["openai/gpt-4o", "ollama/qwen3-coder:30b"]
             }
         })
         .to_string();
@@ -1248,7 +1248,7 @@ mod tests {
         let fallbacks = task["fallback_models"].as_array().unwrap();
         assert_eq!(fallbacks.len(), 2);
         assert_eq!(fallbacks[0], "openai/gpt-4o");
-        assert_eq!(fallbacks[1], "google/gemini-pro");
+        assert_eq!(fallbacks[1], "ollama/qwen3-coder:30b");
     }
 
     #[test]
@@ -1269,7 +1269,7 @@ mod tests {
             "agent": "explorer",
             "prompt": "go",
             "depends_on": [],
-            "fallback_models": ["google/gemini-pro", "mistral/mistral-large"]
+            "fallback_models": ["ollama/qwen3-coder:30b", "mistral/mistral-large"]
         }]);
         let resp: serde_json::Value =
             serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
@@ -1278,7 +1278,7 @@ mod tests {
         let task: serde_json::Value = serde_json::from_str(&dag.get_task(task_id)).unwrap();
         let fallbacks = task["fallback_models"].as_array().unwrap();
         assert_eq!(fallbacks.len(), 2);
-        assert_eq!(fallbacks[0], "google/gemini-pro");
+        assert_eq!(fallbacks[0], "ollama/qwen3-coder:30b");
         assert_eq!(fallbacks[1], "mistral/mistral-large");
     }
 
@@ -1289,7 +1289,7 @@ mod tests {
             "agent": "a",
             "prompt": "p",
             "depends_on": [],
-            "fallback_models": ["openai/gpt-4o", "google/gemini-pro"]
+            "fallback_models": ["openai/gpt-4o", "ollama/qwen3-coder:30b"]
         }]);
         let resp: serde_json::Value =
             serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();

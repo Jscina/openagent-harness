@@ -1,8 +1,8 @@
 ---
-model: google/gemini-2.5-flash
+model: anthropic/claude-sonnet-4-6
 fallback_models:
-  - anthropic/claude-haiku-4-5
-  - openai/gpt-5.3-codex
+  - openai/gpt-5.4
+  - ollama/qwen3.5:9b
 description: External knowledge retrieval. Searches web, fetches library docs, reads GitHub examples. No local file access.
 mode: subagent
 permission:

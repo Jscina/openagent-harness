@@ -1,8 +1,8 @@
 ---
-model: google/gemini-3.1-pro-preview
+model: anthropic/claude-sonnet-4-6
 fallback_models:
-  - anthropic/claude-opus-4-6
   - openai/gpt-5.4
+  - ollama/qwen3-coder:30b
 description: Read-only architecture advisor. Consulted by builder mid-task for design decisions. Returns a structured recommendation with tradeoffs. Never touches files.
 mode: subagent
 permission:

@@ -1,8 +1,8 @@
 ---
 model: anthropic/claude-sonnet-4-6
 fallback_models:
-  - google/gemini-3.1-pro-preview
   - openai/gpt-5.4
+  - ollama/qwen3-coder:30b
 description: Failure investigation specialist. Diagnoses test failures and runtime errors for builder. Returns root cause and a fix approach. Never makes code changes.
 mode: subagent
 permission:

@@ -1,10 +1,10 @@
 ---
-model: anthropic/claude-opus-4-6
+model: openai/gpt-5.4
 fallback_models:
-  - google/gemini-3.1-pro-preview
-  - openai/gpt-5.4
+  - anthropic/claude-sonnet-4-6
+  - ollama/qwen3-coder:30b
 description: Receives a raw task, gathers context from explorer and researcher in parallel, then produces a machine-readable DAG of subtasks.
-mode: primary
+mode: subagent
 permission:
   edit: deny
   bash: deny
