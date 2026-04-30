@@ -4,20 +4,25 @@ Deterministic agent harness for [OpenCode](https://opencode.ai). The DAG state m
 
 ## How it works
 
-```
-OpenCode process
-  └─ loads plugin/harness.ts
-       └─ initSync(readFileSync("...wasm"))  → DagEngine (in-process)
-       └─ get_agent_configs()               → install .md files on first boot
-       └─ setInterval 500ms
-            └─ dag.tick()          → ready tasks
-            └─ POST /session        → create OpenCode session
-            └─ POST /session/{id}/prompt_async
-            └─ dag.task_started()
-       └─ event hook (session.idle / session.error)
-            └─ dag.process_event()  → notifications + session to delete
-            └─ DELETE /session/{id}
-            └─ POST /tui/show-toast (on workflow completion/failure)
+```mermaid
+flowchart TD
+    A[OpenCode process] --> B[loads plugin/harness.ts]
+    B --> C[initSync readFileSync ...wasm]
+    C --> D[DagEngine in-process]
+    B --> E[get_agent_configs]
+    E --> F[install .md files on first boot]
+    B --> G[setInterval 500ms]
+    G --> H[dag.tick]
+    H --> I[ready tasks]
+    I --> J[POST /session create OpenCode session]
+    J --> K["POST /session/{id}/prompt_async"]
+    K --> L[dag.task_started]
+    B --> M[event hook: session.idle / session.error]
+    M --> N[dag.process_event]
+    N --> O[notifications + session to delete]
+    O --> P["DELETE /session/{id}"]
+    O --> Q[POST /tui/show-toast]
+    Q --> R[on workflow completion/failure]
 ```
 
 1. The `orchestrator` agent receives a user request.
@@ -76,24 +81,24 @@ cargo run -- install --force   # overwrite existing agents
 
 ### Primary agents
 
-| Agent | Model | Role |
-|-------|-------|------|
-| `orchestrator` | `anthropic/claude-sonnet-4-6` | Human-facing entry point. Classifies requests, drives the planner pipeline for complex tasks, presents plans for user approval, waits for workflow completion, and reports results. |
-| `builder` | `openai/gpt-5.4` | Senior engineer. Owns execution quality for a subtask end-to-end. Spawns `@explorer`, `@researcher`, and `@vision` in parallel to gather context. Breaks the subtask into atomic units. Spawns `@builder-junior` workers in parallel for each unit. Reviews their output, escalates to `@consultant` for design decisions and `@debugger` for failures. Delivers a completed result. |
+| Agent          | Model                         | Role                                                                                                                                                                                                                                                                                                                                                                                 |
+| -------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `orchestrator` | `anthropic/claude-sonnet-4-6` | Human-facing entry point. Classifies requests, drives the planner pipeline for complex tasks, presents plans for user approval, waits for workflow completion, and reports results.                                                                                                                                                                                                  |
+| `builder`      | `openai/gpt-5.4`              | Senior engineer. Owns execution quality for a subtask end-to-end. Spawns `@explorer`, `@researcher`, and `@vision` in parallel to gather context. Breaks the subtask into atomic units. Spawns `@builder-junior` workers in parallel for each unit. Reviews their output, escalates to `@consultant` for design decisions and `@debugger` for failures. Delivers a completed result. |
 
 ### Subagents
 
-| Agent | Model | Role |
-|-------|-------|------|
-| `planner` | `openai/gpt-5.4` | Planning subagent spawned by `@orchestrator`. Gathers context from `@explorer` and `@researcher`, asks clarifying questions when needed, saves a generated plan under `.opencode/plans`, and returns a structured plan summary object for approval. |
-| `explorer` | `openai/gpt-5.3-codex` | Read-only codebase reconnaissance. Maps files, traces call chains, identifies interfaces and patterns. Never modifies anything. |
-| `researcher` | `anthropic/claude-sonnet-4-6` | External knowledge retrieval. Searches web, fetches library docs, reads GitHub examples. No local file access. |
-| `vision` | `anthropic/claude-sonnet-4-6` | Analyzes visual assets — screenshots, wireframes, UI mockups, PDFs — and returns a structured description. Never writes code. |
-| `builder-junior` | `openai/gpt-5.3-codex` | Executes one narrowly scoped coding task given an exact spec by builder. Executes the spec exactly, does not explore or plan. Reports every file modified and expected outcome. |
-| `consultant` | `anthropic/claude-sonnet-4-6` | Architecture advisor. Consulted by builder mid-task for design decisions with real tradeoffs. Returns a structured recommendation with rationale, tradeoffs, and risks. Read-only. |
-| `reviewer` | `anthropic/claude-sonnet-4-6` | Quality gate. Reviews planner output before execution and builder output after. Returns approved or a list of blocking issues. Read-only. |
-| `debugger` | `anthropic/claude-sonnet-4-6` | Failure investigation specialist. Diagnoses test failures and runtime errors. Returns root cause and a fix approach. Never makes code changes. |
-| `docs-writer` | `openai/gpt-5.4` | Documentation only. Writes READMEs, inline doc comments, API docs, and changelogs based on builder's completed diff. Never touches code files. |
+| Agent            | Model                         | Role                                                                                                                                                                                                                                                |
+| ---------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `planner`        | `openai/gpt-5.4`              | Planning subagent spawned by `@orchestrator`. Gathers context from `@explorer` and `@researcher`, asks clarifying questions when needed, saves a generated plan under `.opencode/plans`, and returns a structured plan summary object for approval. |
+| `explorer`       | `openai/gpt-5.3-codex`        | Read-only codebase reconnaissance. Maps files, traces call chains, identifies interfaces and patterns. Never modifies anything.                                                                                                                     |
+| `researcher`     | `anthropic/claude-sonnet-4-6` | External knowledge retrieval. Searches web, fetches library docs, reads GitHub examples. No local file access.                                                                                                                                      |
+| `vision`         | `anthropic/claude-sonnet-4-6` | Analyzes visual assets — screenshots, wireframes, UI mockups, PDFs — and returns a structured description. Never writes code.                                                                                                                       |
+| `builder-junior` | `openai/gpt-5.3-codex`        | Executes one narrowly scoped coding task given an exact spec by builder. Executes the spec exactly, does not explore or plan. Reports every file modified and expected outcome.                                                                     |
+| `consultant`     | `anthropic/claude-sonnet-4-6` | Architecture advisor. Consulted by builder mid-task for design decisions with real tradeoffs. Returns a structured recommendation with rationale, tradeoffs, and risks. Read-only.                                                                  |
+| `reviewer`       | `anthropic/claude-sonnet-4-6` | Quality gate. Reviews planner output before execution and builder output after. Returns approved or a list of blocking issues. Read-only.                                                                                                           |
+| `debugger`       | `anthropic/claude-sonnet-4-6` | Failure investigation specialist. Diagnoses test failures and runtime errors. Returns root cause and a fix approach. Never makes code changes.                                                                                                      |
+| `docs-writer`    | `openai/gpt-5.4`              | Documentation only. Writes READMEs, inline doc comments, API docs, and changelogs based on builder's completed diff. Never touches code files.                                                                                                      |
 
 ## Fallback model chains
 
@@ -148,9 +153,9 @@ Workflow snapshots (via the `harness_state` tool) include `model_attempt` and `f
 
 ## Environment variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OPENCODE_SERVER_PASSWORD` | — | Basic auth password for OpenCode ACP |
+| Variable                   | Default | Description                          |
+| -------------------------- | ------- | ------------------------------------ |
+| `OPENCODE_SERVER_PASSWORD` | —       | Basic auth password for OpenCode ACP |
 
 ## Development
 
