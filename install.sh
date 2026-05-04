@@ -7,27 +7,27 @@ INSTALL_DIR="$HOME/.openagent-harness"
 echo "🚀 Installing openagent-harness..."
 
 for cmd in bun jq curl tar; do
-	if ! command -v "$cmd" &>/dev/null; then
-		echo "❌ Error: $cmd is required but not installed."
-		exit 1
-	fi
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "❌ Error: $cmd is required but not installed."
+    exit 1
+  fi
 done
 
 if [ -n "${OPENAGENT_HARNESS_TAG:-}" ]; then
-	LATEST_TAG="$OPENAGENT_HARNESS_TAG"
-	echo "🏷️  Using pinned release tag from OPENAGENT_HARNESS_TAG: $LATEST_TAG"
+  LATEST_TAG="$OPENAGENT_HARNESS_TAG"
+  echo "🏷️  Using pinned release tag from OPENAGENT_HARNESS_TAG: $LATEST_TAG"
 else
-	echo "📦 Fetching latest release from $REPO..."
-	RELEASE_JSON=$(curl -s "https://api.github.com/repos/$REPO/releases/latest")
-	LATEST_TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name // empty')
+  echo "📦 Fetching latest release from $REPO..."
+  RELEASE_JSON=$(curl -s "https://api.github.com/repos/$REPO/releases/latest")
+  LATEST_TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name // empty')
 
-	if [ -z "$LATEST_TAG" ]; then
-		echo "❌ Could not determine latest release tag."
-		echo "Please ensure you have created a GitHub Release with pre-built artifacts."
-		exit 1
-	fi
+  if [ -z "$LATEST_TAG" ]; then
+    echo "❌ Could not determine latest release tag."
+    echo "Please ensure you have created a GitHub Release with pre-built artifacts."
+    exit 1
+  fi
 
-	echo "🏷️  Found release: $LATEST_TAG"
+  echo "🏷️  Found release: $LATEST_TAG"
 fi
 
 # Start fresh by wiping old installations (the native binary is no longer needed)
@@ -41,8 +41,8 @@ echo "📥 Downloading plugin bundle: $ASSET_NAME..."
 HTTP_CODE=$(curl -sL -w "%{http_code}" -o "$INSTALL_DIR/plugin.tar.gz" "$DOWNLOAD_URL")
 
 if [ "$HTTP_CODE" != "200" ]; then
-	echo "❌ Failed to download plugin (HTTP $HTTP_CODE): $DOWNLOAD_URL"
-	exit 1
+  echo "❌ Failed to download plugin (HTTP $HTTP_CODE): $DOWNLOAD_URL"
+  exit 1
 fi
 
 tar -xzf "$INSTALL_DIR/plugin.tar.gz" -C "$INSTALL_DIR"
@@ -58,7 +58,7 @@ PLUGIN_PATH="$INSTALL_DIR/harness.ts"
 
 mkdir -p "$CONFIG_DIR"
 if [ ! -f "$CONFIG_FILE" ]; then
-	echo "{}" >"$CONFIG_FILE"
+  echo "{}" >"$CONFIG_FILE"
 fi
 
 OLD_PLUGIN_PATH="$INSTALL_DIR/plugin/harness.ts"
@@ -67,8 +67,7 @@ jq --arg path "$PLUGIN_PATH" --arg old_path "$OLD_PLUGIN_PATH" '
 	.plugin = ((.plugin // []) | if type == "array" then (map(select(. != $old_path)) | if index($path) == null then . + [$path] else . end) else [., $path] end) |
 	.agent.build.disable = true |
 	.agent.plan.disable = true |
-	.agent.explorer.fallback_models = ["ollama/qwen3-coder", "anthropic/claude-haiku-4-5"] |
-	."agent"."builder-junior".fallback_models = ["ollama/qwen3-coder", "anthropic/claude-haiku-4-5"] |
+	.agent.general.disable = true |
 	.mcp.websearch = {"type": "remote", "url": "https://mcp.exa.ai/mcp"} |
 	.mcp.context7 = {"type": "remote", "url": "https://mcp.context7.com/mcp"} |
 	.mcp.grep_app = {"type": "remote", "url": "https://mcp.grep.app"}
@@ -78,8 +77,8 @@ mv "$tmp_file" "$CONFIG_FILE"
 # Clean up old binary if it was installed by the old harness
 OLD_BIN="$HOME/.local/bin/openagent-harness"
 if [ -f "$OLD_BIN" ]; then
-	rm "$OLD_BIN"
-	echo "🗑️  Removed legacy native binary: $OLD_BIN"
+  rm "$OLD_BIN"
+  echo "🗑️  Removed legacy native binary: $OLD_BIN"
 fi
 
 echo ""

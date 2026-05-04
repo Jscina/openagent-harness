@@ -221,11 +221,14 @@ async function showToast(
   for (let i = 0; i < retryDelaysMs.length; i++) {
     if (retryDelaysMs[i] > 0) await sleep(retryDelaysMs[i]);
     try {
-      await fetch(`${baseUrl}/tui/show-toast`, {
+      const resp = await fetch(`${baseUrl}/tui/show-toast`, {
         method: "POST",
         headers: makeHeaders(),
         body,
       });
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
       return; // success
     } catch (e: unknown) {
       if (isConnectionError(e) && i < retryDelaysMs.length - 1) {
