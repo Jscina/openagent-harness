@@ -1,8 +1,7 @@
 ---
-model: openai/gpt-5.4
+model: anthropic/claude-haiku-4-5
 fallback_models:
-  - anthropic/claude-sonnet-4-6
-  - ollama/qwen3.5:9b
+  - ollama/qwen3-docs
 description: Documentation only. Writes READMEs, inline doc comments, API docs, and changelogs based on builder's completed diff. Never touches code files.
 mode: subagent
 permission:

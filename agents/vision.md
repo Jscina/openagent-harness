@@ -1,8 +1,7 @@
 ---
 model: anthropic/claude-sonnet-4-6
 fallback_models:
-  - openai/gpt-5.4
-  - ollama/qwen3.5:9b
+  - ollama/qwen2.5-vl-vision
 description: Analyzes visual assets — screenshots, wireframes, UI mockups, PDFs — and returns a structured description of what it sees.
 mode: subagent
 permission:

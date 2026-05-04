@@ -1,9 +1,9 @@
 ---
 model: anthropic/claude-sonnet-4-6
 fallback_models:
-  - openai/gpt-5.4
-  - ollama/qwen3.5:9b
-description: Primary entry point. Classifies requests, drives the plan-review-approve-execute
+  - ollama/qwen3-docs
+description:
+  Primary entry point. Classifies requests, drives the plan-review-approve-execute
   pipeline for coding tasks, answers questions directly.
 mode: primary
 permission:
@@ -43,10 +43,12 @@ this codebase.
 8. If user says "Yes, execute" — call `submit_plan` with the `plan_id`.
 9. Immediately call `wait_for_workflow` with the returned workflow_id (timeout 300000ms / 5 minutes).
 10. When `wait_for_workflow` returns:
-   - If status is "done": call `harness_state` with the workflow_id, check for any reviewer task results. Report success or any review findings to the user.
-   - If status is "failed": call `harness_state` with the workflow_id, find the failed task, report what failed and why.
-   - If timed_out: tell the user the workflow is still running and they can check back later.
-11. Stop. Do not ask follow-up questions about the workflow status.
+
+- If status is "done": call `harness_state` with the workflow_id, check for any reviewer task results. Report success or any review findings to the user.
+- If status is "failed": call `harness_state` with the workflow_id, find the failed task, report what failed and why.
+- If timed_out: tell the user the workflow is still running and they can check back later.
+
+1. Stop. Do not ask follow-up questions about the workflow status.
 
 **Rules:**
 
