@@ -134,59 +134,40 @@ function parseModel(
     : { providerID: "anthropic", modelID: model };
 }
 
-/** Common request headers; injects Basic-auth when the env var is set. */
-function makeHeaders(): Record<string, string> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  const pw = process.env.OPENCODE_SERVER_PASSWORD;
-  if (pw) {
-    headers["Authorization"] =
-      "Basic " + Buffer.from(`opencode:${pw}`).toString("base64");
-  }
-  return headers;
-}
-
 async function createSession(
-  baseUrl: string,
+  client: PluginInput["client"],
   parentSessionId?: string | null,
 ): Promise<string> {
-  const body = parentSessionId
-    ? JSON.stringify({ parentID: parentSessionId })
-    : "{}";
-  const resp = await fetch(`${baseUrl}/session`, {
-    method: "POST",
-    headers: makeHeaders(),
-    body,
+  const result = await client.session.create({
+    body: parentSessionId ? { parentID: parentSessionId } : {},
   });
-  if (!resp.ok) throw new Error(`createSession failed: ${resp.status}`);
-  const data = (await resp.json()) as { id: string };
-  return data.id;
+  if (!result.data) throw new Error("createSession failed: no data returned");
+  return result.data.id;
 }
 
 async function sendMessage(
-  baseUrl: string,
+  client: PluginInput["client"],
   sessionId: string,
   prompt: string,
   model: string,
   agent?: string | null,
 ): Promise<void> {
-  const body: Record<string, unknown> = {
-    parts: [{ type: "text", text: prompt }],
-  };
   const modelSpec = parseModel(model);
-  if (modelSpec) body["model"] = modelSpec;
-  if (agent) body["agent"] = agent;
-  await fetch(`${baseUrl}/session/${sessionId}/prompt_async`, {
-    method: "POST",
-    headers: makeHeaders(),
-    body: JSON.stringify(body),
+  await client.session.promptAsync({
+    path: { id: sessionId },
+    body: {
+      parts: [{ type: "text", text: prompt }],
+      ...(modelSpec && { model: modelSpec }),
+      ...(agent && { agent }),
+    },
   });
 }
 
-async function deleteSession(baseUrl: string, sessionId: string): Promise<void> {
-  await fetch(`${baseUrl}/session/${sessionId}`, {
-    method: "DELETE",
-    headers: makeHeaders(),
-  }).catch((e: unknown) => {
+async function deleteSession(
+  client: PluginInput["client"],
+  sessionId: string,
+): Promise<void> {
+  await client.session.delete({ path: { id: sessionId } }).catch((e: unknown) => {
     console.error("[harness-plugin] deleteSession failed:", e);
   });
 }
@@ -281,7 +262,6 @@ function sleep(ms: number): Promise<void> {
 async function handleEventResult(
   result: EventResult,
   client: PluginInput["client"],
-  baseUrl: string,
   dag: DagEngine,
 ): Promise<void> {
   for (const n of result.notifications) {
@@ -294,7 +274,7 @@ async function handleEventResult(
     // task_started also updates session_to_task in the WASM engine.
     dag.task_started(result.reuse_session.next_task_id, result.reuse_session.session_id);
   } else if (result.delete_session) {
-    await deleteSession(baseUrl, result.delete_session);
+    await deleteSession(client, result.delete_session);
   }
 }
 
@@ -335,7 +315,6 @@ function classifyError(errorMsg: string): 'retryable' | 'terminal' {
 // ─── Plugin ───────────────────────────────────────────────────────────────────
 
 export default (async (input: PluginInput) => {
-  const baseUrl = input.serverUrl.toString().replace(/\/$/, "");
   const client = input.client;
 
   // Load WASM DAG engine.
@@ -386,10 +365,10 @@ export default (async (input: PluginInput) => {
             // but call again to be idempotent (it's a no-op if mapping already exists).
             dag.task_started(task.id, sessionId);
           } else {
-            sessionId = await createSession(baseUrl, task.parent_session_id);
+            sessionId = await createSession(client, task.parent_session_id);
             dag.task_started(task.id, sessionId);
           }
-          await sendMessage(baseUrl, sessionId, task.prompt, task.model, task.agent);
+          await sendMessage(client, sessionId, task.prompt, task.model, task.agent);
           void showToast(client, 'Task Started', `Task ${task.id} dispatched`, 'info', 5000);
         } catch (e) {
           console.error(`[harness-plugin] failed to start task ${task.id}:`, e);
@@ -401,7 +380,7 @@ export default (async (input: PluginInput) => {
             try {
               const fallbackResult = JSON.parse(dag.try_fallback(task.id, message));
               void showToast(client, 'Fallback', `Task ${task.id} falling back to ${fallbackResult.new_model}`, 'warning');
-              if (sessionId) await deleteSession(baseUrl, sessionId);
+              if (sessionId) await deleteSession(client, sessionId);
               // Task is Pending again — next tick will pick it up
               continue;
             } catch {
@@ -413,7 +392,7 @@ export default (async (input: PluginInput) => {
             const { session_id } = JSON.parse(dag.fail_task(task.id, message)) as {
               session_id: string | null;
             };
-            if (session_id) await deleteSession(baseUrl, session_id);
+            if (session_id) await deleteSession(client, session_id);
           } catch {
             // already terminal — ignore
           }
@@ -629,7 +608,7 @@ export default (async (input: PluginInput) => {
         const result: EventResult = JSON.parse(
           dag.process_event("session.idle", sessionId, JSON.stringify(event.properties)),
         );
-        await handleEventResult(result, client, baseUrl, dag);
+        await handleEventResult(result, client, dag);
       } else if (event.type === "session.error") {
         const sessionId: string = event.properties.sessionID ?? '';
         if (!sessionId) return;
@@ -659,11 +638,11 @@ export default (async (input: PluginInput) => {
               );
               // Clean up old session
               if (fallbackResult.session_id) {
-                await deleteSession(baseUrl, fallbackResult.session_id);
+                await deleteSession(client, fallbackResult.session_id);
               }
               // The task is now Pending again — the tick loop will pick it up
               // Handle any notifications from the original event
-              await handleEventResult(result, client, baseUrl, dag);
+              await handleEventResult(result, client, dag);
               return;
             } catch (e) {
               console.error(`[harness-plugin] fallback attempt failed for task ${task_id}:`, e);
@@ -676,13 +655,13 @@ export default (async (input: PluginInput) => {
             const { session_id } = JSON.parse(dag.fail_task(task_id, error_message)) as {
               session_id: string | null;
             };
-            if (session_id) await deleteSession(baseUrl, session_id);
+            if (session_id) await deleteSession(client, session_id);
           } catch {
             // already terminal — ignore
           }
         }
 
-        await handleEventResult(result, client, baseUrl, dag);
+        await handleEventResult(result, client, dag);
       }
     },
 
