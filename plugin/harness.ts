@@ -192,56 +192,22 @@ async function deleteSession(baseUrl: string, sessionId: string): Promise<void> 
 }
 
 /**
- * Returns true when the error looks like a network-connectivity failure
- * (server not listening yet) rather than a protocol or application error.
- */
-function isConnectionError(e: unknown): boolean {
-  if (e != null && typeof e === "object") {
-    const code = (e as Record<string, unknown>).code;
-    return code === "ConnectionRefused" || code === "ECONNREFUSED";
-  }
-  return false;
-}
-
-/**
- * Post a toast notification to the OpenCode TUI.  Retries up to three times
- * with short back-off so transient "server not ready yet" errors at plugin
- * startup are handled gracefully instead of spamming the console.
+ * Post a toast notification to the OpenCode TUI via the SDK client.
+ * Non-fatal: errors are logged as warnings and silently dropped.
  */
 async function showToast(
-  baseUrl: string,
+  client: PluginInput["client"],
   title: string,
   message: string,
-  variant: string,
+  variant: "info" | "success" | "warning" | "error",
   duration?: number,
 ): Promise<void> {
-  const body = JSON.stringify({ title, message, variant, duration: duration ?? 8000 });
-  // Attempt delays: first try is immediate; subsequent tries wait progressively longer.
-  const retryDelaysMs = [0, 750, 2000];
-  for (let i = 0; i < retryDelaysMs.length; i++) {
-    if (retryDelaysMs[i] > 0) await sleep(retryDelaysMs[i]);
-    try {
-      const resp = await fetch(`${baseUrl}/tui/show-toast`, {
-        method: "POST",
-        headers: makeHeaders(),
-        body,
-      });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      return; // success
-    } catch (e: unknown) {
-      if (isConnectionError(e) && i < retryDelaysMs.length - 1) {
-        // TUI server not ready yet — retry after the next delay.
-        continue;
-      }
-      // Non-connection error or final attempt: warn and give up (non-fatal).
-      console.warn(
-        "[harness-plugin] showToast unavailable:",
-        (e as Error)?.message ?? e,
-      );
-      return;
-    }
+  try {
+    await client.tui.showToast({
+      body: { title, message, variant, duration: duration ?? 8000 },
+    });
+  } catch (e) {
+    console.warn("[harness-plugin] showToast failed:", (e as Error)?.message ?? e);
   }
 }
 
@@ -314,12 +280,13 @@ function sleep(ms: number): Promise<void> {
 
 async function handleEventResult(
   result: EventResult,
+  client: PluginInput["client"],
   baseUrl: string,
   dag: DagEngine,
 ): Promise<void> {
   for (const n of result.notifications) {
     if (n.type === "toast") {
-      await showToast(baseUrl, n.title, n.message, n.variant, n.duration);
+      await showToast(client, n.title, n.message, n.variant as "info" | "success" | "warning" | "error", n.duration);
     }
   }
   if (result.reuse_session) {
@@ -369,22 +336,23 @@ function classifyError(errorMsg: string): 'retryable' | 'terminal' {
 
 export default (async (input: PluginInput) => {
   const baseUrl = input.serverUrl.toString().replace(/\/$/, "");
+  const client = input.client;
 
   // Load WASM DAG engine.
   const dag = loadWasm();
-  void showToast(baseUrl, 'Harness Plugin', 'WASM DAG engine loaded', 'info', 5000);
+  void showToast(client, 'Harness Plugin', 'WASM DAG engine loaded', 'info', 5000);
 
   // Install agent configs the first time this plugin runs.
   const installed = installAgentsIfNeeded();
   if (installed > 0) {
-    void showToast(baseUrl, 'Harness Plugin', `Installed ${installed} agent config(s)`, 'info');
+    void showToast(client, 'Harness Plugin', `Installed ${installed} agent config(s)`, 'info');
   }
 
   // Load agent fallback configs from WASM and register with DAG engine.
   try {
     const fallbackConfigs = agent_fallback_configs_json();
     dag.set_agent_fallbacks(fallbackConfigs);
-    void showToast(baseUrl, 'Harness Plugin', 'Agent fallback models registered', 'info', 5000);
+    void showToast(client, 'Harness Plugin', 'Agent fallback models registered', 'info', 5000);
   } catch (e) {
     console.error('[harness-plugin] fallback config load failed (non-fatal):', e);
   }
@@ -422,17 +390,17 @@ export default (async (input: PluginInput) => {
             dag.task_started(task.id, sessionId);
           }
           await sendMessage(baseUrl, sessionId, task.prompt, task.model, task.agent);
-          void showToast(baseUrl, 'Task Started', `Task ${task.id} dispatched`, 'info', 5000);
+          void showToast(client, 'Task Started', `Task ${task.id} dispatched`, 'info', 5000);
         } catch (e) {
           console.error(`[harness-plugin] failed to start task ${task.id}:`, e);
           const message = e instanceof Error ? e.message : String(e);
           const classification = classifyError(message);
-          void showToast(baseUrl, 'Harness Plugin', `Error classified as ${classification}`, classification === 'retryable' ? 'warning' : 'error');
+          void showToast(client, 'Harness Plugin', `Error classified as ${classification}`, classification === 'retryable' ? 'warning' : 'error');
 
           if (classification === 'retryable' && task.fallback_models && task.fallback_models.length > 0) {
             try {
               const fallbackResult = JSON.parse(dag.try_fallback(task.id, message));
-              void showToast(baseUrl, 'Fallback', `Task ${task.id} falling back to ${fallbackResult.new_model}`, 'warning');
+              void showToast(client, 'Fallback', `Task ${task.id} falling back to ${fallbackResult.new_model}`, 'warning');
               if (sessionId) await deleteSession(baseUrl, sessionId);
               // Task is Pending again — next tick will pick it up
               continue;
@@ -661,7 +629,7 @@ export default (async (input: PluginInput) => {
         const result: EventResult = JSON.parse(
           dag.process_event("session.idle", sessionId, JSON.stringify(event.properties)),
         );
-        await handleEventResult(result, baseUrl, dag);
+        await handleEventResult(result, client, baseUrl, dag);
       } else if (event.type === "session.error") {
         const sessionId: string = event.properties.sessionID ?? '';
         if (!sessionId) return;
@@ -684,7 +652,7 @@ export default (async (input: PluginInput) => {
                 session_id: string | null;
               };
               void showToast(
-                baseUrl,
+                client,
                 'Fallback',
                 `Task ${task_id} → ${fallbackResult.new_model} (attempt ${fallbackResult.attempt})`,
                 'warning',
@@ -695,7 +663,7 @@ export default (async (input: PluginInput) => {
               }
               // The task is now Pending again — the tick loop will pick it up
               // Handle any notifications from the original event
-              await handleEventResult(result, baseUrl, dag);
+              await handleEventResult(result, client, baseUrl, dag);
               return;
             } catch (e) {
               console.error(`[harness-plugin] fallback attempt failed for task ${task_id}:`, e);
@@ -714,7 +682,7 @@ export default (async (input: PluginInput) => {
           }
         }
 
-        await handleEventResult(result, baseUrl, dag);
+        await handleEventResult(result, client, baseUrl, dag);
       }
     },
 
