@@ -155,6 +155,10 @@ pub(crate) struct ReadyTask {
     /// When set, the plugin must skip `createSession` and use this directly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub existing_session_id: Option<String>,
+    /// The workflow this task belongs to.
+    /// Used by the plugin to route tasks to native-dispatch vs. plugin-dispatch workflows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
 }
 
 /// Returned inside `EventResult` on a `session.error` event, telling the plugin

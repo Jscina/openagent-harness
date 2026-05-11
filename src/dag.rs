@@ -249,6 +249,7 @@ impl DagEngine {
             // Mutate phase: mark Running and collect the ReadyTask.
             if let Some(node) = self.nodes.get_mut(&id) {
                 let existing_session_id = node.task.session_id.clone();
+                let workflow_id = node.workflow_id.clone();
                 node.task.status = TaskStatus::Running;
                 started.push(ReadyTask {
                     id: id.clone(),
@@ -258,6 +259,7 @@ impl DagEngine {
                     parent_session_id,
                     fallback_models: node.task.fallback_models.clone(),
                     existing_session_id,
+                    workflow_id,
                 });
             }
         }
