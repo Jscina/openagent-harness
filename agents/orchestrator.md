@@ -41,12 +41,11 @@ this codebase.
 6. If user says "No, cancel" — acknowledge and stop.
 7. If user says "Let me modify the request" — ask what they want to change, then go back to step 1 with the modified request.
 8. If user says "Yes, execute" — call `submit_plan` with the `plan_id`.
-9. Immediately call `wait_for_workflow` with the returned workflow_id (timeout 300000ms / 5 minutes).
+9. Immediately call `wait_for_workflow` with the returned workflow_id.
 10. When `wait_for_workflow` returns:
 
 - If status is "done": call `harness_state` with the workflow_id, check for any reviewer task results. Report success or any review findings to the user.
 - If status is "failed": call `harness_state` with the workflow_id, find the failed task, report what failed and why.
-- If timed_out: tell the user the workflow is still running and they can check back later.
 
 1. Stop. Do not ask follow-up questions about the workflow status.
 

@@ -512,27 +512,24 @@ export default (async (input: PluginInput) => {
 
       wait_for_workflow: tool({
         description:
-          "Poll a workflow internally until terminal state (done/failed) or timeout.",
+          "Poll a workflow internally until terminal state (done/failed).",
         args: {
           workflow_id: tool.schema.string(),
-          timeout_ms: tool.schema.number().optional(),
           interval_ms: tool.schema.number().optional(),
         },
-        async execute({ workflow_id, timeout_ms, interval_ms }) {
-          const timeoutMs = Math.max(1, timeout_ms ?? 60_000);
+        async execute({ workflow_id, interval_ms }) {
           const intervalMs = Math.max(50, interval_ms ?? 1_000);
           const startedAt = Date.now();
 
           let snapshot: unknown = null;
           let status: string | null = null;
 
-          while (Date.now() - startedAt < timeoutMs) {
+          while (true) {
             snapshot = getHarnessWorkflowSnapshot(dag, workflow_id);
             if (snapshot === null) {
               return JSON.stringify({
                 workflow_id,
                 terminal: false,
-                timed_out: false,
                 missing: true,
                 elapsed_ms: Date.now() - startedAt,
               });
@@ -551,15 +548,6 @@ export default (async (input: PluginInput) => {
 
             await sleep(intervalMs);
           }
-
-          return JSON.stringify({
-            workflow_id,
-            terminal: false,
-            timed_out: true,
-            status,
-            elapsed_ms: Date.now() - startedAt,
-            snapshot,
-          });
         },
       }),
 
