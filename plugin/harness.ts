@@ -404,6 +404,10 @@ export default (async (input: PluginInput) => {
    */
   const orphanedErrorEvents = new Map<string, string>();
 
+  // Reviews deferred because the target task was still Running when submit_review was called.
+  // Keyed by target task_id; value is the serialized review JSON string.
+  const pendingReviews = new Map<string, string>();
+
   // ── Tick loop ──────────────────────────────────────────────────────────────
   // Every 500 ms, find unblocked tasks and start them in OpenCode sessions.
   // Tasks belonging to native-dispatch workflows are buffered instead.
@@ -844,7 +848,7 @@ export default (async (input: PluginInput) => {
             id: string;
             session_id: string | null;
           }>;
-          const match = allTasks.find((t) => t.session_id === context.sessionID);
+          const match = allTasks.find((t: any) => t.session_id === context.sessionID);
           const reviewerTaskId = match?.id ?? context.sessionID;
 
           const review = {
@@ -854,7 +858,24 @@ export default (async (input: PluginInput) => {
             findings: findings ?? [],
           };
 
-          return dag.submit_review(task_id, JSON.stringify(review));
+          const reviewJson = JSON.stringify(review);
+
+          try {
+            return dag.submit_review(task_id, reviewJson);
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.includes('is not done') && msg.includes('cannot submit review')) {
+              pendingReviews.set(task_id, reviewJson);
+              return JSON.stringify({
+                task_id,
+                review_status: status,
+                stored: false,
+                deferred: true,
+                reason: 'Target task is still running; review will be applied when it completes.',
+              });
+            }
+            throw err;
+          }
         },
       }),
     },
@@ -865,6 +886,19 @@ export default (async (input: PluginInput) => {
         const result: EventResult = JSON.parse(
           dag.process_event("session.idle", sessionId, JSON.stringify(event.properties)),
         );
+
+        // Apply any deferred reviews now that tasks may have transitioned to Done.
+        if (pendingReviews.size > 0) {
+          for (const [targetTaskId, reviewJson] of pendingReviews) {
+            try {
+              dag.submit_review(targetTaskId, reviewJson);
+              pendingReviews.delete(targetTaskId);
+            } catch {
+              // Target task still not Done (e.g., different task went idle);
+              // leave it in the map for the next idle event.
+            }
+          }
+        }
 
         // Detect no-op result → session not yet registered in the DAG.
         // This happens for native-dispatch tasks whose Task tool finishes before

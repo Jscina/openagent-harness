@@ -1226,6 +1226,44 @@ mod tests {
         assert!(missing.is_null());
     }
 
+    #[test]
+    fn test_submit_review_requires_done_status() {
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([
+            {"agent": "builder", "prompt": "build", "depends_on": []},
+            {"agent": "reviewer", "prompt": "review", "depends_on": [0]},
+        ]);
+
+        let submit_resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        assert!(submit_resp["workflow_id"].is_string());
+
+        let listed_tasks: serde_json::Value = serde_json::from_str(&dag.list_tasks()).unwrap();
+        let listed_tasks = listed_tasks.as_array().unwrap();
+        let builder_task_id = listed_tasks
+            .iter()
+            .find(|task| task["agent"] == "builder")
+            .and_then(|task| task["id"].as_str())
+            .expect("builder task id")
+            .to_string();
+
+        dag.tick();
+        let session_id = "ses_builder";
+        dag.task_started(&builder_task_id, session_id);
+
+        let review_json = r#"{"status": "approved", "reviewer_task_id": "reviewer-1", "summary": "Looks good", "findings": []}"#;
+
+        let err = dag.submit_review(&builder_task_id, review_json).unwrap_err();
+        assert!(err.contains("is not done"), "unexpected: {err}");
+
+        dag.process_event("session.idle", session_id, "{}");
+
+        let ok_resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_review(&builder_task_id, review_json).unwrap())
+                .unwrap();
+        assert_eq!(ok_resp["stored"], true);
+    }
+
     // ─── Fallback model tests ──────────────────────────────────────────────────
 
     #[test]
