@@ -1,7 +1,7 @@
 ---
 model: anthropic/claude-sonnet-4-6
 fallback_models:
-  - ollama/qwen3-coder-builder
+  - ollama/qwen3-coder-builder:latest
 description: External knowledge retrieval. Searches web, fetches library docs, reads GitHub examples. No local file access.
 mode: subagent
 permission:

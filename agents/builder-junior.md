@@ -1,7 +1,7 @@
 ---
 model: anthropic/claude-sonnet-4-6
 fallback_models:
-  - ollama/qwen3-coder-junior
+  - ollama/qwen3-coder-junior:latest
 description: Executes one narrowly scoped coding task. Given an exact spec by builder — which file, what change, what the expected outcome is. Never explores, never plans, never reviews.
 mode: subagent
 permission:

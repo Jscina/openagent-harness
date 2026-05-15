@@ -1,7 +1,7 @@
 ---
 model: anthropic/claude-haiku-4-5
 fallback_models:
-  - ollama/qwen3-coder-builder
+  - ollama/qwen3-coder-builder:latest
 description: Read-only codebase reconnaissance. Maps files, traces call chains, identifies interfaces and patterns. Never modifies anything.
 mode: subagent
 permission:

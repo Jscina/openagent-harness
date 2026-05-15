@@ -1,7 +1,7 @@
 ---
 model: anthropic/claude-sonnet-4-6
 fallback_models:
-  - ollama/qwen3-coder-builder
+  - ollama/qwen3-coder-builder:latest
 description: Receives a raw task, gathers context from explorer and researcher in parallel, then produces a machine-readable DAG of subtasks.
 mode: subagent
 permission:
@@ -82,7 +82,7 @@ Rules:
 
 - Every plan must include at least one `reviewer` task after all `builder` tasks
 - Include `docs-writer` only when user-facing docs or public APIs change
-- Never include `builder-junior`, `consultant`, or `debugger` — builder spawns those internally
+- Never include `builder-junior` or `debugger` — builder spawns those internally
 - The `model` field in each task is optional; omit it to use each agent's configured default
 - Never call workflow submission tools
 - You must call `save_plan` before returning your final JSON object

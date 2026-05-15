@@ -1,64 +1,75 @@
 # openagent-harness
 
-Deterministic agent harness for [OpenCode](https://opencode.ai). The DAG state machine compiles to WebAssembly (WASM) and runs directly inside the OpenCode TypeScript plugin. No separate native binary or HTTP server is required at runtime!
+Deterministic multi-agent harness for [OpenCode](https://opencode.ai), built as a Rust DAG engine compiled to WebAssembly (WASM) and loaded in-process by the OpenCode plugin. No separate runtime service is required.
 
-## How it works
+## Overview
 
-```mermaid
-flowchart TD
-    A[OpenCode process] --> B[loads plugin/harness.ts]
-    B --> C[initSync readFileSync ...wasm]
-    C --> D[DagEngine in-process]
-    B --> E[get_agent_configs]
-    E --> F[install .md files on first boot]
-    B --> G[setInterval 500ms]
-    G --> H[dag.tick]
-    H --> I[ready tasks]
-    I --> J[POST /session create OpenCode session]
-    J --> K["POST /session/{id}/prompt_async"]
-    K --> L[dag.task_started]
-    B --> M[event hook: session.idle / session.error]
-    M --> N[dag.process_event]
-    N --> O[notifications + session to delete]
-    O --> P["DELETE /session/{id}"]
-    O --> Q[POST /tui/show-toast]
-    Q --> R[on workflow completion/failure]
-```
+`openagent-harness` coordinates agent workflows using a dependency-aware DAG engine. The Rust core owns workflow/task state transitions, while the TypeScript plugin handles OpenCode session wiring, async prompt dispatch, and runtime error classification.
 
-1. The `orchestrator` agent receives a user request.
-2. It spawns the `@planner` (for coding tasks).
-3. The planner may ask clarifying questions, then saves the generated plan under `.opencode/plans` and returns a plan object to the orchestrator.
-4. The orchestrator presents the plan to the user and asks for approval via the `question` tool.
-5. If approved, the orchestrator submits the plan via `submit_plan` using the returned `plan_id`, then immediately calls `wait_for_workflow`.
-6. The WASM `DagEngine` creates all tasks atomically in its in-memory DAG.
-7. The 500ms tick loop automatically kicks off pending tasks when their dependencies finish.
-8. The TS plugin listens for `session.idle` and `session.error` events and feeds them to the DAG to advance the workflow state.
-9. When the workflow completes (or fails), `wait_for_workflow` returns and the orchestrator reports results to the user.
+The system is optimized for:
 
-## Quickstart
+- predictable task orchestration
+- explicit dependency handling
+- robust model fallback behavior
+- plugin-local runtime (no external harness daemon)
 
-### Install a tagged release
+## Architecture and runtime behavior
 
-Install a pinned release tag (not `latest`) with the installer script:
+At startup, the plugin:
+
+1. synchronously loads WASM with `initSync(readFileSync(...))`
+2. calls `get_agent_configs()`
+3. auto-installs missing embedded agent markdown files into `~/.config/opencode/agents/`
+4. loads agent fallback config JSON and registers it in the DAG
+
+Core runtime behavior:
+
+- The DAG state is **in-memory only** (restarts clear active workflow/task state).
+- The plugin sends prompts asynchronously to OpenCode ACP via `POST /session/{id}/prompt_async`.
+- Task progression is event-driven from `session.idle` / `session.error` events back into the DAG.
+- Plans are persisted to `.opencode/plans`, while live workflow state stays in memory.
+
+### Orchestrator/planner workflow
+
+For planned coding work, the flow is:
+
+1. `orchestrator` delegates planning to `planner`.
+2. `planner` can ask clarifying questions, then saves a plan artifact under `.opencode/plans`.
+3. `planner` returns a `plan_id` and structured summary.
+4. `orchestrator` asks the user for explicit approval.
+5. On approval, `orchestrator` calls `submit_plan`.
+
+Execution modes:
+
+- **Native dispatch**: the orchestrator/runner uses `harness_dispatch_tasks` to pull ready tasks, executes each as a visible subagent call, then confirms completion with `harness_task_complete`. This is the recommended execution mode for planner-created work.
+- **Non-native dispatch**: the plugin uses its in-plugin 500ms tick loop (`dag.tick()`) to start ready tasks automatically.
+
+## Installation
+
+### Install a release (recommended)
+
+Use the release installer script with a pinned tag:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Jscina/openagent-harness/v0.3.2/install.sh | OPENAGENT_HARNESS_TAG=v0.3.2 bash
 ```
 
-### Building the WASM plugin
+The installer configures OpenCode to use this harness, including:
 
-You need [wasm-pack](https://rustwasm.github.io/wasm-pack/) installed.
+- plugin wiring for `plugin/harness.ts`
+- remote MCP servers for Exa websearch, Context7, and grep.app
+- disabling default OpenCode `build`, `plan`, and `general` agents in favor of harness-managed agents
+
+### Local development setup
+
+Install wasm-pack, rebuild WASM artifacts, and point OpenCode at the local plugin path:
 
 ```sh
 cargo install wasm-pack
 make wasm
 ```
 
-This compiles the Rust DAG to `plugin/wasm/` and generates the JS/TS glue.
-
-### Using the plugin
-
-Add the plugin to your `opencode.json`:
+`opencode.json` example:
 
 ```json
 {
@@ -66,101 +77,87 @@ Add the plugin to your `opencode.json`:
 }
 ```
 
-The very first time the plugin loads, it automatically calls the WASM library to write 11 embedded agent `.md` files to `~/.config/opencode/agents/`.
+### Optional native agent install commands
 
-## Install subcommand (Optional)
-
-If you don't want to use the WASM auto-installer, you can build and use the native CLI to install the agent configs:
+If you want to install or refresh embedded agent markdown files manually (instead of relying on first-boot auto-install):
 
 ```sh
-cargo run -- install           # skip agents that already exist
-cargo run -- install --force   # overwrite existing agents
+cargo run -- install
+cargo run -- install --force
+openagent-harness install
 ```
 
-## Agent team
+## Agent system
 
-### Primary agents
+The checked-in agent markdown files define model defaults in frontmatter:
 
-| Agent          | Model                         | Role                                                                                                                                                                                                                                                                                                                                                                                 |
-| -------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `orchestrator` | `anthropic/claude-sonnet-4-6` | Human-facing entry point. Classifies requests, drives the planner pipeline for complex tasks, presents plans for user approval, waits for workflow completion, and reports results.                                                                                                                                                                                                  |
-| `builder`      | `openai/gpt-5.4`              | Senior engineer. Owns execution quality for a subtask end-to-end. Spawns `@explorer`, `@researcher`, and `@vision` in parallel to gather context. Breaks the subtask into atomic units. Spawns `@builder-junior` workers in parallel for each unit. Reviews their output, escalates to `@consultant` for design decisions and `@debugger` for failures. Delivers a completed result. |
+| Agent | Model |
+| --- | --- |
+| `orchestrator` | `anthropic/claude-sonnet-4-6` |
+| `planner` | `anthropic/claude-sonnet-4-6` |
+| `explorer` | `anthropic/claude-haiku-4-5` |
+| `researcher` | `anthropic/claude-sonnet-4-6` |
+| `vision` | `ollama/qwen2.5-vl-vision:latest` |
+| `builder` | `anthropic/claude-sonnet-4-6` |
+| `builder-junior` | `anthropic/claude-sonnet-4-6` |
+| `reviewer` | `anthropic/claude-sonnet-4-6` |
+| `debugger` | `anthropic/claude-sonnet-4-6` |
+| `docs-writer` | `anthropic/claude-haiku-4-5` |
 
-### Subagents
+The typical delivery flow is: `orchestrator` → `planner` → implementation agents such as `builder`, `reviewer`, and `docs-writer`, with `explorer`, `researcher`, `vision`, `builder-junior`, and `debugger` used as specialized subagents.
 
-| Agent            | Model                         | Role                                                                                                                                                                                                                                                |
-| ---------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `planner`        | `openai/gpt-5.4`              | Planning subagent spawned by `@orchestrator`. Gathers context from `@explorer` and `@researcher`, asks clarifying questions when needed, saves a generated plan under `.opencode/plans`, and returns a structured plan summary object for approval. |
-| `explorer`       | `openai/gpt-5.3-codex`        | Read-only codebase reconnaissance. Maps files, traces call chains, identifies interfaces and patterns. Never modifies anything.                                                                                                                     |
-| `researcher`     | `anthropic/claude-sonnet-4-6` | External knowledge retrieval. Searches web, fetches library docs, reads GitHub examples. No local file access.                                                                                                                                      |
-| `vision`         | `anthropic/claude-sonnet-4-6` | Analyzes visual assets — screenshots, wireframes, UI mockups, PDFs — and returns a structured description. Never writes code.                                                                                                                       |
-| `builder-junior` | `openai/gpt-5.3-codex`        | Executes one narrowly scoped coding task given an exact spec by builder. Executes the spec exactly, does not explore or plan. Reports every file modified and expected outcome.                                                                     |
-| `consultant`     | `anthropic/claude-sonnet-4-6` | Architecture advisor. Consulted by builder mid-task for design decisions with real tradeoffs. Returns a structured recommendation with rationale, tradeoffs, and risks. Read-only.                                                                  |
-| `reviewer`       | `anthropic/claude-sonnet-4-6` | Quality gate. Reviews planner output before execution and builder output after. Returns approved or a list of blocking issues. Read-only.                                                                                                           |
-| `debugger`       | `anthropic/claude-sonnet-4-6` | Failure investigation specialist. Diagnoses test failures and runtime errors. Returns root cause and a fix approach. Never makes code changes.                                                                                                      |
-| `docs-writer`    | `openai/gpt-5.4`              | Documentation only. Writes READMEs, inline doc comments, API docs, and changelogs based on builder's completed diff. Never touches code files.                                                                                                      |
+## Fallback behavior
 
-## Fallback model chains
+Fallbacks are configured per agent via frontmatter `fallback_models`, with optional task-level overrides.
 
-Each agent can declare an ordered list of fallback models in its `.md` frontmatter. When a task fails with a transient provider error (429, 5xx, timeout, etc.) the harness automatically re-queues it with the next model in the chain rather than immediately failing the workflow.
+### Sources and precedence
 
-### Why fallbacks exist
+When selecting model fallback chains, precedence is:
 
-Provider outages and rate limits are common at inference scale. Without fallbacks a single rate-limit on one provider fails the entire workflow. With a chain, the harness silently retries on the next provider and the workflow completes with no user intervention needed.
+1. task-level `fallback_models` passed with the task payload
+2. agent frontmatter `fallback_models` loaded at startup
+3. no fallback chain (task uses only its resolved primary model)
 
-### Configuring fallbacks in agent frontmatter
+### How fallback decisions are made
 
-Add a `fallback_models` list beneath the `model` field in any agent `.md` file:
+- `classifyError` in `plugin/harness.ts` labels errors as retryable vs terminal.
+- For retryable errors and remaining models, the plugin calls WASM `try_fallback()`.
+- `try_fallback()` atomically advances to the next model and resets task state to `Pending` for re-queue.
+- Terminal errors, or exhausted fallback chains, mark the task as failed.
 
-```yaml
----
-model: anthropic/claude-sonnet-4-6
-fallback_models:
-  - openai/gpt-5.4
-  - ollama/qwen3.5:9b
----
-```
+### Visibility in workflow snapshots
 
-Model strings follow the same `provider/model` syntax as the `model` field. These fallbacks are loaded at startup and applied to every task that runs under this agent.
+Workflow snapshots expose:
 
-### Resolution priority
+- `fallback_models` for each task
+- `model_attempt` (0 = primary, 1 = first fallback, etc.)
 
-When a task is dispatched, its model is chosen in this order:
+This makes active model selection and fallback history observable during execution.
 
-1. **Task-level `fallback_models`** — an explicit list in the `submit_workflow` JSON payload overrides everything.
-2. **Agent's frontmatter `fallback_models`** — loaded from the `.md` file at startup via `set_agent_fallbacks()`.
-3. **Global `DEFAULT_MODEL`** — `anthropic/claude-sonnet-4-6`, used when no model is specified at all.
+## Environment
 
-### Error classification and fallback triggers
-
-Error classification runs in the TypeScript plugin (`classifyError` in `plugin/harness.ts`). Errors are classified as either **retryable** or **terminal**:
-
-- **Retryable** — HTTP 429, 5xx, `rate limit`, `overloaded`, `timeout`, `service unavailable`, connection errors. A retryable error with remaining fallbacks triggers `try_fallback()` and re-queues the task.
-- **Terminal** — auth failures, content policy violations, invalid requests, model-not-found. These fail the task immediately regardless of remaining fallbacks.
-
-A task is only marked `Failed` after all models in its chain are exhausted or a terminal error is received.
-
-### Observing fallback activity
-
-The plugin logs every fallback transition with the `[harness-plugin]` prefix:
-
-```
-[harness-plugin] error classified as retryable: rate limit hit (429)
-[harness-plugin] task <id> falling back to openai/gpt-5.4 (attempt 1)
-```
-
-Workflow snapshots (via the `harness_state` tool) include `model_attempt` and `fallback_models` on each task, showing exactly which model in the chain is currently active.
-
-## Environment variables
-
-| Variable                   | Default | Description                          |
-| -------------------------- | ------- | ------------------------------------ |
-| `OPENCODE_SERVER_PASSWORD` | —       | Basic auth password for OpenCode ACP |
+| Variable | Description |
+| --- | --- |
+| `OPENCODE_SERVER_PASSWORD` | Basic auth password for the OpenCode ACP server. |
 
 ## Development
 
+Common commands:
+
 ```sh
-make wasm        # rebuild the WASM plugin module
-cargo test       # 24 tests, no live services needed
-cargo clippy
+make wasm
+cargo test
+cargo fmt && cargo clippy
+cargo run -- install
+cargo run -- install --force
 ```
+
+## Repository layout
+
+- `src/lib.rs` — WASM exports, engine wrapper, and embedded agent config access
+- `src/dag.rs` — DAG engine state machine and task/workflow transition logic
+- `src/agents.rs` — agent frontmatter parsing (`model`, `fallback_models`)
+- `src/install.rs` — installer for embedded agent markdown files
+- `src/main.rs` — CLI entrypoint (`openagent-harness install`)
+- `plugin/harness.ts` — plugin runtime loop, ACP integration, and error classification
+- `plugin/wasm/` — generated WASM artifacts committed to the repo
