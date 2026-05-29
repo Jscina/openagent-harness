@@ -770,12 +770,18 @@ export default (async (input: PluginInput) => {
           } else {
             // Failed path: use buffered error message or the caller-supplied error.
             const errMsg =
-              error ??
-              orphanedErrorEvents.get(session_id) ??
+              orphanedErrorEvents.get(session_id) ?? // real provider error from session.error event
+              error ??                                 // orchestrator-supplied fallback
               "native task reported failure";
+            const errSource = orphanedErrorEvents.has(session_id)
+              ? 'session.error'
+              : error !== undefined
+              ? 'caller'
+              : 'default';
             orphanedErrorEvents.delete(session_id);
-
+            console.log(`[harness] task_complete failed: task_id=${task_id} session_id=${session_id} source=${errSource} errMsg=${errMsg}`);
             const classification = classifyError(errMsg);
+            console.log(`[harness] task_complete classification=${classification} hasMoreFallbacks will be evaluated next`);
             const taskJson = JSON.parse(dag.get_task(task_id)) as {
               fallback_models?: string[];
               model_attempt?: number;
@@ -797,6 +803,10 @@ export default (async (input: PluginInput) => {
                   `Task ${task_id} → ${fallbackResult.new_model} (attempt ${fallbackResult.attempt})`,
                   "warning",
                 );
+                // NOTE: For native-dispatch tasks, task.model is updated in the DAG to fallbackResult.new_model,
+                // but the Task tool interface does not support a model override parameter. The subagent will
+                // be re-spawned by the orchestrator using its frontmatter model, not the DAG fallback model.
+                // This is a known limitation of the native dispatch + Task tool integration.
                 await deleteSession(client, session_id);
                 return JSON.stringify({ registered: true, task_id, session_id, status: "retrying", new_model: fallbackResult.new_model });
               } catch {
