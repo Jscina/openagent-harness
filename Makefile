@@ -30,6 +30,9 @@ build:
 test:
 	cargo test
 
+test-ts:
+	npm --prefix plugin test
+
 # ── Install agent configs ─────────────────────────────────────────────────────
 
 install:

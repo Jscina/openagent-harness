@@ -45,6 +45,18 @@ import {
   initSync,
 } from "./wasm/openagent_harness.js";
 
+import type { PlanArtifact, EventResult } from "./types.js";
+import { classifyError } from "./errors.js";
+import { savePlanArtifact, loadPlanArtifact } from "./plans.js";
+import { createSession, sendMessage, deleteSession, showToast } from "./client.js";
+import {
+  listHarnessWorkflows,
+  getHarnessWorkflowSnapshot,
+  extractWorkflowStatus,
+  sleep,
+  handleEventResult,
+} from "./dag.js";
+
 // ─── WASM initialisation ──────────────────────────────────────────────────────
 
 const __dir = dirname(fileURLToPath(import.meta.url));
@@ -90,251 +102,6 @@ function installAgentsIfNeeded(): number {
   }
 }
 
-// ─── Plan artifact persistence ────────────────────────────────────────────────
-
-interface WorkflowTaskInput {
-  agent: string;
-  prompt: string;
-  depends_on: number[];
-  model?: string;
-}
-
-interface PlanArtifact {
-  id: string;
-  created_at: string;
-  summary: string[];
-  recommendations?: string[];
-  tasks: WorkflowTaskInput[];
-}
-
-function plansDirectory(): string {
-  const dir = join(process.cwd(), ".opencode", "plans");
-  mkdirSync(dir, { recursive: true });
-  return dir;
-}
-
-function planArtifactPath(planId: string): string {
-  return join(plansDirectory(), `${planId}.json`);
-}
-
-function savePlanArtifact(artifact: PlanArtifact): string {
-  const path = planArtifactPath(artifact.id);
-  writeFileSync(path, JSON.stringify(artifact, null, 2), "utf8");
-  return path;
-}
-
-function loadPlanArtifact(planId: string): PlanArtifact {
-  const path = planArtifactPath(planId);
-  if (!existsSync(path)) {
-    throw new Error(`plan artifact not found: ${planId}`);
-  }
-  const raw = readFileSync(path, "utf8");
-  const parsed = JSON.parse(raw) as PlanArtifact;
-  if (!parsed || !Array.isArray(parsed.tasks)) {
-    throw new Error(`invalid plan artifact: ${planId}`);
-  }
-  return parsed;
-}
-
-// ─── OpenCode ACP helpers ─────────────────────────────────────────────────────
-
-/**
- * Parse "provider/model" → `{ providerID, modelID }` for prompt_async.
- * No slash → defaults to `anthropic`.  Empty string → no model sent.
- */
-function parseModel(
-  model: string,
-): { providerID: string; modelID: string } | undefined {
-  if (!model) return undefined;
-  const slash = model.indexOf("/");
-  return slash >= 0
-    ? { providerID: model.slice(0, slash), modelID: model.slice(slash + 1) }
-    : { providerID: "anthropic", modelID: model };
-}
-
-async function createSession(
-  client: PluginInput["client"],
-  parentSessionId?: string | null,
-  title?: string | null,
-  agent?: string | null,
-): Promise<string> {
-  const result = await client.session.create({
-    body: {
-      ...(parentSessionId && { parentID: parentSessionId }),
-      ...(title && { title }),
-      ...(agent && { agent }),
-    },
-  });
-  if (!result.data) throw new Error("createSession failed: no data returned");
-  return result.data.id;
-}
-
-async function sendMessage(
-  client: PluginInput["client"],
-  sessionId: string,
-  prompt: string,
-  model: string,
-  agent?: string | null,
-): Promise<void> {
-  const modelSpec = parseModel(model);
-  await client.session.promptAsync({
-    path: { id: sessionId },
-    body: {
-      parts: [{ type: "text", text: prompt }],
-      ...(modelSpec && { model: modelSpec }),
-      ...(agent && { agent }),
-    },
-  });
-}
-
-async function deleteSession(
-  client: PluginInput["client"],
-  sessionId: string,
-): Promise<void> {
-  await client.session.delete({ path: { id: sessionId } }).catch((e: unknown) => {
-    console.error("[harness-plugin] deleteSession failed:", e);
-  });
-}
-
-/**
- * Post a toast notification to the OpenCode TUI via the SDK client.
- * Non-fatal: errors are logged as warnings and silently dropped.
- */
-async function showToast(
-  client: PluginInput["client"],
-  title: string,
-  message: string,
-  variant: "info" | "success" | "warning" | "error",
-  duration?: number,
-): Promise<void> {
-  try {
-    await client.tui.showToast({
-      body: { title, message, variant, duration: duration ?? 8000 },
-    });
-  } catch (e) {
-    console.warn("[harness-plugin] showToast failed:", (e as Error)?.message ?? e);
-  }
-}
-
-// ─── Notification handling ────────────────────────────────────────────────────
-
-interface ToastNotification {
-  type: "toast";
-  title: string;
-  message: string;
-  variant: string;
-  duration?: number;
-}
-type Notification = ToastNotification;
-
-interface SessionReuse {
-  session_id: string;
-  next_task_id: string;
-}
-
-interface EventResult {
-  notifications: Notification[];
-  delete_session: string | null;
-  fallback_hint?: {
-    task_id: string;
-    error_message: string;
-    has_fallbacks: boolean;
-  };
-  reuse_session?: SessionReuse;
-}
-
-function parseJson(raw: string): unknown {
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return raw;
-  }
-}
-
-function listHarnessWorkflows(dag: DagEngine): unknown {
-  return parseJson(dag.list_workflow_summaries());
-}
-
-function getHarnessWorkflowSnapshot(dag: DagEngine, workflowId: string): unknown {
-  return parseJson(dag.get_workflow_snapshot(workflowId));
-}
-
-function extractWorkflowStatus(snapshot: unknown): string | null {
-  if (!snapshot || typeof snapshot !== "object") return null;
-  const obj = snapshot as {
-    status?: unknown;
-    state?: unknown;
-    workflow?: { status?: unknown; state?: unknown };
-  };
-
-  const status =
-    obj.status ?? obj.state ?? obj.workflow?.status ?? obj.workflow?.state;
-  if (typeof status === "string") {
-    return status.toLowerCase();
-  }
-  if (status && typeof status === "object") {
-    const tagged = status as { type?: unknown };
-    return typeof tagged.type === "string" ? tagged.type.toLowerCase() : null;
-  }
-  return null;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function handleEventResult(
-  result: EventResult,
-  client: PluginInput["client"],
-  dag: DagEngine,
-): Promise<void> {
-  for (const n of result.notifications) {
-    if (n.type === "toast") {
-      await showToast(client, n.title, n.message, n.variant as "info" | "success" | "warning" | "error", n.duration);
-    }
-  }
-  if (result.reuse_session) {
-    // Pre-assign the session to the next task so the tick loop skips createSession.
-    // task_started also updates session_to_task in the WASM engine.
-    dag.task_started(result.reuse_session.next_task_id, result.reuse_session.session_id);
-  } else if (result.delete_session) {
-    await deleteSession(client, result.delete_session);
-  }
-}
-
-// ─── Error classification ─────────────────────────────────────────────────────
-
-/**
- * Classify an error message as retryable (provider-side transient failure) or
- * terminal (auth, content policy, invalid request, model not found, etc.).
- */
-function classifyError(errorMsg: string): 'retryable' | 'terminal' {
-  const lower = errorMsg.toLowerCase();
-  const retryablePatterns = [
-    '429', '500', '502', '503', '504',
-    'rate limit', 'rate_limit',
-    'overloaded',
-    'server_error',
-    'timeout', 'timed out',
-    'temporarily unavailable',
-    'capacity',
-    'too many requests',
-    'service unavailable',
-    'internal server error',
-    'bad gateway',
-    'gateway timeout',
-    'econnrefused',
-    'econnreset',
-    'etimedout',
-    'fetch failed',
-  ];
-
-  const classification = retryablePatterns.some((pattern) => lower.includes(pattern))
-    ? 'retryable'
-    : 'terminal';
-
-  return classification;
-}
 
 // ─── Plugin ───────────────────────────────────────────────────────────────────
 
@@ -930,7 +697,7 @@ export default (async (input: PluginInput) => {
         const sessionId: string = event.properties.sessionID ?? '';
         if (!sessionId) return;
 
-        const result: EventResult & { fallback_hint?: { task_id: string; error_message: string; has_fallbacks: boolean } } = JSON.parse(
+        const result: EventResult = JSON.parse(
           dag.process_event('session.error', sessionId, JSON.stringify(event.properties)),
         );
 
