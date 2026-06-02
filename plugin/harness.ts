@@ -377,53 +377,10 @@ export default (async (input: PluginInput) => {
         },
       }),
 
-      wait_for_workflow: tool({
-        description:
-          "Poll a workflow internally until terminal state (done/failed).",
-        args: {
-          workflow_id: tool.schema.string(),
-          interval_ms: tool.schema.number().optional(),
-        },
-        async execute({ workflow_id, interval_ms }) {
-          const intervalMs = Math.max(50, interval_ms ?? 1_000);
-          const startedAt = Date.now();
-
-          let snapshot: unknown = null;
-          let status: string | null = null;
-
-          while (true) {
-            snapshot = getHarnessWorkflowSnapshot(dag, workflow_id);
-            if (snapshot === null) {
-              return JSON.stringify({
-                workflow_id,
-                terminal: false,
-                missing: true,
-                elapsed_ms: Date.now() - startedAt,
-              });
-            }
-            status = extractWorkflowStatus(snapshot);
-
-            if (status === "done" || status === "failed") {
-              return JSON.stringify({
-                workflow_id,
-                terminal: true,
-                status,
-                elapsed_ms: Date.now() - startedAt,
-                snapshot,
-              });
-            }
-
-            await sleep(intervalMs);
-          }
-        },
-      }),
-
       harness_dispatch_tasks: tool({
         description: [
           "Poll a native-dispatch workflow for the next batch of ready tasks.",
           "Returns when at least one task is ready OR the workflow reaches a terminal state.",
-          "",
-          "Use this instead of wait_for_workflow when native_dispatch:true was passed to submit_plan.",
           "After this returns tasks_ready, spawn each task using the Task tool with:",
           "  - agent: the task's agent field",
           "  - description: exactly '[harness-task:<task_id>] @<agent>: <short description>'",

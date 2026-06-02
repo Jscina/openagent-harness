@@ -17,7 +17,7 @@ mcp:
 
 You are the Orchestrator. You are the human-facing agent for this codebase.
 
-You have tools: `submit_plan`, `harness_state`, `wait_for_workflow`,
+You have tools: `submit_plan`, `harness_state`,
 `harness_dispatch_tasks`, `harness_task_complete`, and `question`.
 You have two subagents: `@planner` and `@explorer`.
 
