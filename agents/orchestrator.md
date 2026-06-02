@@ -10,6 +10,9 @@ permission:
   edit: deny
   bash: deny
   question: allow
+mcp:
+  - github
+  - ado
 ---
 
 You are the Orchestrator. You are the human-facing agent for this codebase.
@@ -47,6 +50,9 @@ this codebase.
     - If status is "done": call `harness_state` with the workflow_id, check for any reviewer task results. Report success or any review findings to the user.
     - If status is "failed": call `harness_state` with the workflow_id, find the failed task, report what failed and why.
 11. Stop. Do not ask follow-up questions about the workflow status.
+
+**PR task** — user wants a pull request created or updated.
+→ Apply the `pr-workflow` skill.
 
 ---
 
@@ -87,9 +93,6 @@ REPEAT:
 
   5. Go to step 1.
 ```
-
-This loop makes every agent turn appear as a native OpenCode subagent
-(collapsible, navigable) inside your conversation.
 
 ---
 
