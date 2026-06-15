@@ -5,14 +5,18 @@
 //! ```text
 //! src/lib.rs        — Entry point, re-exports modules, declares WASM bindings
 //! src/agents.rs     — Embedded AGENTS constant and configs
+//! src/skills.rs     — Embedded SKILLS constant and install helper
 //! src/types.rs      — Task, Node, Workflow, Status enums, and request/response structs
 //! src/dag.rs        — core DagEngine (pure Rust, always compiled)
-//! src/install.rs    — native-only: write agent files to disk
+//! src/install.rs    — native-only: write agent and skill files to disk
 //! src/main.rs       — native-only: install subcommand CLI
 //! ```
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod install;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod skills;
 
 pub mod agents;
 pub mod dag;

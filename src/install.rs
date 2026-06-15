@@ -4,6 +4,11 @@ fn agents_install_dir_from_home(home_dir: &std::path::Path) -> std::path::PathBu
     home_dir.join(".config").join("opencode").join("agents")
 }
 
+#[cfg(test)]
+fn skills_install_dir_from_home(home_dir: &std::path::Path) -> std::path::PathBuf {
+    home_dir.join(".config").join("opencode").join("skills")
+}
+
 /// Write all embedded agent configs to `~/.config/opencode/agents/`.
 pub fn run(force: bool) -> Result<()> {
     let home_dir =
@@ -40,12 +45,16 @@ pub fn run(force: bool) -> Result<()> {
         );
     }
 
+    // Install skills.
+    crate::skills::install(force)?;
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::agents_install_dir_from_home;
+    use super::skills_install_dir_from_home;
     use std::path::Path;
 
     #[test]
@@ -54,5 +63,12 @@ mod tests {
         let path = agents_install_dir_from_home(home);
 
         assert_eq!(path, home.join(".config").join("opencode").join("agents"));
+    }
+
+    #[test]
+    fn computes_skills_path_from_home_directory() {
+        let home = Path::new("/tmp/test-home");
+        let path = skills_install_dir_from_home(home);
+        assert_eq!(path, home.join(".config").join("opencode").join("skills"));
     }
 }
