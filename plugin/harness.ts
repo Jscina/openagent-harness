@@ -45,9 +45,9 @@ import {
   initSync,
 } from "./wasm/openagent_harness.js";
 
-import type { PlanArtifact, EventResult } from "./types.js";
+import type { EventResult } from "./types.js";
 import { classifyError } from "./errors.js";
-import { savePlanArtifact, loadPlanArtifact } from "./plans.js";
+import { createPlanArtifact, savePlanArtifact, loadPlanArtifact } from "./plans.js";
 import { createSession, sendMessage, deleteSession, showToast } from "./client.js";
 import {
   listHarnessWorkflows,
@@ -300,6 +300,7 @@ export default (async (input: PluginInput) => {
         description:
           "Planner-only: persist a plan artifact under .opencode/plans and return its reference metadata.",
         args: {
+          plan_id: tool.schema.string().optional(),
           tasks: tool.schema.array(
             tool.schema.object({
               agent: tool.schema.string(),
@@ -311,23 +312,17 @@ export default (async (input: PluginInput) => {
           summary: tool.schema.array(tool.schema.string()),
           recommendations: tool.schema.array(tool.schema.string()).optional(),
         },
-        async execute({ tasks, summary, recommendations }, context) {
+        async execute({ plan_id, tasks, summary, recommendations }, context) {
           if (context.agent !== "planner") {
             throw new Error("save_plan can only be executed by the planner agent");
           }
 
-          const planId =
-            typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-              ? crypto.randomUUID()
-              : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-
-          const artifact: PlanArtifact = {
-            id: planId,
-            created_at: new Date().toISOString(),
+          const artifact = createPlanArtifact({
+            plan_id,
+            tasks,
             summary,
             recommendations,
-            tasks,
-          };
+          });
 
           const path = savePlanArtifact(artifact);
           return JSON.stringify({

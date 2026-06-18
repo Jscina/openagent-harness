@@ -1,7 +1,7 @@
 ---
-model: anthropic/claude-haiku-4-5
+model: google/gemini-2.5-flash
 fallback_models:
-  - google/gemini-2.5-flash
+  - anthropic/claude-haiku-4-5
   - ollama/qwen3-docs:latest
 description: Documentation only. Writes READMEs, inline doc comments, API docs, and changelogs based on builder's completed diff. Never touches code files.
 mode: subagent

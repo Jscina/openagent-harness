@@ -61,6 +61,41 @@ Call `save_plan` with:
 - `summary`: ordered summary to return
 - `recommendations`: optional notes
 
+Example:
+
+```json
+{
+  "tasks": [
+    {
+      "agent": "explorer",
+      "prompt": "...",
+      "depends_on": []
+    }
+  ],
+  "summary": ["1. ..."],
+  "recommendations": ["..."]
+}
+```
+
+**Editing an existing plan:** If the user asks you to modify or edit a plan they already have (identified by a `plan_id`), include `"plan_id": "<existing_plan_id>"` in the JSON you pass to `save_plan`. This will overwrite the existing plan file at `.opencode/plans/{plan_id}.json` in-place rather than creating a new plan with a fresh UUID. Only include `plan_id` when explicitly editing — omit it for new plans.
+
+When editing an existing plan:
+
+```json
+{
+  "plan_id": "existing-plan-uuid-here",
+  "tasks": [
+    {
+      "agent": "explorer",
+      "prompt": "...",
+      "depends_on": []
+    }
+  ],
+  "summary": ["1. ..."],
+  "recommendations": ["..."]
+}
+```
+
 Return one JSON object, nothing else:
 
 ```json

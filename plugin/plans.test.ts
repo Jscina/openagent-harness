@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
-import { savePlanArtifact, loadPlanArtifact } from './plans.js';
+import { createPlanArtifact, savePlanArtifact, loadPlanArtifact } from './plans.js';
 import type { PlanArtifact } from './types.js';
 
 // Each test gets its own temp directory; process.cwd() is redirected there.
@@ -40,6 +40,77 @@ describe('savePlanArtifact', () => {
     const loaded = loadPlanArtifact('plan-abc');
     expect(loaded).toEqual(minimal);
   });
+
+  it('strips transient plan_id fields before persisting', () => {
+    savePlanArtifact({
+      ...minimal,
+      id: 'plan-strip',
+      plan_id: 'transient-edit-id',
+    } as PlanArtifact & { plan_id: string });
+
+    const raw = readFileSync(join(tmpDir, '.opencode', 'plans', 'plan-strip.json'), 'utf8');
+    expect(raw).not.toContain('"plan_id"');
+    expect(loadPlanArtifact('plan-strip')).toEqual({
+      ...minimal,
+      id: 'plan-strip',
+    });
+  });
+
+  it('rejects invalid plan IDs on save', () => {
+    expect(() => savePlanArtifact({ ...minimal, id: '../escape' })).toThrow(
+      'invalid plan artifact id: ../escape (must not contain "/", "\\" or "..")',
+    );
+  });
+});
+
+describe('createPlanArtifact', () => {
+  it('preserves created_at and overwrites in place when editing an existing plan', () => {
+    savePlanArtifact(minimal);
+
+    const edited = createPlanArtifact({
+      plan_id: 'plan-abc',
+      summary: ['Updated summary'],
+      recommendations: ['Keep editing'],
+      tasks: [{ agent: 'builder', prompt: 'Edited build', depends_on: [] }],
+    });
+    const path = savePlanArtifact(edited);
+    const files = readdirSync(join(tmpDir, '.opencode', 'plans'));
+
+    expect(edited.id).toBe('plan-abc');
+    expect(path).toMatch(/plan-abc\.json$/);
+    expect(files).toEqual(['plan-abc.json']);
+    expect(loadPlanArtifact('plan-abc')).toEqual({
+      id: 'plan-abc',
+      created_at: minimal.created_at,
+      summary: ['Updated summary'],
+      recommendations: ['Keep editing'],
+      tasks: [{ agent: 'builder', prompt: 'Edited build', depends_on: [] }],
+    });
+  });
+
+  it('uses the provided ID and a fresh timestamp when creating a missing plan', () => {
+    const before = Date.now();
+    const created = createPlanArtifact({
+      plan_id: 'new-plan',
+      summary: ['Created'],
+      tasks: [{ agent: 'planner', prompt: 'Create', depends_on: [] }],
+    });
+    const after = Date.now();
+
+    expect(created.id).toBe('new-plan');
+    expect(new Date(created.created_at).getTime()).toBeGreaterThanOrEqual(before);
+    expect(new Date(created.created_at).getTime()).toBeLessThanOrEqual(after);
+  });
+
+  it('rejects invalid plan IDs before any load or save path is used', () => {
+    expect(() =>
+      createPlanArtifact({
+        plan_id: '..\\escape',
+        summary: ['Bad'],
+        tasks: [{ agent: 'planner', prompt: 'Nope', depends_on: [] }],
+      }),
+    ).toThrow('invalid plan artifact id: ..\\escape (must not contain "/", "\\" or "..")');
+  });
 });
 
 describe('loadPlanArtifact', () => {
@@ -56,6 +127,12 @@ describe('loadPlanArtifact', () => {
 
   it('throws with a clear message when the plan does not exist', () => {
     expect(() => loadPlanArtifact('nonexistent-id')).toThrow('plan artifact not found: nonexistent-id');
+  });
+
+  it('rejects invalid plan IDs on load', () => {
+    expect(() => loadPlanArtifact('../escape')).toThrow(
+      'invalid plan artifact id: ../escape (must not contain "/", "\\" or "..")',
+    );
   });
 
   it('throws when the file contains invalid JSON', () => {

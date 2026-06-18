@@ -7,6 +7,13 @@ export interface WorkflowTaskInput {
   model?: string;
 }
 
+export interface PlanSaveInput {
+  plan_id?: string;
+  summary: string[];
+  recommendations?: string[];
+  tasks: WorkflowTaskInput[];
+}
+
 export interface PlanArtifact {
   id: string;
   created_at: string;
