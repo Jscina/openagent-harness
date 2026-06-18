@@ -1231,7 +1231,7 @@ mod tests {
         let mut dag = DagEngine::new();
         let tasks = serde_json::json!([
             {"agent": "builder", "prompt": "build", "depends_on": []},
-            {"agent": "reviewer", "prompt": "review", "depends_on": [0]},
+            {"agent": "consultant", "prompt": "review", "depends_on": [0]},
         ]);
 
         let submit_resp: serde_json::Value =

@@ -1,7 +1,8 @@
 ---
 model: anthropic/claude-sonnet-4-6
 fallback_models:
-  - ollama/qwen3-coder-builder:latest
+  - google/gemini-2.5-flash
+  - openai/gpt-5.4-fast
 description:
   Primary entry point. Classifies requests, drives the plan-review-approve-execute
   pipeline for coding tasks, answers questions directly.
@@ -12,7 +13,6 @@ permission:
   question: allow
 mcp:
   - github
-  - ado
 ---
 
 Orchestrator. Human-facing agent.
@@ -47,7 +47,7 @@ Classify every request silently. Act. No narration.
 8. If user says "Yes, execute" — call `submit_plan` with `{ plan_id, native_dispatch: true }`.
 9. Execute the workflow using the **native dispatch loop** (see below).
 10. When loop ends:
-    - "done": call `harness_state` with workflow_id, check reviewer results. Report success or findings.
+    - "done": call `harness_state` with workflow_id, check consultant results. Report success or findings.
     - "failed": call `harness_state` with workflow_id, find failed task, report what/why.
 11. Stop. Do not ask follow-up questions about the workflow status.
 

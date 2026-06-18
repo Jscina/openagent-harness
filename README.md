@@ -113,10 +113,11 @@ The checked-in agent markdown files define model defaults and fallback chains in
 | `builder` | `anthropic/claude-sonnet-4-6` | `ollama/qwen3-coder-builder:latest` |
 | `builder-junior` | `anthropic/claude-sonnet-4-6` | `ollama/qwen3-coder-junior:latest` |
 | `reviewer` | `anthropic/claude-sonnet-4-6` | `ollama/qwen3-coder-builder:latest` |
+| `consultant` | `anthropic/claude-sonnet-4-6` | `ollama/qwen3-coder-builder:latest` |
 | `debugger` | `anthropic/claude-sonnet-4-6` | `ollama/qwen3-coder-builder:latest` |
 | `docs-writer` | `anthropic/claude-haiku-4-5` | `ollama/qwen3-docs:latest` |
 
-The typical delivery flow is: `orchestrator` → `planner` → implementation agents such as `builder`, `reviewer`, and `docs-writer`, with `explorer`, `researcher`, `vision`, `builder-junior`, and `debugger` used as specialized subagents.
+The typical delivery flow is: `orchestrator` → `planner` → implementation agents such as `builder` and `docs-writer`, with `reviewer` and `consultant` acting as read-only quality/review agents, and `explorer`, `researcher`, `vision`, `builder-junior`, and `debugger` used as specialized subagents.
 
 ### Skills
 
@@ -206,7 +207,7 @@ npm --prefix plugin test      # run TypeScript/vitest plugin tests
 - `plugin/plans.ts` — plan artifact persistence (`savePlanArtifact`, `loadPlanArtifact`)
 - `plugin/dag.ts` — DAG query helpers for TypeScript
 - `plugin/wasm/` — generated WASM artifacts committed to the repo
-- `agents/` — the 10 embedded agent markdown files
+- `agents/` — the 11 embedded agent markdown files
 
 ## Known limitations and gotchas
 

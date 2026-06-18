@@ -1,6 +1,7 @@
 ---
-model: anthropic/claude-sonnet-4-6
+model: openai/gpt-5.4-mini
 fallback_models:
+  - google/gemini-2.5-flash
   - ollama/qwen3-coder-builder:latest
 description: External knowledge retrieval. Searches web, fetches library docs, reads GitHub examples. No local file access.
 mode: subagent

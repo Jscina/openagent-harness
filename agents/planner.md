@@ -1,7 +1,8 @@
 ---
-model: anthropic/claude-sonnet-4-6
+model: google/gemini-3.1-pro-preview
 fallback_models:
-  - ollama/qwen3-coder-builder:latest
+  - openai/gpt-5.4
+  - anthropic/claude-sonnet-4-6
 description: Receives a raw task, gathers context from explorer and researcher in parallel, then produces a machine-readable DAG of subtasks.
 mode: subagent
 permission:
@@ -50,7 +51,7 @@ Build tasks JSON array. Orchestrator presents plan to user for approval — make
 
 Task fields:
 
-- `agent`: one of `explorer`, `researcher`, `vision`, `builder`, `reviewer`, `docs-writer`
+- `agent`: one of `explorer`, `researcher`, `vision`, `builder`, `consultant`, `docs-writer`
 - `prompt`: complete, self-contained — include all context; no assumed shared state
 - `depends_on`: zero-based indices of prerequisite tasks
 
@@ -80,7 +81,7 @@ Output fields:
 
 Rules:
 
-- Every plan must include at least one `reviewer` task after all `builder` tasks
+- Every plan must include at least one `consultant` task after all `builder` tasks
 - Include `docs-writer` only when user-facing docs or public APIs change
 - Never include `builder-junior` or `debugger` — builder spawns those internally
 - `model` is optional; omit to use agent's default

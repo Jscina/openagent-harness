@@ -28,7 +28,7 @@ cargo fmt && cargo clippy     # default rustfmt/clippy config
 
 ## Agent capabilities & skills
 
-**Agents (10 total):**
+**Agents (11 total):**
 - **orchestrator** (primary) — mcp: [github, ado], permission: question: allow
 - **planner** (subagent) — permission: question: allow, skills: [caveman]
 - **explorer** (subagent) — mcp: [grep_app], skills: [caveman]
@@ -36,7 +36,8 @@ cargo fmt && cargo clippy     # default rustfmt/clippy config
 - **vision** (subagent) — skills: [caveman]
 - **builder** (primary) — mcp: [azure], skills: [git-workflow, azure-workflow, caveman]
 - **builder-junior** (subagent) — skills: [git-worktree]
-- **reviewer** (subagent) — mcp: [grep_app], skills: [caveman]
+- **reviewer** (primary) — mcp: [github, grep_app], skills: [caveman]
+- **consultant** (subagent) — mcp: [grep_app], skills: [caveman]
 - **debugger** (subagent) — mcp: [azure], skills: [azure-workflow, caveman]
 - **docs-writer** (subagent) — model: anthropic/claude-haiku-4-5, fallback: ollama/qwen3-docs:latest, skills: [caveman]
 
@@ -45,7 +46,7 @@ cargo fmt && cargo clippy     # default rustfmt/clippy config
 - `cargo run -- install` installs embedded skills alongside agents.
 - Currently shipped: `caveman` (ultra-compressed output mode, ~65% token reduction).
 - Agents declare `skills:` in frontmatter; they must load the skill via the skill tool before acting.
-- **caveman** — loaded by: builder, debugger, planner, reviewer, explorer, researcher, vision, docs-writer. NOT loaded by: orchestrator, builder-junior.
+- **caveman** — loaded by: builder, debugger, planner, consultant, explorer, researcher, reviewer, vision, docs-writer. NOT loaded by: orchestrator, builder-junior.
 - **git-workflow** — builder: manages worktree lifecycle for parallel junior workers.
 - **git-worktree** — builder-junior: enforces atomic seed-commit + autosquash-fixup pattern inside worktree.
 - **azure-workflow** — builder, debugger: hard read-only constraint for Azure operations.

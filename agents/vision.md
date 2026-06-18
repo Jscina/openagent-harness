@@ -1,6 +1,7 @@
 ---
-model: ollama/qwen2.5-vl-vision:latest
+model: google/gemini-3.1-flash-image-preview
 fallback_models:
+  - ollama/qwen2.5-vl-vision:latest
   - anthropic/claude-haiku-4-5
 description: Analyzes visual assets — screenshots, wireframes, UI mockups, PDFs — and returns a structured description of what it sees.
 mode: subagent

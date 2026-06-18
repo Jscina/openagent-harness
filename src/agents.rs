@@ -19,6 +19,7 @@ pub const AGENTS: &[(&str, &str)] = &[
         include_str!("../agents/builder-junior.md"),
     ),
     ("reviewer", include_str!("../agents/reviewer.md")),
+    ("consultant", include_str!("../agents/consultant.md")),
     ("debugger", include_str!("../agents/debugger.md")),
     ("docs-writer", include_str!("../agents/docs-writer.md")),
 ];
@@ -137,7 +138,7 @@ mod tests {
 
     #[test]
     fn all_agents_embedded_with_frontmatter() {
-        assert_eq!(AGENTS.len(), 10);
+        assert_eq!(AGENTS.len(), 11);
         for (name, content) in AGENTS {
             assert!(
                 content.starts_with("---\n"),
@@ -154,6 +155,7 @@ mod tests {
             "builder",
             "builder-junior",
             "reviewer",
+            "consultant",
             "debugger",
             "docs-writer",
         ] {
@@ -196,19 +198,27 @@ mod tests {
     }
 
     #[test]
-    fn no_embedded_agent_references_google_models() {
+    fn all_embedded_agent_model_references_use_provider_prefixes() {
         for (name, content) in AGENTS {
+            let cfg = parse_agent_frontmatter(name, content);
             assert!(
-                !content.contains("google/"),
-                "agent '{name}' should not reference google/ models"
+                cfg.model.contains('/'),
+                "agent '{name}' model should use provider/model format: '{}'",
+                cfg.model
             );
+            for fallback in &cfg.fallback_models {
+                assert!(
+                    fallback.contains('/'),
+                    "agent '{name}' fallback should use provider/model format: '{fallback}'"
+                );
+            }
         }
     }
 
     #[test]
-    fn all_agent_configs_returns_10_with_nonempty_models() {
+    fn all_agent_configs_returns_11_with_nonempty_models() {
         let configs = all_agent_configs();
-        assert_eq!(configs.len(), 10);
+        assert_eq!(configs.len(), 11);
         for cfg in &configs {
             assert!(
                 !cfg.model.is_empty(),
@@ -236,7 +246,7 @@ mod tests {
         let val: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(val.is_object());
         let obj = val.as_object().unwrap();
-        assert_eq!(obj.len(), 10);
+        assert_eq!(obj.len(), 11);
         // Spot-check a known agent.
         assert!(obj["planner"]["model"].is_string());
         assert!(obj["planner"]["fallback_models"].is_array());
