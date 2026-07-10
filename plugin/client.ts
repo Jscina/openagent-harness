@@ -61,6 +61,31 @@ export async function deleteSession(
 }
 
 /**
+ * Abort a running session via the SDK's `POST /session/{id}/abort` endpoint.
+ * Never throws: callers use this as a best-effort signal to stop an
+ * in-flight agent turn before the session is deleted, and are not expected to
+ * wrap the call in their own try/catch. Failures are logged here and
+ * reflected in the returned boolean instead of being swallowed silently, so
+ * callers that need an accurate success count (e.g. `harness_cancel`'s
+ * "Sessions aborted: X/Y" summary) can compute it from the return value.
+ * Safe to call on a session that already finished.
+ *
+ * @returns `true` if the abort request succeeded, `false` if it failed.
+ */
+export async function abortSession(
+  client: PluginInput["client"],
+  sessionId: string,
+): Promise<boolean> {
+  try {
+    await client.session.abort({ path: { id: sessionId } });
+    return true;
+  } catch (e) {
+    console.error("[harness-plugin] abortSession failed:", e);
+    return false;
+  }
+}
+
+/**
  * Post a toast notification to the OpenCode TUI via the SDK client.
  * Non-fatal: errors are logged as warnings and silently dropped.
  */

@@ -42,8 +42,17 @@ For planned coding work, the flow is:
 
 Execution modes:
 
-- **Native dispatch** (recommended): the orchestrator uses `harness_dispatch_tasks` to poll for ready tasks, executes each as a visible `Task` tool call (subagent), then calls `harness_task_complete` to register completion. The loop repeats until the workflow reaches `done` or `failed`.
+- **Native dispatch** (recommended): the orchestrator uses `harness_dispatch_tasks` to poll for ready tasks, executes each as a visible `Task` tool call (subagent), then calls `harness_task_complete` to register completion. The loop repeats until the workflow reaches `done`, `failed`, or `cancelled`.
 - **Non-native dispatch**: the plugin uses its in-plugin 500ms tick loop (`dag.tick()`) to start ready tasks automatically (no visible subagent calls).
+
+### Cancellation
+
+Any agent may call `harness_cancel` to abort a workflow or single task:
+
+- `harness_cancel({ workflow_id })` cancels all Pending/Running tasks in the workflow, marks them `Cancelled`, aborts their in-flight OpenCode sessions (cooperative via `POST /session/{id}/abort`), and transitions the workflow to `Cancelled` status.
+- `harness_cancel({ task_id })` cancels the specified task and all its transitive dependents (tasks blocked on it). Cancelled tasks never attempt fallback recovery.
+- Late `session.idle` / `session.error` events for aborted sessions are dropped by the plugin, preventing race conditions.
+- In native dispatch, `harness_dispatch_tasks` treats `cancelled` as a terminal status, exiting the poll loop.
 
 ### Task state machine
 
@@ -53,7 +62,8 @@ Pending
 Running
   ├─→ Done          (session.idle received)
   ├─→ Pending       (try_fallback() succeeds — next model, re-queued)
-  └─→ Failed        (session.error + no fallbacks, or fail_task() called)
+  ├─→ Failed        (session.error + no fallbacks, or fail_task() called)
+  └─→ Cancelled     (harness_cancel() called, or dependent task cancelled)
 ```
 
 ## Installation
@@ -172,6 +182,7 @@ The following tools are exposed by the plugin to OpenCode agents:
 | `harness_state(workflow_id?)` | Query workflow snapshot; lists all workflows if no ID given |
 | `harness_dispatch_tasks(workflow_id)` | Native dispatch: poll for ready tasks; blocks until at least one is ready |
 | `harness_task_complete(task_id, session_id, status)` | Native dispatch: register task completion after Task tool call returns |
+| `harness_cancel(workflow_id\|task_id)` | Cancel a workflow or task; aborts in-flight sessions and cascades to dependents |
 | `submit_review(task_id, review_json)` | Attach structured review feedback to a completed task |
 
 ## Environment

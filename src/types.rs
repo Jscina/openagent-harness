@@ -7,6 +7,7 @@ pub enum TaskStatus {
     Running,
     Done,
     Failed(String),
+    Cancelled,
 }
 
 /// Classifies an error as retryable or terminal to decide whether a fallback should be attempted.
@@ -83,6 +84,7 @@ pub enum WorkflowStatus {
     Running,
     Done,
     Failed { task_id: String, reason: String },
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +241,16 @@ mod tests {
     }
 
     #[test]
+    fn task_status_cancelled_roundtrip() {
+        let s = serde_json::to_string(&TaskStatus::Cancelled).unwrap();
+        assert_eq!(s, r#"{"type":"cancelled"}"#);
+        assert_eq!(
+            serde_json::from_str::<TaskStatus>(&s).unwrap(),
+            TaskStatus::Cancelled
+        );
+    }
+
+    #[test]
     fn workflow_status_roundtrips() {
         let s = serde_json::to_string(&WorkflowStatus::Running).unwrap();
         assert_eq!(s, r#"{"type":"running"}"#);
@@ -254,6 +266,16 @@ mod tests {
         assert_eq!(v["type"], "failed");
         assert_eq!(v["task_id"], "tid-1");
         assert_eq!(v["reason"], "oops");
+    }
+
+    #[test]
+    fn workflow_status_cancelled_roundtrip() {
+        let s = serde_json::to_string(&WorkflowStatus::Cancelled).unwrap();
+        assert_eq!(s, r#"{"type":"cancelled"}"#);
+        assert_eq!(
+            serde_json::from_str::<WorkflowStatus>(&s).unwrap(),
+            WorkflowStatus::Cancelled
+        );
     }
 
     #[test]

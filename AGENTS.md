@@ -29,7 +29,7 @@ cargo fmt && cargo clippy     # default rustfmt/clippy config
 ## Agent capabilities & skills
 
 **Agents (11 total):**
-- **orchestrator** (primary) — mcp: [github, ado], permission: question: allow
+- **orchestrator** (primary) — mcp: [github, ado], tools: [harness_cancel], permission: question: allow
 - **planner** (subagent) — permission: question: allow, skills: [caveman]
 - **explorer** (subagent) — mcp: [grep_app], skills: [caveman]
 - **researcher** (subagent) — mcp: [websearch, context7, grep_app], skills: [caveman]
@@ -71,6 +71,7 @@ cargo fmt && cargo clippy     # default rustfmt/clippy config
 - Fallback decisions are made in the plugin; the WASM engine exposes `try_fallback()` to atomically advance the model and reset task state to Pending.
 - Plugin errors are logged; they are not propagated to OpenCode.
 - Orchestrator flow: planner may clarify via question tool → planner saves a plan artifact under `.opencode/plans` → user approval (via question tool) → orchestrator calls `submit_plan` with `native_dispatch: true` → native dispatch loop (`harness_dispatch_tasks` polls → spawn Task tool calls in parallel → `harness_task_complete` per task) → report results. The orchestrator never submits a workflow without user confirmation.
+- **Cancellation:** `harness_cancel({ workflow_id })` or `harness_cancel({ task_id, reason? })` aborts in-flight OpenCode sessions via `POST /session/{id}/abort` (cooperative — no force-kill), deletes the sessions, and marks the task(s) `Cancelled`. For `cancel_task`, dependents are also cancelled. Late `session.idle`/`session.error` events for cancelled sessions are dropped. Workflow status becomes `Cancelled` if any Pending/Running task was cancelled; precedence is `Failed` > `Cancelled` > `Done`. The plugin's `harness_dispatch_tasks` treats `"cancelled"` as a terminal workflow status, exiting the native dispatch loop.
 
 ## Non-obvious gotchas
 
@@ -83,6 +84,7 @@ cargo fmt && cargo clippy     # default rustfmt/clippy config
 - The orchestrator agent needs `permission: question: allow` in its frontmatter to use OpenCode's built-in question tool for plan approval. Without this, the question tool calls will be denied.
 - The planner agent now also needs `permission: question: allow` so it can resolve missing requirements before saving a plan artifact.
 - Native dispatch: when `submit_plan` is called with `native_dispatch: true`, the orchestrator must run the `harness_dispatch_tasks` / Task tool / `harness_task_complete` loop manually.
+- Cancellation: `cancel_task()` returns a JSON object `{"cancelled_task_ids": [...], "session_ids": [...]}` and cascades to all transitive dependents. Cancelled tasks never trigger fallback — they are permanently marked `Cancelled` and do not attempt recovery. Late events for cancelled sessions are silently dropped.
 - External skills (git-workflow, azure-workflow, pr-workflow) are NOT shipped by this repo — they must be installed separately. If a declared skill is missing at `~/.config/opencode/skills/`, the agent that needs it will be blocked.
 - Builder-junior operates inside a git worktree, not the main repo. Its working directory is `../work-<task-id>` on branch `ai/*`. Never run git operations in the main repo from a junior context.
 - Caveman skill is auto-installed by `cargo run -- install` (unlike external skills). It compresses subagent prose output by ~65% via `src/skills.rs` → `~/.config/opencode/skills/caveman/SKILL.md`. Orchestrator and builder-junior intentionally excluded.

@@ -276,3 +276,189 @@ describe('DagEngine — session.error fallback_hint', () => {
     dag.free();
   });
 });
+
+// ─── cancel_task / cancel_workflow ─────────────────────────────────────────────
+
+describe('DagEngine — cancel_task', () => {
+  it('cancels a running task and returns its session_id', () => {
+    const dag = newDag();
+    JSON.parse(dag.submit_workflow(ONE_TASK));
+    const [task] = JSON.parse(dag.tick()) as Array<{ id: string }>;
+    dag.task_started(task.id, 'ses_1');
+
+    const result = JSON.parse(dag.cancel_task(task.id)) as {
+      cancelled_task_ids: string[];
+      session_ids: string[];
+    };
+    expect(result.cancelled_task_ids).toEqual([task.id]);
+    expect(result.session_ids).toEqual(['ses_1']);
+
+    const cancelledTask = JSON.parse(dag.get_task(task.id)) as { status: { type: string } };
+    expect(cancelledTask.status.type).toBe('cancelled');
+    dag.free();
+  });
+
+  it('cascades cancellation to transitive dependents', () => {
+    const dag = newDag();
+    const { task_ids } = JSON.parse(dag.submit_workflow(TWO_TASKS)) as { task_ids: string[] };
+    JSON.parse(dag.tick()); // explorer becomes Running
+
+    const result = JSON.parse(dag.cancel_task(task_ids[0])) as {
+      cancelled_task_ids: string[];
+    };
+    expect(result.cancelled_task_ids.sort()).toEqual([...task_ids].sort());
+
+    const builderTask = JSON.parse(dag.get_task(task_ids[1])) as { status: { type: string } };
+    expect(builderTask.status.type).toBe('cancelled');
+    dag.free();
+  });
+
+  it('marks the whole workflow cancelled once no active branch remains', () => {
+    const dag = newDag();
+    const { workflow_id, task_ids } = JSON.parse(dag.submit_workflow(ONE_TASK)) as {
+      workflow_id: string;
+      task_ids: string[];
+    };
+    JSON.parse(dag.tick());
+    dag.task_started(task_ids[0], 'ses_1');
+    dag.cancel_task(task_ids[0]);
+
+    const snapshot = JSON.parse(dag.get_workflow_snapshot(workflow_id)) as {
+      status: { type: string };
+    };
+    expect(snapshot.status.type).toBe('cancelled');
+    dag.free();
+  });
+
+  it('throws when the task is already terminal', () => {
+    const dag = newDag();
+    JSON.parse(dag.submit_workflow(ONE_TASK));
+    const [task] = JSON.parse(dag.tick()) as Array<{ id: string }>;
+    dag.task_started(task.id, 'ses_1');
+    dag.process_event('session.idle', 'ses_1', '{}'); // task now Done
+
+    expect(() => dag.cancel_task(task.id)).toThrow('already terminal');
+    dag.free();
+  });
+
+  it('throws for an unknown task id', () => {
+    const dag = newDag();
+    expect(() => dag.cancel_task('nope')).toThrow('not found');
+    dag.free();
+  });
+
+  it('a late session.idle for the cancelled session is a no-op (no session_to_task mapping)', () => {
+    const dag = newDag();
+    JSON.parse(dag.submit_workflow(ONE_TASK));
+    const [task] = JSON.parse(dag.tick()) as Array<{ id: string }>;
+    dag.task_started(task.id, 'ses_1');
+    dag.cancel_task(task.id);
+
+    const result = JSON.parse(dag.process_event('session.idle', 'ses_1', '{}')) as {
+      delete_session: string | null;
+      notifications: unknown[];
+    };
+    expect(result.delete_session).toBeNull();
+    expect(result.notifications).toHaveLength(0);
+
+    const stillCancelled = JSON.parse(dag.get_task(task.id)) as { status: { type: string } };
+    expect(stillCancelled.status.type).toBe('cancelled');
+    dag.free();
+  });
+
+  it('task_started() returns false through the real WASM boundary for a cancelled task, and creates no binding', () => {
+    // This exercises the actual compiled bool return marshalling (not just
+    // the Rust unit test or a JS-side mock) — regression coverage for the
+    // createSession()/task_started() race: a task cancelled while a session
+    // was being created must reject the late bind attempt.
+    const dag = newDag();
+    JSON.parse(dag.submit_workflow(ONE_TASK));
+    const [task] = JSON.parse(dag.tick()) as Array<{ id: string }>;
+    dag.cancel_task(task.id);
+
+    const bound = dag.task_started(task.id, 'ses_orphan');
+    expect(bound).toBe(false);
+
+    // No mapping was created — a subsequent event for this session is a no-op.
+    const result = JSON.parse(dag.process_event('session.idle', 'ses_orphan', '{}')) as {
+      delete_session: string | null;
+      notifications: unknown[];
+    };
+    expect(result.delete_session).toBeNull();
+    expect(result.notifications).toHaveLength(0);
+
+    const stillCancelled = JSON.parse(dag.get_task(task.id)) as {
+      status: { type: string };
+      session_id: string | null;
+    };
+    expect(stillCancelled.status.type).toBe('cancelled');
+    expect(stillCancelled.session_id).toBeNull();
+    dag.free();
+  });
+
+  it('task_started() returns true through the real WASM boundary for a Running task', () => {
+    const dag = newDag();
+    JSON.parse(dag.submit_workflow(ONE_TASK));
+    const [task] = JSON.parse(dag.tick()) as Array<{ id: string }>;
+
+    expect(dag.task_started(task.id, 'ses_ok')).toBe(true);
+    dag.free();
+  });
+});
+
+describe('DagEngine — cancel_workflow', () => {
+  it('cancels every pending/running task and returns their session_ids', () => {
+    const dag = newDag();
+    const { workflow_id, task_ids } = JSON.parse(dag.submit_workflow(TWO_TASKS)) as {
+      workflow_id: string;
+      task_ids: string[];
+    };
+    JSON.parse(dag.tick());
+    dag.task_started(task_ids[0], 'ses_1');
+
+    const result = JSON.parse(dag.cancel_workflow(workflow_id)) as {
+      cancelled_task_ids: string[];
+      session_ids: string[];
+    };
+    expect(result.cancelled_task_ids.sort()).toEqual([...task_ids].sort());
+    expect(result.session_ids).toEqual(['ses_1']);
+
+    const snapshot = JSON.parse(dag.get_workflow_snapshot(workflow_id)) as {
+      status: { type: string };
+    };
+    expect(snapshot.status.type).toBe('cancelled');
+    dag.free();
+  });
+
+  it('preserves already-Done tasks instead of cancelling them', () => {
+    const dag = newDag();
+    const { workflow_id, task_ids } = JSON.parse(dag.submit_workflow(TWO_TASKS)) as {
+      workflow_id: string;
+      task_ids: string[];
+    };
+    JSON.parse(dag.tick());
+    dag.task_started(task_ids[0], 'ses_1');
+    dag.process_event('session.idle', 'ses_1', '{}'); // explorer Done, builder now ready
+
+    dag.cancel_workflow(workflow_id);
+
+    const explorerTask = JSON.parse(dag.get_task(task_ids[0])) as { status: { type: string } };
+    expect(explorerTask.status.type).toBe('done');
+    dag.free();
+  });
+
+  it('throws when the workflow is already terminal', () => {
+    const dag = newDag();
+    const { workflow_id } = JSON.parse(dag.submit_workflow(ONE_TASK)) as { workflow_id: string };
+    dag.cancel_workflow(workflow_id);
+
+    expect(() => dag.cancel_workflow(workflow_id)).toThrow('already terminal');
+    dag.free();
+  });
+
+  it('throws for an unknown workflow id', () => {
+    const dag = newDag();
+    expect(() => dag.cancel_workflow('nope')).toThrow('not found');
+    dag.free();
+  });
+});

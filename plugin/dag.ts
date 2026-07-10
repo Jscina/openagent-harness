@@ -3,7 +3,8 @@
 import type { DagEngine } from "./wasm/openagent_harness.js";
 
 import type { EventResult } from "./types.js";
-import { deleteSession, showToast } from "./client.js";
+import { abortSession, deleteSession, showToast } from "./client.js";
+import type { BoundedSet } from "./bounded.js";
 
 export function parseJson(raw: string): unknown {
   try {
@@ -21,6 +22,20 @@ export function getHarnessWorkflowSnapshot(dag: DagEngine, workflowId: string): 
   return parseJson(dag.get_workflow_snapshot(workflowId));
 }
 
+/**
+ * Possible workflow status labels surfaced by `extractWorkflowStatus`.
+ * `"cancelled"` is produced by `dag.cancel_workflow` / `dag.cancel_task`
+ * (when the cancelled task was the last active branch of its workflow).
+ */
+export type WorkflowStatusLabel = "running" | "done" | "failed" | "cancelled";
+
+/**
+ * Extract and lowercase the workflow status label from a snapshot/workflow
+ * object. Passes through whatever the Rust engine tags the status with
+ * (`running` | `done` | `failed` | `cancelled`), so no code change is needed
+ * here when new statuses are added on the Rust side — this doc-comments the
+ * ones currently in use.
+ */
 export function extractWorkflowStatus(snapshot: unknown): string | null {
   if (!snapshot || typeof snapshot !== "object") return null;
   const obj = snapshot as {
@@ -43,6 +58,54 @@ export function extractWorkflowStatus(snapshot: unknown): string | null {
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Find the workflow_id that owns `taskId` by scanning workflow summaries and
+ * checking each workflow's task list for membership. `Task` itself does not
+ * carry a `workflow_id` field, so this is the only way to resolve it from a
+ * bare task id (e.g. after a task-level `cancel_task` call).
+ *
+ * Returns `null` if no workflow contains the task (unknown id).
+ */
+export function findOwningWorkflowId(dag: DagEngine, taskId: string): string | null {
+  const summaries = parseJson(dag.list_workflow_summaries()) as Array<{ id: string }> | null;
+  if (!Array.isArray(summaries)) return null;
+
+  for (const { id } of summaries) {
+    const wf = parseJson(dag.get_workflow(id)) as { tasks?: string[] } | null;
+    if (wf?.tasks?.includes(taskId)) return id;
+  }
+  return null;
+}
+
+/**
+ * Clean up a session that `dag.task_started()` refused to bind because its
+ * task was already terminal (typically `Cancelled`, but the DAG's guard also
+ * covers `Done`/`Failed` defensively) by the time the session was created —
+ * e.g. a task cancelled via `harness_cancel` while `createSession()` was
+ * still in flight, or while a native-dispatch Task tool call was still
+ * running.
+ *
+ * Ordering matters: the session is tracked as cancelled BEFORE
+ * `abortSession`/`deleteSession` run, so the abort-induced `session.error`
+ * (or a late `session.idle`) is guaranteed to be dropped by the
+ * `cancelledSessions` guard in the plugin's event hooks, instead of being
+ * buffered/replayed as an orphaned or native-dispatch event that could
+ * resurrect the cancelled task.
+ *
+ * @returns whether `abortSession` succeeded, so callers that need an
+ *   accurate abort count (e.g. `harness_cancel`'s summary) can use it.
+ */
+export async function cleanupOrphanedSession(
+  client: Parameters<typeof deleteSession>[0],
+  sessionId: string,
+  cancelledSessions: BoundedSet<string>,
+): Promise<boolean> {
+  cancelledSessions.add(sessionId);
+  const aborted = await abortSession(client, sessionId);
+  await deleteSession(client, sessionId);
+  return aborted;
 }
 
 export async function handleEventResult(

@@ -4,6 +4,7 @@ import {
   createSession,
   sendMessage,
   deleteSession,
+  abortSession,
   showToast,
 } from './client.js';
 
@@ -165,6 +166,35 @@ describe('deleteSession', () => {
     } as any;
 
     await expect(deleteSession(client, 'ses_xyz')).resolves.toBeUndefined();
+  });
+});
+
+// ─── abortSession ─────────────────────────────────────────────────────────────
+
+describe('abortSession', () => {
+  it('calls client.session.abort with the session id', async () => {
+    const client = {
+      session: { abort: vi.fn().mockResolvedValue(true) },
+    } as any;
+
+    await abortSession(client, 'ses_xyz');
+    expect(client.session.abort).toHaveBeenCalledWith({ path: { id: 'ses_xyz' } });
+  });
+
+  it('resolves true when client.session.abort succeeds', async () => {
+    const client = {
+      session: { abort: vi.fn().mockResolvedValue(undefined) },
+    } as any;
+
+    await expect(abortSession(client, 'ses_xyz')).resolves.toBe(true);
+  });
+
+  it('resolves false (without throwing) when client.session.abort rejects', async () => {
+    const client = {
+      session: { abort: vi.fn().mockRejectedValue(new Error('already gone')) },
+    } as any;
+
+    await expect(abortSession(client, 'ses_xyz')).resolves.toBe(false);
   });
 });
 

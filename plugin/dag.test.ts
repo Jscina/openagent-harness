@@ -2,9 +2,12 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   parseJson,
   extractWorkflowStatus,
+  findOwningWorkflowId,
   sleep,
   handleEventResult,
+  cleanupOrphanedSession,
 } from './dag.js';
+import { BoundedSet } from './bounded.js';
 
 // ─── parseJson ────────────────────────────────────────────────────────────────
 
@@ -85,6 +88,49 @@ describe('extractWorkflowStatus', () => {
   it('returns null when status is a non-string non-object primitive', () => {
     expect(extractWorkflowStatus({ status: 42 })).toBeNull();
     expect(extractWorkflowStatus({ status: true })).toBeNull();
+  });
+
+  it('extracts "cancelled" from a plain string status', () => {
+    expect(extractWorkflowStatus({ status: 'Cancelled' })).toBe('cancelled');
+  });
+
+  it('extracts "cancelled" from a tagged-union status (matches WorkflowStatus::Cancelled)', () => {
+    expect(extractWorkflowStatus({ status: { type: 'cancelled' } })).toBe('cancelled');
+  });
+});
+
+// ─── findOwningWorkflowId ──────────────────────────────────────────────────────
+
+describe('findOwningWorkflowId', () => {
+  it('returns the workflow_id whose task list contains the given task id', () => {
+    const dag = {
+      list_workflow_summaries: () => JSON.stringify([{ id: 'wf_1' }, { id: 'wf_2' }]),
+      get_workflow: (id: string) =>
+        id === 'wf_1'
+          ? JSON.stringify({ id: 'wf_1', tasks: ['t_a', 't_b'] })
+          : JSON.stringify({ id: 'wf_2', tasks: ['t_c'] }),
+    } as any;
+
+    expect(findOwningWorkflowId(dag, 't_c')).toBe('wf_2');
+    expect(findOwningWorkflowId(dag, 't_a')).toBe('wf_1');
+  });
+
+  it('returns null when no workflow contains the task id', () => {
+    const dag = {
+      list_workflow_summaries: () => JSON.stringify([{ id: 'wf_1' }]),
+      get_workflow: () => JSON.stringify({ id: 'wf_1', tasks: ['t_a'] }),
+    } as any;
+
+    expect(findOwningWorkflowId(dag, 't_unknown')).toBeNull();
+  });
+
+  it('returns null when there are no workflows', () => {
+    const dag = {
+      list_workflow_summaries: () => '[]',
+      get_workflow: () => 'null',
+    } as any;
+
+    expect(findOwningWorkflowId(dag, 't_a')).toBeNull();
   });
 });
 
@@ -209,5 +255,101 @@ describe('handleEventResult', () => {
     expect(client.tui.showToast).not.toHaveBeenCalled();
     expect(client.session.delete).not.toHaveBeenCalled();
     expect(dag.task_started).not.toHaveBeenCalled();
+  });
+});
+
+// ─── cleanupOrphanedSession ────────────────────────────────────────────────────
+
+describe('cleanupOrphanedSession', () => {
+  it('tracks the session as cancelled BEFORE aborting it (ordering matters)', async () => {
+    const cancelledSessions = new BoundedSet<string>(1000);
+    const callOrder: string[] = [];
+
+    const client = {
+      session: {
+        abort: vi.fn().mockImplementation(async () => {
+          // At the moment abort is invoked, the session must already be
+          // tracked — this is what guarantees the abort-induced session.error
+          // gets dropped by the cancelledSessions guard instead of being
+          // replayed as an orphaned event.
+          callOrder.push(cancelledSessions.has('ses_orphan') ? 'tracked-then-abort' : 'abort-before-tracked');
+          return undefined;
+        }),
+        delete: vi.fn().mockImplementation(async () => {
+          callOrder.push('delete');
+          return {};
+        }),
+      },
+    } as any;
+
+    await cleanupOrphanedSession(client, 'ses_orphan', cancelledSessions);
+
+    expect(callOrder).toEqual(['tracked-then-abort', 'delete']);
+  });
+
+  it('aborts and deletes the session, and leaves it in cancelledSessions', async () => {
+    const cancelledSessions = new BoundedSet<string>(1000);
+    const client = {
+      session: {
+        abort: vi.fn().mockResolvedValue(undefined),
+        delete: vi.fn().mockResolvedValue({}),
+      },
+    } as any;
+
+    await cleanupOrphanedSession(client, 'ses_orphan', cancelledSessions);
+
+    expect(client.session.abort).toHaveBeenCalledWith({ path: { id: 'ses_orphan' } });
+    expect(client.session.delete).toHaveBeenCalledWith({ path: { id: 'ses_orphan' } });
+    expect(cancelledSessions.has('ses_orphan')).toBe(true);
+  });
+
+  it('returns true when abortSession succeeds and false when it fails, without throwing', async () => {
+    const cancelledSessions = new BoundedSet<string>(1000);
+    const okClient = {
+      session: { abort: vi.fn().mockResolvedValue(undefined), delete: vi.fn().mockResolvedValue({}) },
+    } as any;
+    await expect(cleanupOrphanedSession(okClient, 'ses_ok', cancelledSessions)).resolves.toBe(true);
+
+    const failClient = {
+      session: {
+        abort: vi.fn().mockRejectedValue(new Error('gone')),
+        delete: vi.fn().mockResolvedValue({}),
+      },
+    } as any;
+    await expect(cleanupOrphanedSession(failClient, 'ses_fail', cancelledSessions)).resolves.toBe(false);
+    // Even when abort fails, delete must still run and the session must
+    // still end up tracked as cancelled.
+    expect(failClient.session.delete).toHaveBeenCalledWith({ path: { id: 'ses_fail' } });
+    expect(cancelledSessions.has('ses_fail')).toBe(true);
+  });
+
+  it('simulates the createSession/task_started race: an orphaned session is cleaned up and cannot resurrect the task via a late event', async () => {
+    // Simulate the exact regression scenario: dag.tick() returned a task,
+    // createSession() resolved, but the task was cancelled in the meantime —
+    // so dag.task_started() (mocked here) returns false.
+    const dag = { task_started: vi.fn().mockReturnValue(false) } as any;
+    const cancelledSessions = new BoundedSet<string>(1000);
+    const client = {
+      session: {
+        abort: vi.fn().mockResolvedValue(undefined),
+        delete: vi.fn().mockResolvedValue({}),
+      },
+    } as any;
+
+    const sessionId = 'ses_race';
+    const bound = dag.task_started('task_1', sessionId);
+    expect(bound).toBe(false);
+
+    if (!bound) {
+      await cleanupOrphanedSession(client, sessionId, cancelledSessions);
+    }
+
+    // The orphaned session was aborted and deleted...
+    expect(client.session.abort).toHaveBeenCalledWith({ path: { id: sessionId } });
+    expect(client.session.delete).toHaveBeenCalledWith({ path: { id: sessionId } });
+    // ...and is now tracked, so a late session.idle/session.error event hook
+    // (which checks `cancelledSessions.has(sessionId)` before calling
+    // dag.process_event) would drop it instead of resurrecting the task.
+    expect(cancelledSessions.has(sessionId)).toBe(true);
   });
 });

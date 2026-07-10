@@ -77,6 +77,10 @@ impl DagEngine {
             .get_mut(task_id)
             .ok_or_else(|| format!("task {task_id} not found"))?;
 
+        if matches!(node.task.status, TaskStatus::Cancelled) {
+            return Err(format!("task {task_id} is cancelled"));
+        }
+
         let attempt = node.task.model_attempt;
         let fallback_len = node.task.fallback_models.len();
 
@@ -268,12 +272,41 @@ impl DagEngine {
     }
 
     /// Record that `task_id` now has an active session `session_id`.
-    pub fn task_started(&mut self, task_id: &str, session_id: &str) {
+    ///
+    /// Returns `true` if the task was in a bindable state (`Pending` or
+    /// `Running`) and the session was bound. Returns `false` if the task does
+    /// not exist or is already terminal (`Done`, `Failed`, or `Cancelled`) —
+    /// in that case `session_id` is deliberately left unregistered in
+    /// `session_to_task` (no mapping is created), so a subsequent
+    /// `process_event` for it is a guaranteed no-op.
+    ///
+    /// `Pending` is bindable (not just `Running`) because two legitimate
+    /// callers bind a session while the task is still `Pending`:
+    /// `try_fallback()` resets a task to `Pending` before the tick loop picks
+    /// it back up, and the session-reuse path in `process_event`
+    /// (`session.idle` → `reuse_session`) pre-assigns a session to the next
+    /// task before that task has been through `tick()`.
+    ///
+    /// Callers on the plugin side MUST check this return value: `false` means
+    /// the session was never bound to a task and is now orphaned — the caller
+    /// is responsible for tracking it as cancelled and aborting/deleting it,
+    /// since the DAG will never do so for a session it doesn't know about.
+    pub fn task_started(&mut self, task_id: &str, session_id: &str) -> bool {
+        let bindable = matches!(
+            self.nodes.get(task_id).map(|n| &n.task.status),
+            Some(TaskStatus::Pending) | Some(TaskStatus::Running)
+        );
+
+        if !bindable {
+            return false;
+        }
+
         if let Some(node) = self.nodes.get_mut(task_id) {
             node.task.session_id = Some(session_id.to_string());
         }
         self.session_to_task
             .insert(session_id.to_string(), task_id.to_string());
+        true
     }
 
     /// Handle a session event; returns `{notifications, delete_session}` JSON.
@@ -450,25 +483,119 @@ impl DagEngine {
         serde_json::to_string(&summaries).unwrap_or_else(|_| "[]".to_string())
     }
 
-    /// Cancel a task.  Returns JSON `{session_id: string|null}` or an error string.
+    /// Cancel a task and cascade-cancel every task that transitively depends on it.
+    ///
+    /// Returns JSON `{"cancelled_task_ids": [...], "session_ids": [...]}` or an error string.
     pub fn cancel_task(&mut self, id: &str) -> Result<String, String> {
-        let node = self
-            .nodes
-            .get_mut(id)
-            .ok_or_else(|| format!("task {id} not found"))?;
+        {
+            let node = self
+                .nodes
+                .get(id)
+                .ok_or_else(|| format!("task {id} not found"))?;
 
-        if matches!(node.task.status, TaskStatus::Done | TaskStatus::Failed(_)) {
-            return Err(format!("task {id} is already terminal"));
+            if matches!(
+                node.task.status,
+                TaskStatus::Done | TaskStatus::Failed(_) | TaskStatus::Cancelled
+            ) {
+                return Err(format!("task {id} is already terminal"));
+            }
         }
 
-        node.task.status = TaskStatus::Failed("cancelled".to_string());
-        let session_id = node.task.session_id.clone();
-        if let Some(ref sid) = session_id {
+        // BFS over transitive dependents (any task whose depends_on chain includes
+        // an already-cancelled id), cancelling Pending/Running tasks along the way.
+        let mut cancelled_task_ids: Vec<String> = vec![id.to_string()];
+        let mut worklist: Vec<String> = vec![id.to_string()];
+
+        while let Some(current) = worklist.pop() {
+            let dependents: Vec<String> = self
+                .nodes
+                .iter()
+                .filter(|(tid, n)| {
+                    !cancelled_task_ids.contains(*tid)
+                        && n.depends_on.contains(&current)
+                        && matches!(n.task.status, TaskStatus::Pending | TaskStatus::Running)
+                })
+                .map(|(tid, _)| tid.clone())
+                .collect();
+
+            for dep_id in dependents {
+                cancelled_task_ids.push(dep_id.clone());
+                worklist.push(dep_id);
+            }
+        }
+
+        let mut session_ids: Vec<String> = Vec::new();
+        for tid in &cancelled_task_ids {
+            if let Some(node) = self.nodes.get_mut(tid) {
+                node.task.status = TaskStatus::Cancelled;
+                if let Some(sid) = node.task.session_id.take() {
+                    session_ids.push(sid);
+                }
+            }
+        }
+
+        for sid in &session_ids {
             self.session_to_task.remove(sid);
         }
+
         self.update_workflow_status(id);
 
-        Ok(serde_json::json!({ "session_id": session_id }).to_string())
+        Ok(serde_json::json!({
+            "cancelled_task_ids": cancelled_task_ids,
+            "session_ids": session_ids,
+        })
+        .to_string())
+    }
+
+    /// Cancel an entire workflow.  Marks every Pending/Running task Cancelled,
+    /// leaves Done/Failed tasks untouched, and sets the workflow status to Cancelled.
+    ///
+    /// Returns JSON `{"cancelled_task_ids": [...], "session_ids": [...]}` or an error string.
+    pub fn cancel_workflow(&mut self, workflow_id: &str) -> Result<String, String> {
+        let task_ids: Vec<String> = {
+            let wf = self
+                .workflows
+                .get(workflow_id)
+                .ok_or_else(|| format!("workflow {workflow_id} not found"))?;
+
+            if matches!(
+                wf.status,
+                WorkflowStatus::Done | WorkflowStatus::Failed { .. } | WorkflowStatus::Cancelled
+            ) {
+                return Err(format!("workflow {workflow_id} is already terminal"));
+            }
+
+            wf.tasks.clone()
+        };
+
+        let mut cancelled_task_ids = Vec::new();
+        let mut session_ids = Vec::new();
+
+        for tid in &task_ids {
+            if let Some(node) = self.nodes.get_mut(tid)
+                && matches!(node.task.status, TaskStatus::Pending | TaskStatus::Running)
+            {
+                node.task.status = TaskStatus::Cancelled;
+                cancelled_task_ids.push(tid.clone());
+                if let Some(sid) = node.task.session_id.take() {
+                    session_ids.push(sid);
+                }
+            }
+        }
+
+        for sid in &session_ids {
+            self.session_to_task.remove(sid);
+        }
+
+        if let Some(wf) = self.workflows.get_mut(workflow_id) {
+            wf.status = WorkflowStatus::Cancelled;
+        }
+
+        Ok(serde_json::json!({
+            "cancelled_task_ids": cancelled_task_ids,
+            "session_ids": session_ids,
+        })
+        .to_string())
     }
 
     /// Mark a task failed with a specific reason and propagate workflow status.
@@ -480,7 +607,10 @@ impl DagEngine {
             .get_mut(id)
             .ok_or_else(|| format!("task {id} not found"))?;
 
-        if matches!(node.task.status, TaskStatus::Done | TaskStatus::Failed(_)) {
+        if matches!(
+            node.task.status,
+            TaskStatus::Done | TaskStatus::Failed(_) | TaskStatus::Cancelled
+        ) {
             return Err(format!("task {id} is already terminal"));
         }
 
@@ -537,6 +667,8 @@ impl DagEngine {
         };
 
         let mut first_failure: Option<(String, String)> = None;
+        let mut any_cancelled = false;
+        let mut any_pending_or_running = false;
         let mut all_done = true;
 
         for tid in &task_ids {
@@ -548,7 +680,15 @@ impl DagEngine {
                     }
                     all_done = false;
                 }
-                _ => {
+                Some(TaskStatus::Cancelled) => {
+                    any_cancelled = true;
+                    all_done = false;
+                }
+                Some(TaskStatus::Pending) | Some(TaskStatus::Running) => {
+                    any_pending_or_running = true;
+                    all_done = false;
+                }
+                None => {
                     all_done = false;
                 }
             }
@@ -563,12 +703,18 @@ impl DagEngine {
             return Some(wf.status.clone());
         }
 
-        if !all_done {
+        if any_pending_or_running {
             return None;
         }
 
         let wf = self.workflows.get_mut(&workflow_id).unwrap();
-        wf.status = WorkflowStatus::Done;
+        wf.status = if any_cancelled {
+            WorkflowStatus::Cancelled
+        } else if all_done {
+            WorkflowStatus::Done
+        } else {
+            return None;
+        };
         Some(wf.status.clone())
     }
 
@@ -1059,11 +1205,13 @@ mod tests {
 
         let cancel: serde_json::Value =
             serde_json::from_str(&dag.cancel_task(task_id).unwrap()).unwrap();
-        assert_eq!(cancel["session_id"], "ses_c");
+        assert_eq!(cancel["session_ids"].as_array().unwrap().len(), 1);
+        assert_eq!(cancel["session_ids"][0], "ses_c");
+        assert_eq!(cancel["cancelled_task_ids"].as_array().unwrap().len(), 1);
+        assert_eq!(cancel["cancelled_task_ids"][0], task_id);
 
         let task: serde_json::Value = serde_json::from_str(&dag.get_task(task_id)).unwrap();
-        assert_eq!(task["status"]["type"], "failed");
-        assert_eq!(task["status"]["message"], "cancelled");
+        assert_eq!(task["status"]["type"], "cancelled");
     }
 
     #[test]
@@ -1085,6 +1233,394 @@ mod tests {
     fn cancel_unknown_task_errors() {
         let mut dag = DagEngine::new();
         assert!(dag.cancel_task("nope").is_err());
+    }
+
+    #[test]
+    fn task_started_rejects_cancelled_task_and_creates_no_mapping() {
+        // Regression test for the createSession/task_started race: a task
+        // cancelled while a session was being created must not let that
+        // session bind after the fact.
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([{"agent": "a", "prompt": "p", "depends_on": []}]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let task_id = resp["task_ids"][0].as_str().unwrap();
+
+        dag.tick();
+        dag.cancel_task(task_id).unwrap();
+
+        // Simulate createSession() resolving after the cancellation already
+        // landed: task_started() must reject the bind.
+        let bound = dag.task_started(task_id, "ses_orphan");
+        assert!(!bound, "task_started must reject a cancelled task");
+
+        // No session_to_task mapping was created: a subsequent event for
+        // this session must be a complete no-op (not resurrect the task).
+        let r: serde_json::Value =
+            serde_json::from_str(&dag.process_event("session.idle", "ses_orphan", "null")).unwrap();
+        assert!(r["delete_session"].is_null());
+        assert_eq!(r["notifications"].as_array().unwrap().len(), 0);
+
+        // The task's own session_id field must remain untouched (still None,
+        // not overwritten with the orphaned session).
+        let task: serde_json::Value = serde_json::from_str(&dag.get_task(task_id)).unwrap();
+        assert!(task["session_id"].is_null());
+        assert_eq!(task["status"]["type"], "cancelled");
+    }
+
+    #[test]
+    fn task_started_rejects_done_and_failed_tasks() {
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([
+            {"agent": "a", "prompt": "done-task", "depends_on": []},
+            {"agent": "b", "prompt": "failed-task", "depends_on": []},
+        ]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let ids = resp["task_ids"].as_array().unwrap();
+        let (done_id, failed_id) = (ids[0].as_str().unwrap(), ids[1].as_str().unwrap());
+
+        dag.tick();
+        dag.task_started(done_id, "ses_done");
+        dag.process_event("session.idle", "ses_done", "null");
+        dag.fail_task(failed_id, "boom").unwrap();
+
+        assert!(!dag.task_started(done_id, "ses_late_done"));
+        assert!(!dag.task_started(failed_id, "ses_late_failed"));
+    }
+
+    #[test]
+    fn task_started_accepts_pending_task_reset_by_fallback() {
+        // try_fallback() resets the task to Pending; task_started() must
+        // still accept a bind while the task sits Pending awaiting the next
+        // tick(), not just once it is Running again.
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([{
+            "agent": "a",
+            "prompt": "p",
+            "depends_on": [],
+            "fallback_models": ["openai/gpt-4o"]
+        }]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let task_id = resp["task_ids"][0].as_str().unwrap();
+
+        dag.tick();
+        assert!(dag.task_started(task_id, "ses_1"));
+        dag.process_event(
+            "session.error",
+            "ses_1",
+            &serde_json::json!({"error": "rate limit"}).to_string(),
+        );
+        dag.try_fallback(task_id, "rate limit").unwrap();
+
+        let task: serde_json::Value = serde_json::from_str(&dag.get_task(task_id)).unwrap();
+        assert_eq!(task["status"]["type"], "pending");
+
+        // Bind a new session while still Pending (before the next tick()).
+        assert!(dag.task_started(task_id, "ses_2"));
+        let task: serde_json::Value = serde_json::from_str(&dag.get_task(task_id)).unwrap();
+        assert_eq!(task["session_id"], "ses_2");
+    }
+
+    #[test]
+    fn task_started_returns_true_for_running_task() {
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([{"agent": "a", "prompt": "p", "depends_on": []}]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let task_id = resp["task_ids"][0].as_str().unwrap();
+
+        dag.tick();
+        assert!(dag.task_started(task_id, "ses_ok"));
+    }
+
+    #[test]
+    fn task_started_rejects_unknown_task() {
+        let mut dag = DagEngine::new();
+        assert!(!dag.task_started("nope", "ses_x"));
+    }
+
+    #[test]
+    fn cancel_task_cascades_to_transitive_dependents() {
+        let mut dag = DagEngine::new();
+        // Linear chain: t0 -> t1 -> t2
+        let tasks = serde_json::json!([
+            {"agent": "a", "prompt": "t0", "depends_on": []},
+            {"agent": "b", "prompt": "t1", "depends_on": [0]},
+            {"agent": "c", "prompt": "t2", "depends_on": [1]},
+        ]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let ids = resp["task_ids"].as_array().unwrap();
+        let (id0, id1, id2) = (
+            ids[0].as_str().unwrap(),
+            ids[1].as_str().unwrap(),
+            ids[2].as_str().unwrap(),
+        );
+
+        dag.tick();
+        dag.task_started(id0, "ses_0");
+
+        let cancel: serde_json::Value =
+            serde_json::from_str(&dag.cancel_task(id0).unwrap()).unwrap();
+        let cancelled_ids: Vec<&str> = cancel["cancelled_task_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(cancelled_ids.contains(&id0));
+        assert!(cancelled_ids.contains(&id1));
+        assert!(cancelled_ids.contains(&id2));
+        assert_eq!(cancelled_ids.len(), 3);
+
+        for id in [id0, id1, id2] {
+            let task: serde_json::Value = serde_json::from_str(&dag.get_task(id)).unwrap();
+            assert_eq!(task["status"]["type"], "cancelled");
+        }
+    }
+
+    #[test]
+    fn cancel_task_leaves_independent_branch_running() {
+        let mut dag = DagEngine::new();
+        // Two independent roots: t0 (to be cancelled) and t1 (independent, still pending).
+        let tasks = serde_json::json!([
+            {"agent": "a", "prompt": "t0", "depends_on": []},
+            {"agent": "b", "prompt": "t1", "depends_on": []},
+        ]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let wf_id = resp["workflow_id"].as_str().unwrap();
+        let ids = resp["task_ids"].as_array().unwrap();
+        let id0 = ids[0].as_str().unwrap();
+
+        dag.tick();
+        dag.cancel_task(id0).unwrap();
+
+        let wf: serde_json::Value = serde_json::from_str(&dag.get_workflow(wf_id)).unwrap();
+        assert_eq!(wf["status"]["type"], "running");
+    }
+
+    #[test]
+    fn cancel_workflow_cancels_pending_and_running_returns_sessions() {
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([
+            {"agent": "a", "prompt": "t0", "depends_on": []},
+            {"agent": "b", "prompt": "t1", "depends_on": []},
+        ]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let wf_id = resp["workflow_id"].as_str().unwrap();
+        let ids = resp["task_ids"].as_array().unwrap();
+        let (id0, id1) = (ids[0].as_str().unwrap(), ids[1].as_str().unwrap());
+
+        dag.tick();
+        dag.task_started(id0, "ses_0");
+        dag.task_started(id1, "ses_1");
+
+        let cancel: serde_json::Value =
+            serde_json::from_str(&dag.cancel_workflow(wf_id).unwrap()).unwrap();
+        let cancelled_ids: Vec<&str> = cancel["cancelled_task_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(cancelled_ids.len(), 2);
+        let session_ids: Vec<&str> = cancel["session_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(session_ids.contains(&"ses_0"));
+        assert!(session_ids.contains(&"ses_1"));
+
+        let wf: serde_json::Value = serde_json::from_str(&dag.get_workflow(wf_id)).unwrap();
+        assert_eq!(wf["status"]["type"], "cancelled");
+    }
+
+    #[test]
+    fn cancel_workflow_preserves_done_and_failed_tasks() {
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([
+            {"agent": "a", "prompt": "t0", "depends_on": []},
+            {"agent": "b", "prompt": "t1", "depends_on": []},
+        ]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let wf_id = resp["workflow_id"].as_str().unwrap();
+        let ids = resp["task_ids"].as_array().unwrap();
+        let (id0, id1) = (ids[0].as_str().unwrap(), ids[1].as_str().unwrap());
+
+        dag.tick();
+        dag.task_started(id0, "ses_done");
+        dag.task_started(id1, "ses_running");
+
+        // id0 completes; workflow stays Running because id1 is still Running.
+        dag.process_event("session.idle", "ses_done", "null");
+        let wf: serde_json::Value = serde_json::from_str(&dag.get_workflow(wf_id)).unwrap();
+        assert_eq!(wf["status"]["type"], "running");
+
+        // Now cancel the whole workflow: id0 (Done) must be untouched, id1 (Running) cancelled.
+        let cancel: serde_json::Value =
+            serde_json::from_str(&dag.cancel_workflow(wf_id).unwrap()).unwrap();
+        let cancelled_ids: Vec<&str> = cancel["cancelled_task_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(cancelled_ids, vec![id1]);
+
+        let task0: serde_json::Value = serde_json::from_str(&dag.get_task(id0)).unwrap();
+        assert_eq!(task0["status"]["type"], "done");
+        let task1: serde_json::Value = serde_json::from_str(&dag.get_task(id1)).unwrap();
+        assert_eq!(task1["status"]["type"], "cancelled");
+
+        let wf: serde_json::Value = serde_json::from_str(&dag.get_workflow(wf_id)).unwrap();
+        assert_eq!(wf["status"]["type"], "cancelled");
+    }
+
+    #[test]
+    fn workflow_cancelled_when_cancelled_tasks_terminalize() {
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([{"agent": "a", "prompt": "p", "depends_on": []}]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let wf_id = resp["workflow_id"].as_str().unwrap();
+        let task_id = resp["task_ids"][0].as_str().unwrap();
+
+        dag.tick();
+        dag.task_started(task_id, "ses_only");
+        dag.cancel_task(task_id).unwrap();
+
+        let wf: serde_json::Value = serde_json::from_str(&dag.get_workflow(wf_id)).unwrap();
+        assert_eq!(wf["status"]["type"], "cancelled");
+    }
+
+    #[test]
+    fn workflow_failed_takes_precedence_over_cancelled() {
+        let mut dag = DagEngine::new();
+        // Two independent tasks; one fails, one gets cancelled — workflow must end Failed.
+        let tasks = serde_json::json!([
+            {"agent": "a", "prompt": "t0", "depends_on": []},
+            {"agent": "b", "prompt": "t1", "depends_on": []},
+        ]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let wf_id = resp["workflow_id"].as_str().unwrap();
+        let ids = resp["task_ids"].as_array().unwrap();
+        let (id0, id1) = (ids[0].as_str().unwrap(), ids[1].as_str().unwrap());
+
+        dag.tick();
+        dag.task_started(id0, "ses_0");
+        dag.task_started(id1, "ses_1");
+
+        // Cancel id1 first (workflow still Running since id0 is still Running).
+        dag.cancel_task(id1).unwrap();
+        let wf: serde_json::Value = serde_json::from_str(&dag.get_workflow(wf_id)).unwrap();
+        assert_eq!(wf["status"]["type"], "running");
+
+        // Now fail id0 — Failed must take precedence over the earlier Cancelled task.
+        dag.fail_task(id0, "boom").unwrap();
+        let wf: serde_json::Value = serde_json::from_str(&dag.get_workflow(wf_id)).unwrap();
+        assert_eq!(wf["status"]["type"], "failed");
+        assert_eq!(wf["status"]["task_id"], id0);
+    }
+
+    #[test]
+    fn late_session_idle_after_cancel_is_noop() {
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([{"agent": "a", "prompt": "p", "depends_on": []}]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let task_id = resp["task_ids"][0].as_str().unwrap();
+
+        dag.tick();
+        dag.task_started(task_id, "ses_late");
+        dag.cancel_task(task_id).unwrap();
+
+        // The session mapping was removed by cancel_task; a late idle event must no-op.
+        let r: serde_json::Value =
+            serde_json::from_str(&dag.process_event("session.idle", "ses_late", "null")).unwrap();
+        assert!(r["delete_session"].is_null());
+        assert_eq!(r["notifications"].as_array().unwrap().len(), 0);
+
+        // Task status must remain Cancelled, not be resurrected to Done.
+        let task: serde_json::Value = serde_json::from_str(&dag.get_task(task_id)).unwrap();
+        assert_eq!(task["status"]["type"], "cancelled");
+    }
+
+    #[test]
+    fn try_fallback_rejects_cancelled_task() {
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([{
+            "agent": "a",
+            "prompt": "p",
+            "depends_on": [],
+            "fallback_models": ["openai/gpt-4o"]
+        }]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let task_id = resp["task_ids"][0].as_str().unwrap();
+
+        dag.tick();
+        dag.task_started(task_id, "ses_x");
+        dag.cancel_task(task_id).unwrap();
+
+        let err = dag.try_fallback(task_id, "some error").unwrap_err();
+        assert!(err.contains("cancelled"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn cancel_workflow_twice_errors() {
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([{"agent": "a", "prompt": "p", "depends_on": []}]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let wf_id = resp["workflow_id"].as_str().unwrap();
+
+        dag.tick();
+        dag.cancel_workflow(wf_id).unwrap();
+
+        let err = dag.cancel_workflow(wf_id).unwrap_err();
+        assert!(
+            err.contains("already terminal") || err.contains("terminal"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn snapshot_reports_cancelled_status() {
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([{"agent": "a", "prompt": "p", "depends_on": []}]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let wf_id = resp["workflow_id"].as_str().unwrap();
+        let task_id = resp["task_ids"][0].as_str().unwrap();
+
+        dag.tick();
+        dag.task_started(task_id, "ses_snap");
+        dag.cancel_task(task_id).unwrap();
+
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&dag.get_workflow_snapshot(wf_id)).unwrap();
+        assert_eq!(snapshot["status"]["type"], "cancelled");
+        let task = &snapshot["tasks"][0];
+        assert_eq!(task["id"], task_id);
+        assert_eq!(task["status"]["type"], "cancelled");
+
+        let summaries: serde_json::Value =
+            serde_json::from_str(&dag.list_workflow_summaries()).unwrap();
+        let summary = summaries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|wf| wf["id"] == wf_id)
+            .expect("workflow summary missing");
+        assert_eq!(summary["status"]["type"], "cancelled");
     }
 
     #[test]
@@ -1253,7 +1789,9 @@ mod tests {
 
         let review_json = r#"{"status": "approved", "reviewer_task_id": "reviewer-1", "summary": "Looks good", "findings": []}"#;
 
-        let err = dag.submit_review(&builder_task_id, review_json).unwrap_err();
+        let err = dag
+            .submit_review(&builder_task_id, review_json)
+            .unwrap_err();
         assert!(err.contains("is not done"), "unexpected: {err}");
 
         dag.process_event("session.idle", session_id, "{}");

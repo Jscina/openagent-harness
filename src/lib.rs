@@ -85,8 +85,8 @@ mod wasm {
             self.0.tick()
         }
 
-        pub fn task_started(&mut self, task_id: &str, session_id: &str) {
-            self.0.task_started(task_id, session_id);
+        pub fn task_started(&mut self, task_id: &str, session_id: &str) -> bool {
+            self.0.task_started(task_id, session_id)
         }
 
         pub fn process_event(
@@ -126,6 +126,12 @@ mod wasm {
 
         pub fn cancel_task(&mut self, id: &str) -> Result<String, JsValue> {
             self.0.cancel_task(id).map_err(|e| JsValue::from_str(&e))
+        }
+
+        pub fn cancel_workflow(&mut self, id: &str) -> Result<String, JsValue> {
+            self.0
+                .cancel_workflow(id)
+                .map_err(|e| JsValue::from_str(&e))
         }
 
         pub fn set_agent_fallbacks(&mut self, json: &str) {

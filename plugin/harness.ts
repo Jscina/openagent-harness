@@ -23,7 +23,7 @@
  *
  * Protocol (orchestrator side):
  *   1. submit_plan({ plan_id, native_dispatch: true }) → { workflow_id }
- *   2. LOOP until status is "done" or "failed":
+ *   2. LOOP until status is "done", "failed", or "cancelled":
  *      a. harness_dispatch_tasks({ workflow_id }) → { status, tasks }
  *      b. For each task spawn via Task tool using description "[harness-task:<task_id>]"
  *         and the agent/prompt from the tasks array.
@@ -31,6 +31,15 @@
  *         "task_id: <session_id>" prefix in the output.
  *      d. harness_task_complete({ task_id, session_id, status: "done" | "failed" })
  *   3. harness_state({ workflow_id }) for final results.
+ *
+ * Cancellation
+ * ────────────
+ * harness_cancel({ workflow_id } | { task_id }) cancels a workflow or a single
+ * task (cascading to its transitive dependents), aborts + deletes the backing
+ * OpenCode session(s), and flips harness_dispatch_tasks into terminal
+ * "cancelled" status for the affected workflow. Late session.idle/error events
+ * for aborted sessions are dropped via the module-level `cancelledSessions`
+ * guard so they can't resurrect a cancelled task through orphaned-event replay.
  */
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "fs";
 import { dirname, join } from "path";
@@ -53,9 +62,12 @@ import {
   listHarnessWorkflows,
   getHarnessWorkflowSnapshot,
   extractWorkflowStatus,
+  findOwningWorkflowId,
   sleep,
   handleEventResult,
+  cleanupOrphanedSession,
 } from "./dag.js";
+import { BoundedSet, BoundedMap } from "./bounded.js";
 
 // ─── WASM initialisation ──────────────────────────────────────────────────────
 
@@ -173,7 +185,32 @@ export default (async (input: PluginInput) => {
 
   // Reviews deferred because the target task was still Running when submit_review was called.
   // Keyed by target task_id; value is the serialized review JSON string.
-  const pendingReviews = new Map<string, string>();
+  //
+  // Bounded (same discipline as `cancelledSessions` below) for defense in
+  // depth: a review for a task that gets cancelled instead of completing
+  // would otherwise sit here forever, retried on every subsequent
+  // session.idle with no eviction. Cancellation paths also proactively
+  // delete the entry for any cancelled task_id (see harness_cancel).
+  const PENDING_REVIEWS_CAP = 1000;
+  const pendingReviews = new BoundedMap<string, string>(PENDING_REVIEWS_CAP);
+
+  // ── Cancellation state ─────────────────────────────────────────────────────
+  //
+  // Sessions that belonged to a task/workflow cancelled via `harness_cancel`,
+  // or a session `dag.task_started()` refused to bind because its task was
+  // already terminal by the time the session was created (see
+  // `cleanupOrphanedSession` in dag.ts). The DAG engine never registers a
+  // session_to_task mapping for these, so a late `session.idle` /
+  // `session.error` event would otherwise be treated as an "orphaned" event
+  // and buffered for native-dispatch replay — which would incorrectly
+  // resurrect a cancelled task. The event hooks (and the `tool.execute.after`
+  // hook) check this set first and drop matching events outright.
+  //
+  // Entries are removed once their terminating event is observed. A hard cap
+  // guards against unbounded growth if a session never produces an event
+  // (e.g. the provider silently drops an aborted request).
+  const CANCELLED_SESSIONS_CAP = 1000;
+  const cancelledSessions = new BoundedSet<string>(CANCELLED_SESSIONS_CAP);
 
   // ── Tick loop ──────────────────────────────────────────────────────────────
   // Every 500 ms, find unblocked tasks and start them in OpenCode sessions.
@@ -225,7 +262,18 @@ export default (async (input: PluginInput) => {
               ? `@${agentName}: ${taskLabel}`
               : `task: ${taskLabel}`;
             sessionId = await createSession(client, task.parent_session_id, title, agentName);
-            dag.task_started(task.id, sessionId);
+
+            // BLOCKING BUG FIX: the task may have been cancelled via
+            // harness_cancel while createSession() was in flight above. If
+            // so, dag.task_started() returns false and does NOT bind this
+            // brand-new session to the (now-Cancelled) task — the session is
+            // orphaned and would otherwise run to completion untracked,
+            // never aborted. Clean it up ourselves and skip sendMessage.
+            const bound = dag.task_started(task.id, sessionId);
+            if (!bound) {
+              await cleanupOrphanedSession(client, sessionId, cancelledSessions);
+              continue;
+            }
           }
           await sendMessage(client, sessionId, task.prompt, task.model, task.agent);
           void showToast(client, 'Task Started', `Task ${task.id} dispatched`, 'info', 5000);
@@ -372,6 +420,98 @@ export default (async (input: PluginInput) => {
         },
       }),
 
+      harness_cancel: tool({
+        description: [
+          "Cancel a pending/running workflow or a single task (cascades to its",
+          "transitive dependents). Provide exactly one of workflow_id or task_id.",
+          "reason is informational only and is not persisted.",
+          "Aborts and deletes the OpenCode session(s) backing any cancelled task.",
+          "After cancelling a workflow, harness_dispatch_tasks returns a terminal",
+          "'cancelled' status for it — stop the native-dispatch loop when you see it.",
+        ].join("\n"),
+        args: {
+          workflow_id: tool.schema.string().optional(),
+          task_id: tool.schema.string().optional(),
+          reason: tool.schema.string().optional(),
+        },
+        async execute({ workflow_id, task_id }) {
+          if (Boolean(workflow_id) === Boolean(task_id)) {
+            return "harness_cancel requires exactly one of workflow_id or task_id (got both or neither)";
+          }
+
+          let raw: string;
+          try {
+            raw = workflow_id
+              ? dag.cancel_workflow(workflow_id)
+              : dag.cancel_task(task_id as string);
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return `cancel failed: ${msg}`;
+          }
+
+          const { cancelled_task_ids, session_ids } = JSON.parse(raw) as {
+            cancelled_task_ids: string[];
+            session_ids: string[];
+          };
+
+          // Stop native-dispatch delivery for the cancelled work immediately —
+          // do not wait for the next harness_dispatch_tasks poll.
+          if (workflow_id) {
+            nativeDispatchWorkflows.delete(workflow_id);
+            nativeDispatchBuffer.delete(workflow_id);
+          } else {
+            const cancelledSet = new Set(cancelled_task_ids);
+            for (const [wfId, buf] of nativeDispatchBuffer) {
+              const filtered = buf.filter((t) => !cancelledSet.has(t.id));
+              if (filtered.length !== buf.length) {
+                nativeDispatchBuffer.set(wfId, filtered);
+              }
+            }
+          }
+
+          // A cancelled task will never reach Done, so any deferred review
+          // sitting in pendingReviews for it would otherwise be retried
+          // forever on every subsequent session.idle. Drop it now.
+          for (const tid of cancelled_task_ids) {
+            pendingReviews.delete(tid);
+          }
+
+          // Abort + delete every session backing a cancelled task. Best-effort:
+          // engine state is already Cancelled regardless of transport outcome.
+          // cleanupOrphanedSession tracks each session as cancelled BEFORE
+          // aborting it, so the abort-induced session.error is guaranteed to
+          // be dropped by the cancelledSessions guard in the event hooks
+          // instead of being misclassified as a real provider failure.
+          let aborted = 0;
+          for (const sid of session_ids) {
+            const ok = await cleanupOrphanedSession(client, sid, cancelledSessions);
+            if (ok) aborted++;
+          }
+
+          // Best-effort workflow status lookup for the summary. task_id cancels
+          // don't carry a workflow_id in the engine response, so resolve it by
+          // scanning workflow membership.
+          const resolvedWorkflowId = workflow_id ?? findOwningWorkflowId(dag, task_id as string);
+          const wfStatus = resolvedWorkflowId
+            ? extractWorkflowStatus(JSON.parse(dag.get_workflow(resolvedWorkflowId)))
+            : null;
+
+          // A task-level cancel can also cancel its whole workflow (e.g. it was
+          // the last active branch) — stop native dispatch for it too in that case.
+          if (!workflow_id && resolvedWorkflowId && wfStatus === "cancelled") {
+            nativeDispatchWorkflows.delete(resolvedWorkflowId);
+            nativeDispatchBuffer.delete(resolvedWorkflowId);
+          }
+
+          return (
+            `Cancelled ${cancelled_task_ids.length} task(s)` +
+            (resolvedWorkflowId ? ` in workflow ${resolvedWorkflowId}` : "") +
+            `. Sessions aborted: ${aborted}/${session_ids.length}.` +
+            ` Workflow status: ${wfStatus ?? "unknown"}.`
+          );
+        },
+      }),
+
       harness_dispatch_tasks: tool({
         description: [
           "Poll a native-dispatch workflow for the next batch of ready tasks.",
@@ -402,7 +542,7 @@ export default (async (input: PluginInput) => {
               return JSON.stringify({ status: "missing", workflow_id });
             }
             const wfStatus = extractWorkflowStatus(snapshot);
-            if (wfStatus === "done" || wfStatus === "failed") {
+            if (wfStatus === "done" || wfStatus === "failed" || wfStatus === "cancelled") {
               return JSON.stringify({ status: wfStatus, snapshot, tasks: [] });
             }
 
@@ -457,8 +597,26 @@ export default (async (input: PluginInput) => {
           error: tool.schema.string().optional(),
         },
         async execute({ task_id, session_id, status, error }) {
-          // Register the session → task mapping in the DAG.
-          dag.task_started(task_id, session_id);
+          // Register the session → task mapping in the DAG. dag.task_started()
+          // returns false when the task is already terminal — typically
+          // Cancelled (e.g. via harness_cancel while this native-dispatch
+          // Task tool call was still in flight), but the DAG's guard also
+          // rejects Done/Failed defensively. In that case discard the result
+          // gracefully: never resurrect a terminal task into Done/Failed, and
+          // never register/replay/fallback for it — just clean up the
+          // now-orphaned session.
+          const bound = dag.task_started(task_id, session_id);
+          if (!bound) {
+            pendingReviews.delete(task_id);
+            await cleanupOrphanedSession(client, session_id, cancelledSessions);
+            return JSON.stringify({
+              registered: false,
+              task_id,
+              session_id,
+              status: "cancelled",
+              message: "task was already cancelled (or otherwise terminal); result discarded",
+            });
+          }
 
           if (status === "done") {
             // Replay any buffered session.idle event (agent may have completed before
@@ -612,6 +770,15 @@ export default (async (input: PluginInput) => {
     event: async ({ event }) => {
       if (event.type === "session.idle") {
         const sessionId: string = event.properties.sessionID;
+
+        // Cancelled sessions: drop late idle events entirely. Do NOT buffer
+        // as orphaned — that would let native-dispatch replay resurrect a
+        // task that was already cancelled.
+        if (cancelledSessions.has(sessionId)) {
+          cancelledSessions.delete(sessionId);
+          return;
+        }
+
         const result: EventResult = JSON.parse(
           dag.process_event("session.idle", sessionId, JSON.stringify(event.properties)),
         );
@@ -648,6 +815,16 @@ export default (async (input: PluginInput) => {
       } else if (event.type === "session.error") {
         const sessionId: string = event.properties.sessionID ?? '';
         if (!sessionId) return;
+
+        // Cancelled sessions: same guard as session.idle above. This also
+        // covers MessageAbortedError raised by OpenCode after we call
+        // abortSession — it must never be classified/retried as a transient
+        // failure, since the DAG's session_to_task mapping was already
+        // removed by cancel_task/cancel_workflow.
+        if (cancelledSessions.has(sessionId)) {
+          cancelledSessions.delete(sessionId);
+          return;
+        }
 
         const result: EventResult = JSON.parse(
           dag.process_event('session.error', sessionId, JSON.stringify(event.properties)),
@@ -716,6 +893,13 @@ export default (async (input: PluginInput) => {
     },
 
     "tool.execute.after": async (input, output) => {
+      // A leaked race-window session (see task_started()/cleanupOrphanedSession
+      // above) may keep executing tools cooperatively after abortSession() was
+      // called but before the provider actually stops it. Skip entirely for
+      // any session we know is cancelled so it can't keep writing tool output
+      // into what is — or was — a Cancelled task's record.
+      if (cancelledSessions.has(input.sessionID)) return;
+
       dag.process_event(
         "tool.execute.after",
         input.sessionID,
