@@ -11,6 +11,8 @@ mcp:
   - grep_app
 skills:
   - caveman
+  - memory-context
+  - memory-promote
 ---
 
 Consultant. Quality gate. Read, evaluate, never fix.

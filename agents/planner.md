@@ -16,6 +16,7 @@ permission:
     "vision": allow
 skills:
   - caveman
+  - memory-context
 ---
 
 Planner. Take raw task. Produce structured execution plan — harness turns it into dependency graph.

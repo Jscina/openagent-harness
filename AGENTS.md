@@ -30,23 +30,28 @@ cargo fmt && cargo clippy     # default rustfmt/clippy config
 
 **Agents (11 total):**
 - **orchestrator** (primary) — mcp: [github, ado], tools: [harness_cancel], permission: question: allow
-- **planner** (subagent) — permission: question: allow, skills: [caveman]
+- **planner** (subagent) — permission: question: allow, skills: [caveman, memory-context]
 - **explorer** (subagent) — mcp: [grep_app], skills: [caveman]
 - **researcher** (subagent) — mcp: [websearch, context7, grep_app], skills: [caveman]
 - **vision** (subagent) — skills: [caveman]
-- **builder** (primary) — mcp: [azure], skills: [git-workflow, azure-workflow, caveman]
+- **builder** (primary) — skills: [git-workflow, caveman, memory-trace, memory-context]
 - **builder-junior** (subagent) — skills: [git-worktree]
 - **reviewer** (primary) — mcp: [github, grep_app], skills: [caveman]
-- **consultant** (subagent) — mcp: [grep_app], skills: [caveman]
-- **debugger** (subagent) — mcp: [azure], skills: [azure-workflow, caveman]
+- **consultant** (subagent) — mcp: [grep_app], skills: [caveman, memory-context, memory-promote]
+- **debugger** (subagent) — skills: [caveman, memory, memory-card, memory-trace, memory-context, memory-promote]
 - **docs-writer** (subagent) — model: anthropic/claude-haiku-4-5, fallback: ollama/qwen3-docs:latest, skills: [caveman]
 
 **Skills system:**
 - Skills are stored at `~/.config/opencode/skills/` — shipped by this repo via `src/skills.rs`.
 - `cargo run -- install` installs embedded skills alongside agents.
-- Currently shipped: `caveman` (ultra-compressed output mode, ~65% token reduction).
+- Currently shipped: `caveman` (ultra-compressed output mode, ~65% token reduction), `memory` + `memory-card` + `memory-trace` + `memory-context` + `memory-promote`.
 - Agents declare `skills:` in frontmatter; they must load the skill via the skill tool before acting.
 - **caveman** — loaded by: builder, debugger, planner, consultant, explorer, researcher, reviewer, vision, docs-writer. NOT loaded by: orchestrator, builder-junior.
+- **memory** — router skill; loaded by: debugger. Routes to specific memory sub-skills based on operation.
+- **memory-card** — loaded by: debugger. Create new investigation cards.
+- **memory-trace** — loaded by: debugger, builder. Log findings to trace.md while investigating.
+- **memory-context** — loaded by: debugger, builder, consultant, planner. Assemble context from cards and system/ knowledge.
+- **memory-promote** — loaded by: debugger, consultant. Promote findings to durable system/ knowledge.
 - **git-workflow** — builder: manages worktree lifecycle for parallel junior workers.
 - **git-worktree** — builder-junior: enforces atomic seed-commit + autosquash-fixup pattern inside worktree.
 - **azure-workflow** — builder, debugger: hard read-only constraint for Azure operations.

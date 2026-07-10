@@ -137,7 +137,6 @@ Agents declare skills in frontmatter; they are loaded on demand via the `skill` 
 | --- | --- | --- |
 | `git-workflow` | `builder` | Manages worktree lifecycle for parallel junior workers |
 | `git-worktree` | `builder-junior` | Enforces atomic seed-commit + autosquash-fixup pattern |
-| `azure-workflow` | `builder`, `debugger` | Hard read-only constraint for Azure operations |
 | `pr-workflow` | `orchestrator` | PR creation and lifecycle management |
 
 ## Fallback behavior
@@ -170,6 +169,68 @@ Workflow snapshots expose:
 
 This makes active model selection and fallback history observable during execution.
 
+## Memory (RAG)
+
+A two-layer file-based investigation memory system, rooted at `<project>/.opencode/memory/`:
+
+- **`system/`** (committed) — durable, long-term knowledge about the codebase: architecture, schemas, services, known behaviors
+- **`issues/`** (mostly local) — per-investigation cards across their lifecycle: backlog (planned), active (under investigation), done (finished locally), archive (durable shared record)
+
+Each card holds `context.md` (issue summary), `trace.md` (append-only investigation log), `benchmarks.md` (findings to promote), and `artifacts/` (code/DDL snippets). The system is modeled on the `rag` Claude plugin's card/trace/context/promote pattern, but reimplemented entirely in TypeScript (no CLI, no Rust counterpart) — a single coherent implementation rather than two separate ones.
+
+### Four memory tools
+
+All exposed by the plugin and managed through five companion skills:
+
+| Tool | Arguments | Purpose |
+| --- | --- | --- |
+| `memory_card` | `cardId, symptom?, source?, backlog?` | Create a new investigation card (active by default; pass `backlog: true` to park an idea without a symptom). Auto-scaffolds the corpus on first use. |
+| `memory_trace` | `cardId, type, body, session?` | Append a structured entry (finding/ruled-out/hypothesis/next-step) to an active card's trace.md. Append-only, never rewrites. |
+| `memory_context` | `cardId, mode?, sections?` | Assemble a focused markdown context payload from the card (context.md/trace.md/benchmarks.md) and selected system/ sections. Mode: `compact` (headings only, default) or `full` (complete record). |
+| `memory_promote` | `cardId, finding, targetPath, impact?, title?, sectionTitle?` | Promote a confirmed finding from an active card to durable `system/` knowledge (creates or appends to the target file), and record a `promoted` entry in the card's benchmarks.md. Never touches trace.md. |
+
+### Skills assignment
+
+Five skills are shipped and auto-installed:
+
+| Skill | Used by | Purpose |
+| --- | --- | --- |
+| `memory` | debugger | Router — load this first, then the specific sub-skill for the operation |
+| `memory-card` | debugger | Create investigation cards |
+| `memory-trace` | debugger, builder | Log findings to trace.md while investigating |
+| `memory-context` | debugger, builder, consultant, planner | Assemble context for resuming sessions or gathering prior analysis |
+| `memory-promote` | debugger, consultant | Promote findings to durable system/ knowledge |
+
+### Commit boundary: `.opencode/memory/.gitignore`
+
+The corpus generates its own nested `.gitignore`, enforcing:
+
+- **Ignored** (local working state): `issues/backlog/`, `issues/active/`, `issues/done/`, and all `trace.md` (even inside `issues/archive/`)
+- **Committed**: `system/**` and `issues/archive/**` minus `trace.md` (i.e., `context.md`, `benchmarks.md`, `artifacts/`)
+
+The harness repo itself ignores `.opencode/` wholesale (via root `.gitignore`), which is intentional and untouched. For **consumer projects** adopting the harness, if a root `.opencode/` ignore rule swallows the memory corpus, restore it with:
+
+```gitignore
+.opencode/*
+!.opencode/memory/
+```
+
+The nested corpus `.gitignore` then still excludes local card state, yielding the intended boundary.
+
+### Auto-trace-on-failure
+
+When a task fails, the plugin attempts a best-effort trace: if there is **exactly one** active investigation card (unambiguous attribution), it logs the failure to that card's trace.md as a `finding` entry. If zero or multiple cards are active, the trace is silently skipped — there is no unambiguous card to attribute the failure to. This behavior is strictly additive: any corpus/filesystem failure is never fatal to the task-failure flow. See `harness_task_complete` in `plugin/harness.ts` (lines 711–730).
+
+### Out of scope (by design)
+
+Not included, deferred, or not planned:
+
+- No CLI (rag-style `rag-new-card` / `rag-trace` / `rag-promote` scripts) — all operations are tool-driven
+- No embeddings or semantic search — purely file-based, searchable via grep/browser
+- No MCP server — memory is a plugin-local corpus, not a remote service
+- No schema migration or versioning tooling — `.rag-meta.json` is informational only
+- No changes to `src/dag.rs`, `src/lib.rs`, or WASM interface — memory is pure TypeScript
+
 ## Plugin tool exports
 
 The following tools are exposed by the plugin to OpenCode agents:
@@ -182,8 +243,12 @@ The following tools are exposed by the plugin to OpenCode agents:
 | `harness_state(workflow_id?)` | Query workflow snapshot; lists all workflows if no ID given |
 | `harness_dispatch_tasks(workflow_id)` | Native dispatch: poll for ready tasks; blocks until at least one is ready |
 | `harness_task_complete(task_id, session_id, status)` | Native dispatch: register task completion after Task tool call returns |
-| `harness_cancel(workflow_id\|task_id)` | Cancel a workflow or task; aborts in-flight sessions and cascades to dependents |
+| `harness_cancel(workflow_id\|task_id)` | Cancel a pending/running workflow or task; aborts in-flight sessions and cascades to dependents |
 | `submit_review(task_id, review_json)` | Attach structured review feedback to a completed task |
+| `memory_card(cardId, symptom?, source?, backlog?)` | Create a new investigation card |
+| `memory_trace(cardId, type, body, session?)` | Append a trace entry to an active card |
+| `memory_context(cardId, mode?, sections?)` | Assemble context from a card and system/ knowledge |
+| `memory_promote(cardId, finding, targetPath, impact?, title?, sectionTitle?)` | Promote a finding to system/ knowledge |
 
 ## Environment
 

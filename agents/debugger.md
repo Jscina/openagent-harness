@@ -9,6 +9,11 @@ permission:
   edit: deny
 skills:
   - caveman
+  - memory
+  - memory-card
+  - memory-trace
+  - memory-context
+  - memory-promote
 ---
 
 Debugger. Investigate failures, return diagnosis. No fixes — tell builder what's wrong and how.

@@ -68,6 +68,7 @@ import {
   cleanupOrphanedSession,
 } from "./dag.js";
 import { BoundedSet, BoundedMap } from "./bounded.js";
+import { createCard, appendTrace, assembleContext, promoteFinding, listActiveCards } from "./memory.js";
 
 // ─── WASM initialisation ──────────────────────────────────────────────────────
 
@@ -310,8 +311,15 @@ export default (async (input: PluginInput) => {
     }
   }, 500);
 
-  // Cleanup on process exit.
+  // Cleanup on process exit. Idempotent: SIGTERM/SIGINT below call cleanup()
+  // then process.exit(0), and process.exit() itself re-fires the "exit"
+  // listener registered next — without this guard that second invocation
+  // would call dag.free() on an already-freed WASM object and crash with
+  // "null pointer passed to rust" while the process is tearing down.
+  let cleaned = false;
   const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
     clearInterval(tickInterval);
     dag.free();
   };
@@ -700,6 +708,27 @@ export default (async (input: PluginInput) => {
               // already terminal
             }
 
+            // Best-effort auto-trace: if there is exactly one active
+            // investigation card, log this task failure to its trace.md so
+            // the context isn't lost. Deliberately skipped when zero or
+            // multiple cards are active — there's no unambiguous card to
+            // attribute the failure to, and guessing would pollute the
+            // wrong card's trace. This is strictly additive: any failure
+            // here (missing corpus, fs error, whatever) must never affect
+            // the dag.fail_task outcome above or the response below.
+            try {
+              const activeCards = listActiveCards();
+              if (activeCards.length === 1) {
+                appendTrace({
+                  cardId: activeCards[0],
+                  type: "finding",
+                  body: `Task ${task_id} failed: ${errMsg}`,
+                });
+              }
+            } catch (e) {
+              console.error("[harness] auto-trace on task failure skipped (non-fatal):", e);
+            }
+
             return JSON.stringify({
               registered: true,
               task_id,
@@ -747,6 +776,18 @@ export default (async (input: PluginInput) => {
 
           const reviewJson = JSON.stringify(review);
 
+          // TODO: auto-trace on blocking review findings deferred — this
+          // payload only carries task_id/status/summary/findings, with no
+          // card_id. Auto-tracing here would need an explicit task->card
+          // mapping (e.g. a card_id field on the review, or a lookup keyed
+          // off task metadata) before it could attribute a "blocked" finding
+          // to the right investigation card reliably. The single-active-card
+          // heuristic used in harness_task_complete is a reasonable
+          // best-effort fallback for task *failures*, but a review can be
+          // submitted against a task in a different, unrelated workflow than
+          // whatever card happens to be active — silently tracing to the
+          // wrong card would be worse than not tracing at all.
+
           try {
             return dag.submit_review(task_id, reviewJson);
           } catch (err: unknown) {
@@ -762,6 +803,106 @@ export default (async (input: PluginInput) => {
               });
             }
             throw err;
+          }
+        },
+      }),
+
+      memory_card: tool({
+        description: [
+          "Create a new investigation card under .opencode/memory/issues/.",
+          "Active cards (default) require a symptom. Pass backlog:true to park",
+          "a not-yet-started idea instead (context.md only, no symptom required).",
+          "Refuses if the card already exists in any lifecycle state.",
+        ].join("\n"),
+        args: {
+          cardId: tool.schema.string(),
+          symptom: tool.schema.string().optional(),
+          source: tool.schema.enum(["ado", "qa", "prod", "other"]).optional(),
+          backlog: tool.schema.boolean().optional(),
+        },
+        async execute({ cardId, symptom, source, backlog }) {
+          try {
+            const created = createCard({ cardId, symptom, source, backlog });
+            return JSON.stringify({ success: true, cardId, created });
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            throw new Error(`memory_card failed: ${msg}`);
+          }
+        },
+      }),
+
+      memory_trace: tool({
+        description: [
+          "Append a structured trace entry (finding, ruled-out, hypothesis, or",
+          "next-step) to an active investigation card's trace.md. Append-only —",
+          "never rewrites prior entries. Refuses if the card is not active.",
+        ].join("\n"),
+        args: {
+          cardId: tool.schema.string(),
+          type: tool.schema.enum(["finding", "ruled-out", "hypothesis", "next-step"]),
+          body: tool.schema.string(),
+          session: tool.schema.string().optional(),
+        },
+        async execute({ cardId, type, body, session }) {
+          try {
+            const result = appendTrace({ cardId, type, body, session });
+            return result.formatted;
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            throw new Error(`memory_trace failed: ${msg}`);
+          }
+        },
+      }),
+
+      memory_context: tool({
+        description: [
+          "Assemble a focused markdown context payload for an investigation card,",
+          "pulling from its context.md/trace.md/benchmarks.md and selected system/",
+          "knowledge sections. Use mode:'compact' (default) to prime a new session",
+          "cheaply, or mode:'full' for the complete record.",
+        ].join("\n"),
+        args: {
+          cardId: tool.schema.string(),
+          mode: tool.schema.enum(["compact", "full"]).optional(),
+          sections: tool.schema.array(tool.schema.string()).optional(),
+        },
+        async execute({ cardId, mode, sections }) {
+          try {
+            return assembleContext({ cardId, mode, sections });
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            throw new Error(`memory_context failed: ${msg}`);
+          }
+        },
+      }),
+
+      memory_promote: tool({
+        description: [
+          "Promote a confirmed finding from an investigation card to durable",
+          "system/ knowledge (creating or appending to the target file), and",
+          "record a 'promoted' entry in the card's benchmarks.md. Never touches",
+          "trace.md.",
+        ].join("\n"),
+        args: {
+          cardId: tool.schema.string(),
+          finding: tool.schema.string(),
+          impact: tool.schema.string().optional(),
+          targetPath: tool.schema.string(),
+          title: tool.schema.string().optional(),
+          sectionTitle: tool.schema.string().optional(),
+        },
+        async execute({ cardId, finding, impact, targetPath, title, sectionTitle }) {
+          try {
+            const result = promoteFinding({ cardId, finding, impact, targetPath, title, sectionTitle });
+            return JSON.stringify({
+              success: true,
+              systemPath: result.systemPath,
+              benchmarksPath: result.benchmarksPath,
+              created: result.created,
+            });
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            throw new Error(`memory_promote failed: ${msg}`);
           }
         },
       }),

@@ -5,11 +5,38 @@ use anyhow::{Context, Result};
 /// Each entry is `(skill_name, filename, content)`.
 ///
 /// Used by the native `install` subcommand (`cargo run -- install`).
-pub const SKILLS: &[(&str, &str, &str)] = &[(
-    "caveman",
-    "SKILL.md",
-    include_str!("../skills/caveman/SKILL.md"),
-)];
+pub const SKILLS: &[(&str, &str, &str)] = &[
+    (
+        "caveman",
+        "SKILL.md",
+        include_str!("../skills/caveman/SKILL.md"),
+    ),
+    (
+        "memory",
+        "SKILL.md",
+        include_str!("../skills/memory/SKILL.md"),
+    ),
+    (
+        "memory-card",
+        "SKILL.md",
+        include_str!("../skills/memory-card/SKILL.md"),
+    ),
+    (
+        "memory-trace",
+        "SKILL.md",
+        include_str!("../skills/memory-trace/SKILL.md"),
+    ),
+    (
+        "memory-context",
+        "SKILL.md",
+        include_str!("../skills/memory-context/SKILL.md"),
+    ),
+    (
+        "memory-promote",
+        "SKILL.md",
+        include_str!("../skills/memory-promote/SKILL.md"),
+    ),
+];
 
 /// Write all embedded skill files to `~/.config/opencode/skills/<skill_name>/`.
 pub fn install(force: bool) -> Result<()> {
@@ -60,9 +87,20 @@ mod tests {
 
     #[test]
     fn skills_has_expected_entries() {
-        assert_eq!(SKILLS.len(), 1);
+        assert_eq!(SKILLS.len(), 6);
         let names: Vec<&str> = SKILLS.iter().map(|(n, _, _)| *n).collect();
         assert!(names.contains(&"caveman"), "missing skill: caveman");
+        assert!(names.contains(&"memory"), "missing skill: memory");
+        assert!(names.contains(&"memory-card"), "missing skill: memory-card");
+        assert!(names.contains(&"memory-trace"), "missing skill: memory-trace");
+        assert!(
+            names.contains(&"memory-context"),
+            "missing skill: memory-context"
+        );
+        assert!(
+            names.contains(&"memory-promote"),
+            "missing skill: memory-promote"
+        );
     }
 
     #[test]
