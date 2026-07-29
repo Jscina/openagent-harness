@@ -1,14 +1,12 @@
 ---
-model: anthropic/claude-opus-4-6
+model: anthropic/claude-opus-5
 fallback_models:
-  - openai/gpt-5.4
   - ollama/qwen3-coder-builder:latest
 description: Failure investigation specialist. Diagnoses test failures and runtime errors for builder. Returns root cause and a fix approach. Never makes code changes.
 mode: subagent
 permission:
   edit: deny
 skills:
-  - caveman
   - memory
   - memory-card
   - memory-trace
