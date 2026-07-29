@@ -6,6 +6,7 @@ import {
   sleep,
   handleEventResult,
   cleanupOrphanedSession,
+  bindSessionOrCleanup,
 } from './dag.js';
 import { BoundedSet } from './bounded.js';
 
@@ -323,10 +324,44 @@ describe('cleanupOrphanedSession', () => {
     expect(cancelledSessions.has('ses_fail')).toBe(true);
   });
 
-  it('simulates the createSession/task_started race: an orphaned session is cleaned up and cannot resurrect the task via a late event', async () => {
-    // Simulate the exact regression scenario: dag.tick() returned a task,
-    // createSession() resolved, but the task was cancelled in the meantime —
-    // so dag.task_started() (mocked here) returns false.
+});
+
+// ─── bindSessionOrCleanup ───────────────────────────────────────────────────
+//
+// This is the single shared call site for "bind via task_started(), clean up
+// if the DAG refuses" — used by the tick loop's fresh-session path, its
+// session-reuse path (existing_session_id), and harness_task_complete. It
+// replaces three previously-separate inline copies of this pattern, one of
+// which (the reuse path) had silently dropped the bound-check entirely.
+// Testing the real function here (rather than re-inlining the pattern in
+// the test, as the previous version of this suite did) is exactly what
+// would have caught that drift.
+
+describe('bindSessionOrCleanup', () => {
+  it('returns true and leaves the session alone when task_started binds successfully', async () => {
+    const dag = { task_started: vi.fn().mockReturnValue(true) } as any;
+    const cancelledSessions = new BoundedSet<string>(1000);
+    const client = {
+      session: {
+        abort: vi.fn().mockResolvedValue(undefined),
+        delete: vi.fn().mockResolvedValue({}),
+      },
+    } as any;
+
+    const result = await bindSessionOrCleanup(dag, client, 'task_1', 'ses_ok', cancelledSessions);
+
+    expect(result).toBe(true);
+    expect(dag.task_started).toHaveBeenCalledWith('task_1', 'ses_ok');
+    expect(client.session.abort).not.toHaveBeenCalled();
+    expect(client.session.delete).not.toHaveBeenCalled();
+    expect(cancelledSessions.has('ses_ok')).toBe(false);
+  });
+
+  it('simulates the createSession/task_started race: returns false and cleans up the orphaned session so it cannot resurrect the task via a late event', async () => {
+    // Regression scenario: dag.tick() returned a task (fresh session) or a
+    // reuse_session pre-assignment picked one back up (existing_session_id),
+    // but the task was cancelled via harness_cancel in the meantime — so
+    // dag.task_started() (mocked here) returns false.
     const dag = { task_started: vi.fn().mockReturnValue(false) } as any;
     const cancelledSessions = new BoundedSet<string>(1000);
     const client = {
@@ -337,13 +372,10 @@ describe('cleanupOrphanedSession', () => {
     } as any;
 
     const sessionId = 'ses_race';
-    const bound = dag.task_started('task_1', sessionId);
-    expect(bound).toBe(false);
+    const result = await bindSessionOrCleanup(dag, client, 'task_1', sessionId, cancelledSessions);
 
-    if (!bound) {
-      await cleanupOrphanedSession(client, sessionId, cancelledSessions);
-    }
-
+    expect(result).toBe(false);
+    expect(dag.task_started).toHaveBeenCalledWith('task_1', sessionId);
     // The orphaned session was aborted and deleted...
     expect(client.session.abort).toHaveBeenCalledWith({ path: { id: sessionId } });
     expect(client.session.delete).toHaveBeenCalledWith({ path: { id: sessionId } });

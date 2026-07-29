@@ -108,6 +108,49 @@ export async function cleanupOrphanedSession(
   return aborted;
 }
 
+/**
+ * Bind `sessionId` to `taskId` via `dag.task_started()`, cleaning up the
+ * session as orphaned if the DAG refuses the bind.
+ *
+ * This is the single call site for the "bind, then check, then clean up if
+ * rejected" pattern required at every place a session gets associated with
+ * a task: `dag.task_started()` returns `false` whenever the task is already
+ * terminal (typically `Cancelled` via a concurrent `harness_cancel`, but the
+ * DAG's guard also covers `Done`/`Failed` defensively) — see
+ * `DagEngine::task_started` in `src/dag.rs`. That can happen at any of these
+ * call sites:
+ *   - tick loop, fresh session: `harness_cancel` lands while `createSession()`
+ *     was in flight.
+ *   - tick loop, reused session (`existing_session_id`): `harness_cancel`
+ *     lands in the tick-interval-sized gap between the reuse pre-assignment
+ *     (`handleEventResult`, when the prior task went idle) and this tick
+ *     picking the task back up.
+ *   - `harness_task_complete` (native dispatch): `harness_cancel` lands while
+ *     the Task tool call was still in flight.
+ *
+ * Routing every call through this one function means the return value can
+ * never be silently discarded at a new (or existing) call site — which is
+ * exactly how the reuse-path gap above went unguarded while the other two
+ * call sites were already fixed.
+ *
+ * @returns `true` if the bind succeeded, `false` if the session was cleaned
+ *   up as orphaned instead (caller must not send/replay anything into it).
+ */
+export async function bindSessionOrCleanup(
+  dag: DagEngine,
+  client: Parameters<typeof deleteSession>[0],
+  taskId: string,
+  sessionId: string,
+  cancelledSessions: BoundedSet<string>,
+): Promise<boolean> {
+  const bound = dag.task_started(taskId, sessionId);
+  if (!bound) {
+    await cleanupOrphanedSession(client, sessionId, cancelledSessions);
+    return false;
+  }
+  return true;
+}
+
 export async function handleEventResult(
   result: EventResult,
   client: Parameters<typeof deleteSession>[0],

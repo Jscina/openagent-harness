@@ -56,8 +56,17 @@ import {
 
 import type { EventResult } from "./types.js";
 import { classifyError } from "./errors.js";
-import { createPlanArtifact, savePlanArtifact, loadPlanArtifact } from "./plans.js";
-import { createSession, sendMessage, deleteSession, showToast } from "./client.js";
+import {
+  createPlanArtifact,
+  savePlanArtifact,
+  loadPlanArtifact,
+} from "./plans.js";
+import {
+  createSession,
+  sendMessage,
+  deleteSession,
+  showToast,
+} from "./client.js";
 import {
   listHarnessWorkflows,
   getHarnessWorkflowSnapshot,
@@ -66,9 +75,16 @@ import {
   sleep,
   handleEventResult,
   cleanupOrphanedSession,
+  bindSessionOrCleanup,
 } from "./dag.js";
 import { BoundedSet, BoundedMap } from "./bounded.js";
-import { createCard, appendTrace, assembleContext, promoteFinding, listActiveCards } from "./memory.js";
+import {
+  createCard,
+  appendTrace,
+  assembleContext,
+  promoteFinding,
+  listActiveCards,
+} from "./memory.js";
 
 // ─── WASM initialisation ──────────────────────────────────────────────────────
 
@@ -115,7 +131,6 @@ function installAgentsIfNeeded(): number {
   }
 }
 
-
 // ─── Plugin ───────────────────────────────────────────────────────────────────
 
 export default (async (input: PluginInput) => {
@@ -123,21 +138,41 @@ export default (async (input: PluginInput) => {
 
   // Load WASM DAG engine.
   const dag = loadWasm();
-  void showToast(client, 'Harness Plugin', 'WASM DAG engine loaded', 'info', 5000);
+  void showToast(
+    client,
+    "Harness Plugin",
+    "WASM DAG engine loaded",
+    "info",
+    5000,
+  );
 
   // Install agent configs the first time this plugin runs.
   const installed = installAgentsIfNeeded();
   if (installed > 0) {
-    void showToast(client, 'Harness Plugin', `Installed ${installed} agent config(s)`, 'info');
+    void showToast(
+      client,
+      "Harness Plugin",
+      `Installed ${installed} agent config(s)`,
+      "info",
+    );
   }
 
   // Load agent fallback configs from WASM and register with DAG engine.
   try {
     const fallbackConfigs = agent_fallback_configs_json();
     dag.set_agent_fallbacks(fallbackConfigs);
-    void showToast(client, 'Harness Plugin', 'Agent fallback models registered', 'info', 5000);
+    void showToast(
+      client,
+      "Harness Plugin",
+      "Agent fallback models registered",
+      "info",
+      5000,
+    );
   } catch (e) {
-    console.error('[harness-plugin] fallback config load failed (non-fatal):', e);
+    console.error(
+      "[harness-plugin] fallback config load failed (non-fatal):",
+      e,
+    );
   }
 
   // ── Native-dispatch state ──────────────────────────────────────────────────
@@ -160,16 +195,19 @@ export default (async (input: PluginInput) => {
    * Buffer of tasks ready to be dispatched natively, keyed by workflow_id.
    * The tick loop populates this instead of creating sessions for these tasks.
    */
-  const nativeDispatchBuffer = new Map<string, Array<{
-    id: string;
-    prompt: string;
-    model: string;
-    agent: string | null;
-    parent_session_id: string | null;
-    fallback_models: string[];
-    existing_session_id?: string | null;
-    workflow_id?: string | null;
-  }>>();
+  const nativeDispatchBuffer = new Map<
+    string,
+    Array<{
+      id: string;
+      prompt: string;
+      model: string;
+      agent: string | null;
+      parent_session_id: string | null;
+      fallback_models: string[];
+      existing_session_id?: string | null;
+      workflow_id?: string | null;
+    }>
+  >();
 
   /**
    * Buffer for `session.idle` events whose session ID is not yet registered in
@@ -253,41 +291,79 @@ export default (async (input: PluginInput) => {
           if (task.existing_session_id) {
             // Session was pre-assigned from a prior task's reuse — skip createSession.
             sessionId = task.existing_session_id;
-            // task_started was already called in handleEventResult when reuse was set,
-            // but call again to be idempotent (it's a no-op if mapping already exists).
-            dag.task_started(task.id, sessionId);
           } else {
             const agentName = task.agent ?? undefined;
             const taskLabel = task.id.slice(0, 8);
             const title = agentName
               ? `@${agentName}: ${taskLabel}`
               : `task: ${taskLabel}`;
-            sessionId = await createSession(client, task.parent_session_id, title, agentName);
-
-            // BLOCKING BUG FIX: the task may have been cancelled via
-            // harness_cancel while createSession() was in flight above. If
-            // so, dag.task_started() returns false and does NOT bind this
-            // brand-new session to the (now-Cancelled) task — the session is
-            // orphaned and would otherwise run to completion untracked,
-            // never aborted. Clean it up ourselves and skip sendMessage.
-            const bound = dag.task_started(task.id, sessionId);
-            if (!bound) {
-              await cleanupOrphanedSession(client, sessionId, cancelledSessions);
-              continue;
-            }
+            sessionId = await createSession(
+              client,
+              task.parent_session_id,
+              title,
+              agentName,
+            );
           }
-          await sendMessage(client, sessionId, task.prompt, task.model, task.agent);
-          void showToast(client, 'Task Started', `Task ${task.id} dispatched`, 'info', 5000);
+
+          // BLOCKING BUG FIX: the task may have been cancelled via
+          // harness_cancel while the session above was being set up — either
+          // a brand-new createSession() call in flight (fresh-session path
+          // above), or the tick-interval-sized gap between a reuse
+          // assignment (existing_session_id, first bound in
+          // handleEventResult when the prior task went idle) and this tick
+          // picking the task back up (reuse path above). bindSessionOrCleanup
+          // checks dag.task_started()'s return value for us and cleans up
+          // the session as orphaned if the bind was refused — applied
+          // unconditionally after BOTH branches above, so neither one can
+          // silently skip the check the way the reuse path once did.
+          const bound = await bindSessionOrCleanup(
+            dag,
+            client,
+            task.id,
+            sessionId,
+            cancelledSessions,
+          );
+          if (!bound) continue;
+          await sendMessage(
+            client,
+            sessionId,
+            task.prompt,
+            task.model,
+            task.agent,
+          );
+          void showToast(
+            client,
+            "Task Started",
+            `Task ${task.id} dispatched`,
+            "info",
+            5000,
+          );
         } catch (e) {
           console.error(`[harness-plugin] failed to start task ${task.id}:`, e);
           const message = e instanceof Error ? e.message : String(e);
           const classification = classifyError(message);
-          void showToast(client, 'Harness Plugin', `Error classified as ${classification}`, classification === 'retryable' ? 'warning' : 'error');
+          void showToast(
+            client,
+            "Harness Plugin",
+            `Error classified as ${classification}`,
+            classification === "retryable" ? "warning" : "error",
+          );
 
-          if (classification === 'retryable' && task.fallback_models && task.fallback_models.length > 0) {
+          if (
+            classification === "retryable" &&
+            task.fallback_models &&
+            task.fallback_models.length > 0
+          ) {
             try {
-              const fallbackResult = JSON.parse(dag.try_fallback(task.id, message));
-              void showToast(client, 'Fallback', `Task ${task.id} falling back to ${fallbackResult.new_model}`, 'warning');
+              const fallbackResult = JSON.parse(
+                dag.try_fallback(task.id, message),
+              );
+              void showToast(
+                client,
+                "Fallback",
+                `Task ${task.id} falling back to ${fallbackResult.new_model}`,
+                "warning",
+              );
               if (sessionId) await deleteSession(client, sessionId);
               // Task is Pending again — next tick will pick it up
               continue;
@@ -297,7 +373,9 @@ export default (async (input: PluginInput) => {
           }
 
           try {
-            const { session_id } = JSON.parse(dag.fail_task(task.id, message)) as {
+            const { session_id } = JSON.parse(
+              dag.fail_task(task.id, message),
+            ) as {
               session_id: string | null;
             };
             if (session_id) await deleteSession(client, session_id);
@@ -311,11 +389,7 @@ export default (async (input: PluginInput) => {
     }
   }, 500);
 
-  // Cleanup on process exit. Idempotent: SIGTERM/SIGINT below call cleanup()
-  // then process.exit(0), and process.exit() itself re-fires the "exit"
-  // listener registered next — without this guard that second invocation
-  // would call dag.free() on an already-freed WASM object and crash with
-  // "null pointer passed to rust" while the process is tearing down.
+  // Cleanup on process exit.
   let cleaned = false;
   const cleanup = () => {
     if (cleaned) return;
@@ -324,10 +398,14 @@ export default (async (input: PluginInput) => {
     dag.free();
   };
   process.on("exit", cleanup);
-  process.on("SIGTERM", () => { cleanup(); process.exit(0); });
-  process.on("SIGINT",  () => { cleanup(); process.exit(0); });
-
-  // ── Hooks ──────────────────────────────────────────────────────────────────
+  process.on("SIGTERM", () => {
+    cleanup();
+    process.exit(0);
+  });
+  process.on("SIGINT", () => {
+    cleanup();
+    process.exit(0);
+  });
 
   return {
     tool: {
@@ -346,7 +424,9 @@ export default (async (input: PluginInput) => {
         },
         async execute({ tasks }, context) {
           if (context.agent !== "orchestrator") {
-            throw new Error("submit_workflow can only be executed by the orchestrator agent");
+            throw new Error(
+              "submit_workflow can only be executed by the orchestrator agent",
+            );
           }
           return dag.submit_workflow(JSON.stringify(tasks), context.sessionID);
         },
@@ -370,7 +450,9 @@ export default (async (input: PluginInput) => {
         },
         async execute({ plan_id, tasks, summary, recommendations }, context) {
           if (context.agent !== "planner") {
-            throw new Error("save_plan can only be executed by the planner agent");
+            throw new Error(
+              "save_plan can only be executed by the planner agent",
+            );
           }
 
           const artifact = createPlanArtifact({
@@ -400,11 +482,19 @@ export default (async (input: PluginInput) => {
         },
         async execute({ plan_id, native_dispatch }, context) {
           if (context.agent !== "orchestrator") {
-            throw new Error("submit_plan can only be executed by the orchestrator agent");
+            throw new Error(
+              "submit_plan can only be executed by the orchestrator agent",
+            );
           }
           const artifact = loadPlanArtifact(plan_id);
-          const result = dag.submit_workflow(JSON.stringify(artifact.tasks), context.sessionID);
-          const parsed = JSON.parse(result) as { workflow_id: string; task_ids: string[] };
+          const result = dag.submit_workflow(
+            JSON.stringify(artifact.tasks),
+            context.sessionID,
+          );
+          const parsed = JSON.parse(result) as {
+            workflow_id: string;
+            task_ids: string[];
+          };
 
           if (native_dispatch) {
             nativeDispatchWorkflows.add(parsed.workflow_id);
@@ -422,7 +512,10 @@ export default (async (input: PluginInput) => {
         },
         async execute({ workflow_id }) {
           const payload = workflow_id
-            ? { workflow_id, snapshot: getHarnessWorkflowSnapshot(dag, workflow_id) }
+            ? {
+                workflow_id,
+                snapshot: getHarnessWorkflowSnapshot(dag, workflow_id),
+              }
             : { workflows: listHarnessWorkflows(dag) };
           return JSON.stringify(payload);
         },
@@ -492,16 +585,23 @@ export default (async (input: PluginInput) => {
           // instead of being misclassified as a real provider failure.
           let aborted = 0;
           for (const sid of session_ids) {
-            const ok = await cleanupOrphanedSession(client, sid, cancelledSessions);
+            const ok = await cleanupOrphanedSession(
+              client,
+              sid,
+              cancelledSessions,
+            );
             if (ok) aborted++;
           }
 
           // Best-effort workflow status lookup for the summary. task_id cancels
           // don't carry a workflow_id in the engine response, so resolve it by
           // scanning workflow membership.
-          const resolvedWorkflowId = workflow_id ?? findOwningWorkflowId(dag, task_id as string);
+          const resolvedWorkflowId =
+            workflow_id ?? findOwningWorkflowId(dag, task_id as string);
           const wfStatus = resolvedWorkflowId
-            ? extractWorkflowStatus(JSON.parse(dag.get_workflow(resolvedWorkflowId)))
+            ? extractWorkflowStatus(
+                JSON.parse(dag.get_workflow(resolvedWorkflowId)),
+              )
             : null;
 
           // A task-level cancel can also cancel its whole workflow (e.g. it was
@@ -550,7 +650,11 @@ export default (async (input: PluginInput) => {
               return JSON.stringify({ status: "missing", workflow_id });
             }
             const wfStatus = extractWorkflowStatus(snapshot);
-            if (wfStatus === "done" || wfStatus === "failed" || wfStatus === "cancelled") {
+            if (
+              wfStatus === "done" ||
+              wfStatus === "failed" ||
+              wfStatus === "cancelled"
+            ) {
               return JSON.stringify({ status: wfStatus, snapshot, tasks: [] });
             }
 
@@ -605,24 +709,31 @@ export default (async (input: PluginInput) => {
           error: tool.schema.string().optional(),
         },
         async execute({ task_id, session_id, status, error }) {
-          // Register the session → task mapping in the DAG. dag.task_started()
-          // returns false when the task is already terminal — typically
-          // Cancelled (e.g. via harness_cancel while this native-dispatch
-          // Task tool call was still in flight), but the DAG's guard also
-          // rejects Done/Failed defensively. In that case discard the result
-          // gracefully: never resurrect a terminal task into Done/Failed, and
-          // never register/replay/fallback for it — just clean up the
-          // now-orphaned session.
-          const bound = dag.task_started(task_id, session_id);
+          // Register the session → task mapping in the DAG.
+          // bindSessionOrCleanup checks dag.task_started()'s return value
+          // for us: it's false when the task is already terminal —
+          // typically Cancelled (e.g. via harness_cancel while this
+          // native-dispatch Task tool call was still in flight), but the
+          // DAG's guard also rejects Done/Failed defensively. In that case
+          // it also cleans up the now-orphaned session; discard the result
+          // gracefully here: never resurrect a terminal task into
+          // Done/Failed, and never register/replay/fallback for it.
+          const bound = await bindSessionOrCleanup(
+            dag,
+            client,
+            task_id,
+            session_id,
+            cancelledSessions,
+          );
           if (!bound) {
             pendingReviews.delete(task_id);
-            await cleanupOrphanedSession(client, session_id, cancelledSessions);
             return JSON.stringify({
               registered: false,
               task_id,
               session_id,
               status: "cancelled",
-              message: "task was already cancelled (or otherwise terminal); result discarded",
+              message:
+                "task was already cancelled (or otherwise terminal); result discarded",
             });
           }
 
@@ -633,7 +744,11 @@ export default (async (input: PluginInput) => {
             orphanedIdleEvents.delete(session_id);
 
             const result: EventResult = JSON.parse(
-              dag.process_event("session.idle", session_id, JSON.stringify(bufferedProps)),
+              dag.process_event(
+                "session.idle",
+                session_id,
+                JSON.stringify(bufferedProps),
+              ),
             );
 
             // For native-dispatch workflows, never reuse sessions across tasks —
@@ -656,17 +771,21 @@ export default (async (input: PluginInput) => {
             // Failed path: use buffered error message or the caller-supplied error.
             const errMsg =
               orphanedErrorEvents.get(session_id) ?? // real provider error from session.error event
-              error ??                                 // orchestrator-supplied fallback
+              error ?? // orchestrator-supplied fallback
               "native task reported failure";
             const errSource = orphanedErrorEvents.has(session_id)
-              ? 'session.error'
+              ? "session.error"
               : error !== undefined
-              ? 'caller'
-              : 'default';
+                ? "caller"
+                : "default";
             orphanedErrorEvents.delete(session_id);
-            console.log(`[harness] task_complete failed: task_id=${task_id} session_id=${session_id} source=${errSource} errMsg=${errMsg}`);
+            console.log(
+              `[harness] task_complete failed: task_id=${task_id} session_id=${session_id} source=${errSource} errMsg=${errMsg}`,
+            );
             const classification = classifyError(errMsg);
-            console.log(`[harness] task_complete classification=${classification} hasMoreFallbacks will be evaluated next`);
+            console.log(
+              `[harness] task_complete classification=${classification} hasMoreFallbacks will be evaluated next`,
+            );
             const taskJson = JSON.parse(dag.get_task(task_id)) as {
               fallback_models?: string[];
               model_attempt?: number;
@@ -693,7 +812,13 @@ export default (async (input: PluginInput) => {
                 // be re-spawned by the orchestrator using its frontmatter model, not the DAG fallback model.
                 // This is a known limitation of the native dispatch + Task tool integration.
                 await deleteSession(client, session_id);
-                return JSON.stringify({ registered: true, task_id, session_id, status: "retrying", new_model: fallbackResult.new_model });
+                return JSON.stringify({
+                  registered: true,
+                  task_id,
+                  session_id,
+                  status: "retrying",
+                  new_model: fallbackResult.new_model,
+                });
               } catch {
                 // No more fallbacks — fall through to fail
               }
@@ -726,7 +851,10 @@ export default (async (input: PluginInput) => {
                 });
               }
             } catch (e) {
-              console.error("[harness] auto-trace on task failure skipped (non-fatal):", e);
+              console.error(
+                "[harness] auto-trace on task failure skipped (non-fatal):",
+                e,
+              );
             }
 
             return JSON.stringify({
@@ -764,7 +892,9 @@ export default (async (input: PluginInput) => {
             id: string;
             session_id: string | null;
           }>;
-          const match = allTasks.find((t: any) => t.session_id === context.sessionID);
+          const match = allTasks.find(
+            (t: any) => t.session_id === context.sessionID,
+          );
           const reviewerTaskId = match?.id ?? context.sessionID;
 
           const review = {
@@ -792,14 +922,18 @@ export default (async (input: PluginInput) => {
             return dag.submit_review(task_id, reviewJson);
           } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
-            if (msg.includes('is not done') && msg.includes('cannot submit review')) {
+            if (
+              msg.includes("is not done") &&
+              msg.includes("cannot submit review")
+            ) {
               pendingReviews.set(task_id, reviewJson);
               return JSON.stringify({
                 task_id,
                 review_status: status,
                 stored: false,
                 deferred: true,
-                reason: 'Target task is still running; review will be applied when it completes.',
+                reason:
+                  "Target task is still running; review will be applied when it completes.",
               });
             }
             throw err;
@@ -839,7 +973,12 @@ export default (async (input: PluginInput) => {
         ].join("\n"),
         args: {
           cardId: tool.schema.string(),
-          type: tool.schema.enum(["finding", "ruled-out", "hypothesis", "next-step"]),
+          type: tool.schema.enum([
+            "finding",
+            "ruled-out",
+            "hypothesis",
+            "next-step",
+          ]),
           body: tool.schema.string(),
           session: tool.schema.string().optional(),
         },
@@ -891,9 +1030,23 @@ export default (async (input: PluginInput) => {
           title: tool.schema.string().optional(),
           sectionTitle: tool.schema.string().optional(),
         },
-        async execute({ cardId, finding, impact, targetPath, title, sectionTitle }) {
+        async execute({
+          cardId,
+          finding,
+          impact,
+          targetPath,
+          title,
+          sectionTitle,
+        }) {
           try {
-            const result = promoteFinding({ cardId, finding, impact, targetPath, title, sectionTitle });
+            const result = promoteFinding({
+              cardId,
+              finding,
+              impact,
+              targetPath,
+              title,
+              sectionTitle,
+            });
             return JSON.stringify({
               success: true,
               systemPath: result.systemPath,
@@ -921,7 +1074,11 @@ export default (async (input: PluginInput) => {
         }
 
         const result: EventResult = JSON.parse(
-          dag.process_event("session.idle", sessionId, JSON.stringify(event.properties)),
+          dag.process_event(
+            "session.idle",
+            sessionId,
+            JSON.stringify(event.properties),
+          ),
         );
 
         // Apply any deferred reviews now that tasks may have transitioned to Done.
@@ -954,7 +1111,7 @@ export default (async (input: PluginInput) => {
 
         await handleEventResult(result, client, dag);
       } else if (event.type === "session.error") {
-        const sessionId: string = event.properties.sessionID ?? '';
+        const sessionId: string = event.properties.sessionID ?? "";
         if (!sessionId) return;
 
         // Cancelled sessions: same guard as session.idle above. This also
@@ -968,14 +1125,18 @@ export default (async (input: PluginInput) => {
         }
 
         const result: EventResult = JSON.parse(
-          dag.process_event('session.error', sessionId, JSON.stringify(event.properties)),
+          dag.process_event(
+            "session.error",
+            sessionId,
+            JSON.stringify(event.properties),
+          ),
         );
 
         // Detect no-op → buffer for later replay.
         if (!result.fallback_hint) {
           const errMsg =
-            (event.properties as Record<string, unknown>).error as string ??
-            (event.properties as Record<string, unknown>).message as string ??
+            ((event.properties as Record<string, unknown>).error as string) ??
+            ((event.properties as Record<string, unknown>).message as string) ??
             "unknown error";
           orphanedErrorEvents.set(sessionId, String(errMsg));
           return;
@@ -983,12 +1144,15 @@ export default (async (input: PluginInput) => {
 
         // Check if this error is eligible for fallback
         if (result.fallback_hint) {
-          const { task_id, error_message, has_fallbacks } = result.fallback_hint;
+          const { task_id, error_message, has_fallbacks } =
+            result.fallback_hint;
           const classification = classifyError(error_message);
 
-          if (classification === 'retryable' && has_fallbacks) {
+          if (classification === "retryable" && has_fallbacks) {
             try {
-              const fallbackResult = JSON.parse(dag.try_fallback(task_id, error_message)) as {
+              const fallbackResult = JSON.parse(
+                dag.try_fallback(task_id, error_message),
+              ) as {
                 fallback: boolean;
                 new_model: string;
                 attempt: number;
@@ -996,9 +1160,9 @@ export default (async (input: PluginInput) => {
               };
               void showToast(
                 client,
-                'Fallback',
+                "Fallback",
                 `Task ${task_id} → ${fallbackResult.new_model} (attempt ${fallbackResult.attempt})`,
-                'warning',
+                "warning",
               );
               // Clean up old session
               if (fallbackResult.session_id) {
@@ -1009,14 +1173,19 @@ export default (async (input: PluginInput) => {
               await handleEventResult(result, client, dag);
               return;
             } catch (e) {
-              console.error(`[harness-plugin] fallback attempt failed for task ${task_id}:`, e);
+              console.error(
+                `[harness-plugin] fallback attempt failed for task ${task_id}:`,
+                e,
+              );
               // Fall through to fail the task
             }
           }
 
           // Not retryable or no fallbacks — fail the task
           try {
-            const { session_id } = JSON.parse(dag.fail_task(task_id, error_message)) as {
+            const { session_id } = JSON.parse(
+              dag.fail_task(task_id, error_message),
+            ) as {
               session_id: string | null;
             };
             if (session_id) await deleteSession(client, session_id);
