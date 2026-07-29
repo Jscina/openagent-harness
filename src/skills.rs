@@ -7,11 +7,6 @@ use anyhow::{Context, Result};
 /// Used by the native `install` subcommand (`cargo run -- install`).
 pub const SKILLS: &[(&str, &str, &str)] = &[
     (
-        "caveman",
-        "SKILL.md",
-        include_str!("../skills/caveman/SKILL.md"),
-    ),
-    (
         "memory",
         "SKILL.md",
         include_str!("../skills/memory/SKILL.md"),
@@ -87,12 +82,14 @@ mod tests {
 
     #[test]
     fn skills_has_expected_entries() {
-        assert_eq!(SKILLS.len(), 6);
+        assert_eq!(SKILLS.len(), 5);
         let names: Vec<&str> = SKILLS.iter().map(|(n, _, _)| *n).collect();
-        assert!(names.contains(&"caveman"), "missing skill: caveman");
         assert!(names.contains(&"memory"), "missing skill: memory");
         assert!(names.contains(&"memory-card"), "missing skill: memory-card");
-        assert!(names.contains(&"memory-trace"), "missing skill: memory-trace");
+        assert!(
+            names.contains(&"memory-trace"),
+            "missing skill: memory-trace"
+        );
         assert!(
             names.contains(&"memory-context"),
             "missing skill: memory-context"
