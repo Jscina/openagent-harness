@@ -37,6 +37,16 @@ pub struct AgentConfig {
     pub fallback_models: Vec<String>,
 }
 
+impl AgentConfig {
+    pub fn new(name: String, model: String, fallback_models: Vec<String>) -> Self {
+        Self {
+            name,
+            model,
+            fallback_models,
+        }
+    }
+}
+
 /// Parse the `model` and `fallback_models` fields from an agent's YAML frontmatter.
 ///
 /// Returns an `AgentConfig` with empty `model` and no `fallback_models` when the
@@ -47,22 +57,14 @@ pub fn parse_agent_frontmatter(name: &str, content: &str) -> AgentConfig {
     let after_first = match content.strip_prefix("---\n") {
         Some(rest) => rest,
         None => {
-            return AgentConfig {
-                name: name.to_string(),
-                model: String::new(),
-                fallback_models: vec![],
-            };
+            return AgentConfig::new(name.to_string(), String::new(), vec![]);
         }
     };
 
     let end = match after_first.find("\n---") {
         Some(pos) => pos,
         None => {
-            return AgentConfig {
-                name: name.to_string(),
-                model: String::new(),
-                fallback_models: vec![],
-            };
+            return AgentConfig::new(name.to_string(), String::new(), vec![]);
         }
     };
 
@@ -90,11 +92,7 @@ pub fn parse_agent_frontmatter(name: &str, content: &str) -> AgentConfig {
         }
     }
 
-    AgentConfig {
-        name: name.to_string(),
-        model,
-        fallback_models,
-    }
+    AgentConfig::new(name.to_string(), model, fallback_models)
 }
 
 /// Returns an `AgentConfig` for every embedded agent.
