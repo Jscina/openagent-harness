@@ -32,69 +32,32 @@ Wait for all agents. Synthesize.
 
 Missing details? Ask via `question` tool before finalizing.
 
-Build tasks JSON array. Orchestrator presents plan to user for approval — make it human-readable. Use descriptive prompts.
+Build the plan incrementally. Orchestrator presents it to user for approval — make it human-readable. Use descriptive prompts.
 
-```json
-[
-  {
-    "agent": "explorer",
-    "prompt": "...",
-    "depends_on": []
-  },
-  {
-    "agent": "builder",
-    "prompt": "...",
-    "depends_on": [0, 1]
-  }
-]
-```
+Call `plan_task` once per task, in dependency order (earliest first) — not one big array.
 
-Task fields:
-
+- First call: omit `plan_id`. Response returns a generated `plan_id` — capture it, pass it on every later `plan_task` call and to `save_plan`.
+- Args: `agent`, `prompt`, `depends_on` (optional), `model` (optional).
 - `agent`: one of `explorer`, `researcher`, `vision`, `builder`, `consultant`, `docs-writer`
+  - `reviewer` is excluded: it's a primary-mode agent invoked directly by the orchestrator for GitHub PR review (`pr-workflow` skill), not a mid-DAG subagent you assign work to
 - `prompt`: complete, self-contained — include all context; no assumed shared state
-- `depends_on`: zero-based indices of prerequisite tasks
+- `depends_on`: zero-based indices of tasks already appended to this draft — backward-only, forward references rejected
 
-Call `save_plan` with:
+Example — three tasks, then finalize:
 
-- `tasks`: tasks array
-- `summary`: ordered summary to return
-- `recommendations`: optional notes
-
-Example:
-
-```json
-{
-  "tasks": [
-    {
-      "agent": "explorer",
-      "prompt": "...",
-      "depends_on": []
-    }
-  ],
-  "summary": ["1. ..."],
-  "recommendations": ["..."]
-}
+```
+plan_task({agent: "explorer", prompt: "...", depends_on: []})
+  → {plan_id: "abc123", task_index: 0, ...}
+plan_task({agent: "builder", prompt: "...", depends_on: [0], plan_id: "abc123"})
+  → {task_index: 1, ...}
+plan_task({agent: "consultant", prompt: "...", depends_on: [1], plan_id: "abc123"})
+  → {task_index: 2, ...}
+save_plan({plan_id: "abc123", summary: ["1. ...", "2. ...", "3. ..."]})
 ```
 
-**Editing an existing plan:** If the user asks you to modify or edit a plan they already have (identified by a `plan_id`), include `"plan_id": "<existing_plan_id>"` in the JSON you pass to `save_plan`. This will overwrite the existing plan file at `.opencode/plans/{plan_id}.json` in-place rather than creating a new plan with a fresh UUID. Only include `plan_id` when explicitly editing — omit it for new plans.
+After the last task, call `save_plan` with `plan_id`, `summary` (ordered, human-readable), `recommendations` (optional). No `tasks` arg — `save_plan` reads the accumulated draft.
 
-When editing an existing plan:
-
-```json
-{
-  "plan_id": "existing-plan-uuid-here",
-  "tasks": [
-    {
-      "agent": "explorer",
-      "prompt": "...",
-      "depends_on": []
-    }
-  ],
-  "summary": ["1. ..."],
-  "recommendations": ["..."]
-}
-```
+**Editing an existing plan:** reusing an old `plan_id` does NOT recover its old tasks — an unknown or stale `plan_id` (including one from a restarted session) always seeds a fresh, empty draft. Re-append every task you want via `plan_task`, then `save_plan` with that same `plan_id`. This overwrites the old artifact file in place (its original `created_at` is preserved). Only reuse a `plan_id` when explicitly editing — omit it for new plans.
 
 Return one JSON object, nothing else:
 
@@ -121,6 +84,6 @@ Rules:
 - Never include `builder-junior` or `debugger` — builder spawns those internally
 - `model` is optional; omit to use agent's default
 - Never call workflow submission tools
-- You must call `save_plan` before returning your final JSON object
+- You must call `plan_task` at least once, then `save_plan`, before returning your final JSON object
 - Return `{"error": "..."}` only if plan impossible after clarification
 - Plan is user-reviewed before execution — prompts must be self-explanatory

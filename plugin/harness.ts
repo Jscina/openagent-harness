@@ -54,12 +54,13 @@ import {
   initSync,
 } from "./wasm/openagent_harness.js";
 
-import type { EventResult } from "./types.js";
+import type { EventResult, WorkflowTaskInput } from "./types.js";
 import { classifyError } from "./errors.js";
 import {
   createPlanArtifact,
   savePlanArtifact,
   loadPlanArtifact,
+  validatePlanId,
 } from "./plans.js";
 import {
   createSession,
@@ -432,28 +433,75 @@ export default (async (input: PluginInput) => {
         },
       }),
 
+      plan_task: tool({
+        description: [
+          "Planner-only: append exactly one task to an in-progress plan draft.",
+          "Call this once per task instead of building the whole tasks array up",
+          "front. The first call may omit plan_id — the response's plan_id must",
+          "then be captured and passed on every subsequent call so all tasks land",
+          "in the same draft. depends_on indices refer only to tasks already",
+          "appended to this draft (0-based, backward-only). Once every task has",
+          "been appended, call save_plan with the same plan_id (no tasks arg — it",
+          "reads the accumulated draft) to finalize and persist the plan.",
+        ].join("\n"),
+        args: {
+          agent: tool.schema.string(),
+          prompt: tool.schema.string(),
+          depends_on: tool.schema.array(tool.schema.number()).optional(),
+          model: tool.schema.string().optional(),
+          plan_id: tool.schema.string().optional(),
+        },
+        async execute({ agent, prompt, depends_on, model, plan_id }, context) {
+          if (context.agent !== "planner") {
+            throw new Error(
+              "plan_task can only be executed by the planner agent",
+            );
+          }
+
+          if (plan_id !== undefined) {
+            validatePlanId(plan_id);
+          }
+
+          const taskJson = JSON.stringify({
+            agent,
+            prompt,
+            depends_on: depends_on ?? [],
+            ...(model !== undefined ? { model } : {}),
+          });
+
+          try {
+            return dag.append_plan_task(taskJson, plan_id);
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            throw new Error(`plan_task failed: ${msg}`);
+          }
+        },
+      }),
+
       save_plan: tool({
         description:
-          "Planner-only: persist a plan artifact under .opencode/plans and return its reference metadata.",
+          "Planner-only: finalize an in-progress plan draft (built via plan_task) into a persisted artifact under .opencode/plans and return its reference metadata.",
         args: {
-          plan_id: tool.schema.string().optional(),
-          tasks: tool.schema.array(
-            tool.schema.object({
-              agent: tool.schema.string(),
-              prompt: tool.schema.string(),
-              depends_on: tool.schema.array(tool.schema.number()),
-              model: tool.schema.string().optional(),
-            }),
-          ),
+          plan_id: tool.schema.string(),
           summary: tool.schema.array(tool.schema.string()),
           recommendations: tool.schema.array(tool.schema.string()).optional(),
         },
-        async execute({ plan_id, tasks, summary, recommendations }, context) {
+        async execute({ plan_id, summary, recommendations }, context) {
           if (context.agent !== "planner") {
             throw new Error(
               "save_plan can only be executed by the planner agent",
             );
           }
+
+          let draftJson: string;
+          try {
+            draftJson = dag.get_plan_draft(plan_id);
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            throw new Error(msg);
+          }
+
+          const tasks = JSON.parse(draftJson) as WorkflowTaskInput[];
 
           const artifact = createPlanArtifact({
             plan_id,
@@ -463,6 +511,19 @@ export default (async (input: PluginInput) => {
           });
 
           const path = savePlanArtifact(artifact);
+
+          // Discard only after the artifact is durably on disk — a write
+          // failure above must never destroy the accumulated draft, since
+          // the planner would then have to rebuild it from scratch.
+          try {
+            dag.discard_plan_draft(plan_id);
+          } catch (e) {
+            console.error(
+              `[harness-plugin] discard_plan_draft(${plan_id}) failed (non-fatal, artifact already saved):`,
+              e,
+            );
+          }
+
           return JSON.stringify({
             plan_id: artifact.id,
             path,

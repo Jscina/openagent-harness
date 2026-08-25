@@ -4,6 +4,13 @@ use crate::types::*;
 
 const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-6";
 const SNAPSHOT_PREVIEW_CHARS: usize = 240;
+/// Hard cap on tasks accumulated in a single in-progress plan draft. Also acts as a
+/// runaway circuit breaker for `append_plan_task` callers.
+const MAX_TASKS_PER_DRAFT: usize = 64;
+/// Hard cap on the number of concurrently in-progress plan drafts. Exceeding this on
+/// draft creation evicts the least-recently-touched draft (lowest `last_touched_seq`
+/// — true LRU, not creation-order FIFO).
+const MAX_PLAN_DRAFTS: usize = 32;
 
 /// Synchronous DAG state machine.
 ///
@@ -16,6 +23,16 @@ pub struct DagEngine {
     session_to_task: HashMap<String, String>,
     /// Maps agent name → ordered fallback model list (populated at startup).
     agent_fallbacks: HashMap<String, Vec<String>>,
+    /// In-progress plan drafts built incrementally via `append_plan_task`, keyed by
+    /// plan_id, consumed via `get_plan_draft` + `discard_plan_draft`.
+    plan_drafts: HashMap<String, PlanDraft>,
+    /// Monotonic counter assigning both creation order (`PlanDraft::seq`) and
+    /// last-touched order (`PlanDraft::last_touched_seq`) to plan drafts — the same
+    /// counter drives both, just read at different moments. Used for
+    /// least-recently-touched eviction once `MAX_PLAN_DRAFTS` is exceeded.
+    /// Deliberately a plain counter rather than `SystemTime::now()`, which is
+    /// unavailable on `wasm32-unknown-unknown`.
+    next_draft_seq: u64,
 }
 
 impl Default for DagEngine {
@@ -31,6 +48,8 @@ impl DagEngine {
             workflows: HashMap::new(),
             session_to_task: HashMap::new(),
             agent_fallbacks: HashMap::new(),
+            plan_drafts: HashMap::new(),
+            next_draft_seq: 0,
         }
     }
 
@@ -656,6 +675,191 @@ impl DagEngine {
             "stored": true
         })
         .to_string())
+    }
+
+    /// Append one task to an in-progress plan draft, creating the draft if needed.
+    ///
+    /// `task_json` deserializes into the same shape as a `submit_workflow` task entry:
+    /// `{agent, prompt, depends_on?, model?, fallback_models?}`. `depends_on` indices
+    /// refer only to tasks already appended to this draft (backward-only references —
+    /// this also rejects self-references, since a task's own index does not yet exist
+    /// when it is being appended).
+    ///
+    /// When `plan_id` is `None`, or refers to an id this draft store does not
+    /// recognize, a fresh empty draft is seeded — generating a new id in the `None`
+    /// case, or using the given id otherwise. This is forced: the in-memory draft
+    /// store cannot see plans already persisted to disk, so any unrecognized id must
+    /// be treated as the start of a new draft rather than an error.
+    ///
+    /// Enforces `MAX_TASKS_PER_DRAFT` (hard error once reached) and `MAX_PLAN_DRAFTS`
+    /// (evicts the least-recently-touched, i.e. lowest-`last_touched_seq`, draft when
+    /// creating a *new* draft would exceed the cap; never evicts the draft currently
+    /// being appended to, since that only happens on the new-draft path).
+    ///
+    /// Validation (`depends_on` bounds, then `MAX_TASKS_PER_DRAFT`) happens *before*
+    /// the draft store is touched at all: the target draft is only looked up
+    /// read-only to determine the current task count. This guarantees a failed
+    /// append — e.g. an out-of-range `depends_on` on the very first call for a brand
+    /// new `plan_id` — never leaves an orphaned zero-task draft occupying a
+    /// `MAX_PLAN_DRAFTS` slot. Only after validation passes do we get-or-insert the
+    /// draft entry (which is where eviction can fire) and push the task.
+    ///
+    /// Returns JSON `{plan_id, task_index, task_count, agent, prompt_chars, agents}`
+    /// on success — never the whole draft, which would defeat the point of building
+    /// it up via small calls — or an error message string.
+    pub fn append_plan_task(
+        &mut self,
+        task_json: &str,
+        plan_id: Option<&str>,
+    ) -> Result<String, String> {
+        let task: WorkflowTaskInput =
+            serde_json::from_str(task_json).map_err(|e| format!("invalid task JSON: {e}"))?;
+
+        let target_id = match plan_id {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => uuid::Uuid::new_v4().to_string(),
+        };
+
+        // Read-only: determine the current task count without creating or touching
+        // any entry in `plan_drafts`. An existing draft contributes its real count;
+        // an unrecognized `plan_id` is treated as count 0 (the start of a new draft).
+        let current_count = self
+            .plan_drafts
+            .get(&target_id)
+            .map(|d| d.tasks.len())
+            .unwrap_or(0);
+
+        for &dep in &task.depends_on {
+            if dep >= current_count {
+                return Err(format!(
+                    "plan draft '{target_id}' depends_on index {dep} is out of bounds (only {current_count} tasks)"
+                ));
+            }
+        }
+
+        if current_count >= MAX_TASKS_PER_DRAFT {
+            return Err(format!(
+                "plan draft '{target_id}' already has the maximum {MAX_TASKS_PER_DRAFT} tasks"
+            ));
+        }
+
+        // Validation passed — now, and only now, get-or-insert the draft entry.
+        if !self.plan_drafts.contains_key(&target_id) {
+            if self.plan_drafts.len() >= MAX_PLAN_DRAFTS
+                && let Some(evict_id) = self
+                    .plan_drafts
+                    .iter()
+                    // Primary key: least-recently-touched wins eviction (true LRU).
+                    // `last_touched_seq` values are already globally unique (drawn
+                    // from one monotonic counter), so `seq` never actually breaks a
+                    // tie today — it's a defensive tie-breaker (oldest-created first)
+                    // in case that uniqueness guarantee ever changes.
+                    .min_by_key(|(_, d)| (d.last_touched_seq, d.seq))
+                    .map(|(id, _)| id.clone())
+            {
+                self.plan_drafts.remove(&evict_id);
+            }
+
+            let seq = self.next_draft_seq;
+            self.next_draft_seq += 1;
+            self.plan_drafts.insert(
+                target_id.clone(),
+                PlanDraft {
+                    id: target_id.clone(),
+                    seq,
+                    // Creation counts as the first touch.
+                    last_touched_seq: seq,
+                    tasks: Vec::new(),
+                    agents: Vec::new(),
+                },
+            );
+        } else {
+            let touch_seq = self.next_draft_seq;
+            self.next_draft_seq += 1;
+            self.plan_drafts
+                .get_mut(&target_id)
+                .unwrap()
+                .last_touched_seq = touch_seq;
+        }
+
+        let agent = task.agent.clone();
+        let prompt_chars = task.prompt.chars().count();
+
+        let draft = self.plan_drafts.get_mut(&target_id).unwrap();
+        draft.agents.push(agent.clone());
+        draft.tasks.push(task);
+        let plan_id_out = draft.id.clone();
+        let task_index = draft.tasks.len() - 1;
+        let task_count = draft.tasks.len();
+        let agents = draft.agents.clone();
+
+        Ok(serde_json::json!({
+            "plan_id": plan_id_out,
+            "task_index": task_index,
+            "task_count": task_count,
+            "agent": agent,
+            "prompt_chars": prompt_chars,
+            "agents": agents,
+        })
+        .to_string())
+    }
+
+    /// Read back a plan draft's accumulated tasks for finalization.
+    ///
+    /// Returns a JSON array shaped exactly like the `tasks` field of a
+    /// `submit_workflow` payload (`agent`, `prompt`, `depends_on`, optional `model`,
+    /// optional `fallback_models`) — the caller can drop this straight into the
+    /// on-disk plan artifact's `tasks` field with zero transformation.
+    ///
+    /// Does NOT discard or otherwise mutate the draft. Discarding is a separate,
+    /// later call (`discard_plan_draft`) so that an interrupted or failed disk write
+    /// never destroys the accumulated plan — the caller must only discard after
+    /// confirming the write succeeded.
+    ///
+    /// Returns `Err` when `plan_id` is not a known draft, and `Err` (distinctly, with
+    /// a different message) when the draft exists but has zero tasks, so a caller can
+    /// never silently persist an empty plan.
+    pub fn get_plan_draft(&self, plan_id: &str) -> Result<String, String> {
+        let draft = self.plan_drafts.get(plan_id).ok_or_else(|| {
+            format!("plan draft '{plan_id}' not found — call plan_task before save_plan")
+        })?;
+
+        if draft.tasks.is_empty() {
+            return Err(format!(
+                "plan draft '{plan_id}' has no tasks — call plan_task at least once before save_plan"
+            ));
+        }
+
+        // Defense-in-depth invariant check. `append_plan_task` already validates every
+        // `depends_on` index against the task count *at the time it was appended*,
+        // and that count only ever grows — so this should be unreachable today. It
+        // exists as a safety net against a future refactor (e.g. a hypothetical
+        // task-removal or reordering feature) silently corrupting a draft and letting
+        // a bad `depends_on` reach a caller as if it were valid data.
+        let task_count = draft.tasks.len();
+        for (index, t) in draft.tasks.iter().enumerate() {
+            for &dep in &t.depends_on {
+                if dep >= task_count {
+                    return Err(format!(
+                        "internal error: plan draft '{plan_id}' task {index} has out-of-bounds depends_on {dep} (only {task_count} tasks) — plan draft accumulator invariant violated"
+                    ));
+                }
+            }
+        }
+
+        serde_json::to_string(&draft.tasks).map_err(|e| format!("failed to serialize draft: {e}"))
+    }
+
+    /// Remove a plan draft from the store.
+    ///
+    /// Idempotent — removing an id that was never created, or was already
+    /// discarded, is not an error. Callers should only discard a draft after
+    /// confirming the plan built from `get_plan_draft` was durably persisted.
+    ///
+    /// Returns JSON `{"discarded": true}`.
+    pub fn discard_plan_draft(&mut self, plan_id: &str) -> Result<String, String> {
+        self.plan_drafts.remove(plan_id);
+        Ok(serde_json::json!({ "discarded": true }).to_string())
     }
 
     fn update_workflow_status(&mut self, task_id: &str) -> Option<WorkflowStatus> {
@@ -2138,6 +2342,415 @@ mod tests {
         assert_eq!(
             ready_arr[0]["existing_session_id"], "ses_chain",
             "existing_session_id should be the pre-assigned session"
+        );
+    }
+
+    // ─── plan draft accumulator ──────────────────────────────────────────
+
+    #[test]
+    fn plan_draft_appends_accumulate_in_order() {
+        let mut dag = DagEngine::new();
+        let t0 = serde_json::json!({"agent": "explorer", "prompt": "map it"});
+        let resp0: serde_json::Value =
+            serde_json::from_str(&dag.append_plan_task(&t0.to_string(), None).unwrap()).unwrap();
+        let plan_id = resp0["plan_id"].as_str().unwrap().to_string();
+        assert_eq!(resp0["task_index"], 0);
+        assert_eq!(resp0["task_count"], 1);
+        assert_eq!(resp0["agent"], "explorer");
+        assert_eq!(resp0["agents"], serde_json::json!(["explorer"]));
+
+        let t1 = serde_json::json!({"agent": "builder", "prompt": "build it", "depends_on": [0]});
+        let resp1: serde_json::Value = serde_json::from_str(
+            &dag.append_plan_task(&t1.to_string(), Some(&plan_id))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resp1["plan_id"], plan_id);
+        assert_eq!(resp1["task_index"], 1);
+        assert_eq!(resp1["task_count"], 2);
+        assert_eq!(resp1["agent"], "builder");
+        assert_eq!(resp1["agents"], serde_json::json!(["explorer", "builder"]));
+
+        let t2 = serde_json::json!({"agent": "reviewer", "prompt": "review it", "depends_on": [1]});
+        let resp2: serde_json::Value = serde_json::from_str(
+            &dag.append_plan_task(&t2.to_string(), Some(&plan_id))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resp2["task_index"], 2);
+        assert_eq!(resp2["task_count"], 3);
+        assert_eq!(
+            resp2["agents"],
+            serde_json::json!(["explorer", "builder", "reviewer"])
+        );
+    }
+
+    #[test]
+    fn plan_draft_auto_generates_id_and_reuses_on_second_call() {
+        let mut dag = DagEngine::new();
+        let t0 = serde_json::json!({"agent": "a", "prompt": "p0"});
+        let resp0: serde_json::Value =
+            serde_json::from_str(&dag.append_plan_task(&t0.to_string(), None).unwrap()).unwrap();
+        let plan_id = resp0["plan_id"].as_str().unwrap().to_string();
+        assert!(!plan_id.is_empty());
+        assert_eq!(resp0["task_count"], 1);
+
+        let t1 = serde_json::json!({"agent": "b", "prompt": "p1"});
+        let resp1: serde_json::Value = serde_json::from_str(
+            &dag.append_plan_task(&t1.to_string(), Some(&plan_id))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resp1["plan_id"], plan_id);
+        assert_eq!(resp1["task_count"], 2, "count must not reset");
+    }
+
+    #[test]
+    fn plan_draft_two_independent_drafts_no_cross_contamination() {
+        let mut dag = DagEngine::new();
+        let a0 = serde_json::json!({"agent": "a-agent", "prompt": "a0"});
+        let resp_a0: serde_json::Value =
+            serde_json::from_str(&dag.append_plan_task(&a0.to_string(), None).unwrap()).unwrap();
+        let plan_a = resp_a0["plan_id"].as_str().unwrap().to_string();
+
+        let b0 = serde_json::json!({"agent": "b-agent", "prompt": "b0"});
+        let resp_b0: serde_json::Value =
+            serde_json::from_str(&dag.append_plan_task(&b0.to_string(), None).unwrap()).unwrap();
+        let plan_b = resp_b0["plan_id"].as_str().unwrap().to_string();
+
+        assert_ne!(plan_a, plan_b);
+
+        let a1 = serde_json::json!({"agent": "a-agent-2", "prompt": "a1"});
+        dag.append_plan_task(&a1.to_string(), Some(&plan_a))
+            .unwrap();
+
+        let tasks_a: Vec<serde_json::Value> =
+            serde_json::from_str(&dag.get_plan_draft(&plan_a).unwrap()).unwrap();
+        let tasks_b: Vec<serde_json::Value> =
+            serde_json::from_str(&dag.get_plan_draft(&plan_b).unwrap()).unwrap();
+
+        assert_eq!(tasks_a.len(), 2);
+        assert_eq!(tasks_b.len(), 1);
+        assert_eq!(tasks_a[0]["agent"], "a-agent");
+        assert_eq!(tasks_a[1]["agent"], "a-agent-2");
+        assert_eq!(tasks_b[0]["agent"], "b-agent");
+    }
+
+    #[test]
+    fn plan_draft_depends_on_previous_task_preserved_through_readback() {
+        let mut dag = DagEngine::new();
+        let t0 = serde_json::json!({"agent": "a", "prompt": "p0"});
+        let resp0: serde_json::Value =
+            serde_json::from_str(&dag.append_plan_task(&t0.to_string(), None).unwrap()).unwrap();
+        let plan_id = resp0["plan_id"].as_str().unwrap().to_string();
+
+        let t1 = serde_json::json!({"agent": "b", "prompt": "p1", "depends_on": [0]});
+        dag.append_plan_task(&t1.to_string(), Some(&plan_id))
+            .unwrap();
+
+        let tasks: Vec<WorkflowTaskInput> =
+            serde_json::from_str(&dag.get_plan_draft(&plan_id).unwrap()).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].depends_on, vec![0]);
+    }
+
+    #[test]
+    fn plan_draft_rejects_out_of_range_depends_on_on_first_task() {
+        let mut dag = DagEngine::new();
+        let t0 = serde_json::json!({"agent": "a", "prompt": "p0", "depends_on": [3]});
+        let err = dag
+            .append_plan_task(&t0.to_string(), Some("draft-oob"))
+            .unwrap_err();
+        assert!(err.contains("out of bounds"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn plan_draft_rejects_depends_on_beyond_current_count() {
+        let mut dag = DagEngine::new();
+        let t0 = serde_json::json!({"agent": "a", "prompt": "p0"});
+        let resp0: serde_json::Value =
+            serde_json::from_str(&dag.append_plan_task(&t0.to_string(), None).unwrap()).unwrap();
+        let plan_id = resp0["plan_id"].as_str().unwrap().to_string();
+
+        // Only task 0 exists so far; depends_on [1] (self-reference-shaped) is invalid.
+        let t1 = serde_json::json!({"agent": "b", "prompt": "p1", "depends_on": [1]});
+        let err = dag
+            .append_plan_task(&t1.to_string(), Some(&plan_id))
+            .unwrap_err();
+        assert!(err.contains("out of bounds"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn plan_draft_readback_roundtrips_workflow_task_input_and_omits_missing_model() {
+        let mut dag = DagEngine::new();
+        let t0 = serde_json::json!({"agent": "explorer", "prompt": "map it"});
+        let resp0: serde_json::Value =
+            serde_json::from_str(&dag.append_plan_task(&t0.to_string(), None).unwrap()).unwrap();
+        let plan_id = resp0["plan_id"].as_str().unwrap().to_string();
+
+        let t1 = serde_json::json!({
+            "agent": "builder",
+            "prompt": "build it",
+            "depends_on": [0],
+            "model": "anthropic/claude-x"
+        });
+        dag.append_plan_task(&t1.to_string(), Some(&plan_id))
+            .unwrap();
+
+        let raw = dag.get_plan_draft(&plan_id).unwrap();
+        let raw_value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        // Hazard 1: an omitted model must be ABSENT from the JSON, not present as null.
+        assert!(
+            raw_value[0].get("model").is_none(),
+            "model should be omitted, got: {:?}",
+            raw_value[0].get("model")
+        );
+        assert_eq!(raw_value[1]["model"], "anthropic/claude-x");
+
+        let tasks: Vec<WorkflowTaskInput> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].agent, "explorer");
+        assert_eq!(tasks[0].prompt, "map it");
+        assert_eq!(tasks[0].depends_on, Vec::<usize>::new());
+        assert_eq!(tasks[0].model, None);
+        assert_eq!(tasks[1].agent, "builder");
+        assert_eq!(tasks[1].depends_on, vec![0]);
+        assert_eq!(tasks[1].model.as_deref(), Some("anthropic/claude-x"));
+    }
+
+    #[test]
+    fn plan_draft_readback_missing_draft_errors() {
+        let dag = DagEngine::new();
+        let err = dag.get_plan_draft("nope").unwrap_err();
+        assert!(err.contains("not found"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn plan_draft_rejects_first_task_leaves_no_orphaned_entry() {
+        // Regression test for the orphaned-zero-task-draft bug: an out-of-range
+        // depends_on on the very first call against a brand-new/explicit unknown
+        // plan_id must fail WITHOUT leaving any entry behind in the draft store.
+        let mut dag = DagEngine::new();
+        let bad = serde_json::json!({"agent": "a", "prompt": "p0", "depends_on": [0]});
+        let err = dag
+            .append_plan_task(&bad.to_string(), Some("draft-never-created"))
+            .unwrap_err();
+        assert!(err.contains("out of bounds"), "unexpected: {err}");
+
+        // Must be "not found" (no entry at all), NOT "has no tasks" (which would
+        // mean an empty draft was left behind occupying a MAX_PLAN_DRAFTS slot).
+        let read_err = dag.get_plan_draft("draft-never-created").unwrap_err();
+        assert!(
+            read_err.contains("not found"),
+            "expected 'not found' proving no orphaned draft was created, got: {read_err}"
+        );
+    }
+
+    #[test]
+    fn plan_draft_readback_empty_draft_errors_and_is_not_silently_persisted() {
+        // With the fix-3 reordering (see
+        // plan_draft_rejects_first_task_leaves_no_orphaned_entry), a failed first
+        // append no longer leaves an orphaned empty draft behind, so "exists but has
+        // zero tasks" is unreachable through the public API. Construct that state
+        // directly via private field access (this test module is nested in the same
+        // file/module as DagEngine, so it can reach private fields) to prove
+        // get_plan_draft's distinct empty-draft error branch still fires correctly.
+        // Kept as defense-in-depth for a hypothetical future "remove task" API that
+        // could reintroduce a path to an empty-but-present draft.
+        let mut dag = DagEngine::new();
+        dag.plan_drafts.insert(
+            "draft-empty".to_string(),
+            PlanDraft {
+                id: "draft-empty".to_string(),
+                seq: 0,
+                last_touched_seq: 0,
+                tasks: Vec::new(),
+                agents: Vec::new(),
+            },
+        );
+
+        let read_err = dag.get_plan_draft("draft-empty").unwrap_err();
+        assert!(read_err.contains("no tasks"), "unexpected: {read_err}");
+    }
+
+    #[test]
+    fn plan_draft_readback_detects_corrupted_out_of_bounds_depends_on() {
+        // Defense-in-depth test for the get_plan_draft invariant check: directly
+        // construct a corrupted draft (same private-field-access technique as the
+        // empty-draft test above) whose depends_on is already out-of-range for the
+        // final task count — a state append-time validation should make
+        // unreachable — and assert get_plan_draft catches it with the specific
+        // internal-error message instead of silently returning bad data.
+        let mut dag = DagEngine::new();
+        dag.plan_drafts.insert(
+            "draft-corrupt".to_string(),
+            PlanDraft {
+                id: "draft-corrupt".to_string(),
+                seq: 0,
+                last_touched_seq: 0,
+                tasks: vec![WorkflowTaskInput {
+                    agent: "a".to_string(),
+                    prompt: "p0".to_string(),
+                    depends_on: vec![5],
+                    model: None,
+                    fallback_models: None,
+                }],
+                agents: vec!["a".to_string()],
+            },
+        );
+
+        let err = dag.get_plan_draft("draft-corrupt").unwrap_err();
+        assert!(
+            err.contains("internal error") && err.contains("out-of-bounds depends_on 5"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn plan_draft_readback_does_not_discard() {
+        let mut dag = DagEngine::new();
+        let t0 = serde_json::json!({"agent": "a", "prompt": "p0"});
+        let resp0: serde_json::Value =
+            serde_json::from_str(&dag.append_plan_task(&t0.to_string(), None).unwrap()).unwrap();
+        let plan_id = resp0["plan_id"].as_str().unwrap().to_string();
+
+        let first = dag.get_plan_draft(&plan_id).unwrap();
+        let second = dag.get_plan_draft(&plan_id).unwrap();
+        assert_eq!(first, second, "read-back must be non-destructive");
+    }
+
+    #[test]
+    fn plan_draft_discard_removes_and_is_idempotent() {
+        let mut dag = DagEngine::new();
+        let t0 = serde_json::json!({"agent": "a", "prompt": "p0"});
+        let resp0: serde_json::Value =
+            serde_json::from_str(&dag.append_plan_task(&t0.to_string(), None).unwrap()).unwrap();
+        let plan_id = resp0["plan_id"].as_str().unwrap().to_string();
+
+        let discard_resp: serde_json::Value =
+            serde_json::from_str(&dag.discard_plan_draft(&plan_id).unwrap()).unwrap();
+        assert_eq!(discard_resp["discarded"], true);
+
+        let err = dag.get_plan_draft(&plan_id).unwrap_err();
+        assert!(err.contains("not found"), "unexpected: {err}");
+
+        // Idempotent: discarding again, or an id that never existed, is not an error.
+        let discard_again: serde_json::Value =
+            serde_json::from_str(&dag.discard_plan_draft(&plan_id).unwrap()).unwrap();
+        assert_eq!(discard_again["discarded"], true);
+
+        let discard_never: serde_json::Value =
+            serde_json::from_str(&dag.discard_plan_draft("never-existed").unwrap()).unwrap();
+        assert_eq!(discard_never["discarded"], true);
+    }
+
+    #[test]
+    fn plan_draft_enforces_max_tasks_per_draft() {
+        let mut dag = DagEngine::new();
+        let mut plan_id: Option<String> = None;
+        for i in 0..MAX_TASKS_PER_DRAFT {
+            let t = serde_json::json!({"agent": format!("agent-{i}"), "prompt": format!("p{i}")});
+            let resp: serde_json::Value = serde_json::from_str(
+                &dag.append_plan_task(&t.to_string(), plan_id.as_deref())
+                    .unwrap(),
+            )
+            .unwrap();
+            plan_id = Some(resp["plan_id"].as_str().unwrap().to_string());
+        }
+        let final_id = plan_id.unwrap();
+
+        let tasks: Vec<serde_json::Value> =
+            serde_json::from_str(&dag.get_plan_draft(&final_id).unwrap()).unwrap();
+        assert_eq!(tasks.len(), MAX_TASKS_PER_DRAFT);
+
+        let overflow = serde_json::json!({"agent": "overflow", "prompt": "one too many"});
+        let err = dag
+            .append_plan_task(&overflow.to_string(), Some(&final_id))
+            .unwrap_err();
+        assert!(err.contains("maximum"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn plan_draft_evicts_lowest_seq_when_max_drafts_exceeded() {
+        let mut dag = DagEngine::new();
+        let mut ids: Vec<String> = Vec::new();
+        for i in 0..MAX_PLAN_DRAFTS {
+            let t = serde_json::json!({"agent": format!("agent-{i}"), "prompt": format!("p{i}")});
+            let resp: serde_json::Value =
+                serde_json::from_str(&dag.append_plan_task(&t.to_string(), None).unwrap()).unwrap();
+            ids.push(resp["plan_id"].as_str().unwrap().to_string());
+        }
+        assert_eq!(ids.len(), MAX_PLAN_DRAFTS);
+
+        // Touch the most recently created draft again — appends to an existing draft
+        // never trigger eviction.
+        let touch = serde_json::json!({"agent": "touch", "prompt": "again", "depends_on": [0]});
+        dag.append_plan_task(&touch.to_string(), Some(ids.last().unwrap()))
+            .unwrap();
+
+        // A 33rd distinct new draft should evict the very first one ever created.
+        let overflow = serde_json::json!({"agent": "overflow-agent", "prompt": "new draft"});
+        let resp_overflow: serde_json::Value =
+            serde_json::from_str(&dag.append_plan_task(&overflow.to_string(), None).unwrap())
+                .unwrap();
+        let overflow_id = resp_overflow["plan_id"].as_str().unwrap().to_string();
+        assert_ne!(overflow_id, ids[0]);
+
+        // The very first draft created is now gone.
+        let err = dag.get_plan_draft(&ids[0]).unwrap_err();
+        assert!(err.contains("not found"), "unexpected: {err}");
+
+        // The 33rd (newest) draft and the most recently touched one survive.
+        assert!(dag.get_plan_draft(&overflow_id).is_ok());
+        assert!(dag.get_plan_draft(ids.last().unwrap()).is_ok());
+        // A middle draft that was never re-touched also survives — only the single
+        // lowest-seq draft is evicted, not everything older than the newest.
+        assert!(dag.get_plan_draft(&ids[1]).is_ok());
+    }
+
+    #[test]
+    fn plan_draft_eviction_is_true_lru_not_fifo_by_creation() {
+        // Proves eviction tracks last-touched order, not creation order: touch the
+        // OLDEST draft (by appending a second task to it) so it is no longer the
+        // least-recently-touched draft, then force an eviction. A pure FIFO-by-
+        // creation policy would evict ids[0] regardless of the touch; true LRU must
+        // spare it and evict the draft that is genuinely least-recently-touched
+        // instead (ids[1], which was created second and never touched again).
+        let mut dag = DagEngine::new();
+        let mut ids: Vec<String> = Vec::new();
+        for i in 0..MAX_PLAN_DRAFTS {
+            let t = serde_json::json!({"agent": format!("agent-{i}"), "prompt": format!("p{i}")});
+            let resp: serde_json::Value =
+                serde_json::from_str(&dag.append_plan_task(&t.to_string(), None).unwrap()).unwrap();
+            ids.push(resp["plan_id"].as_str().unwrap().to_string());
+        }
+        assert_eq!(ids.len(), MAX_PLAN_DRAFTS);
+
+        // Touch the OLDEST draft (ids[0]) — appending to an existing draft bumps its
+        // last_touched_seq, making it the most-recently-touched despite being the
+        // first ever created.
+        let touch = serde_json::json!({"agent": "touch", "prompt": "again", "depends_on": [0]});
+        dag.append_plan_task(&touch.to_string(), Some(&ids[0]))
+            .unwrap();
+
+        // Force an eviction by creating one more brand-new draft.
+        let overflow = serde_json::json!({"agent": "overflow-agent", "prompt": "new draft"});
+        dag.append_plan_task(&overflow.to_string(), None).unwrap();
+
+        // The touched draft (ids[0], oldest by creation) must survive: this is the
+        // behavior that distinguishes true LRU from FIFO-by-creation.
+        assert!(
+            dag.get_plan_draft(&ids[0]).is_ok(),
+            "touched draft must survive eviction under true LRU"
+        );
+
+        // The draft that is now genuinely least-recently-touched (ids[1] — created
+        // second, never touched again) must be the one evicted instead.
+        let err = dag.get_plan_draft(&ids[1]).unwrap_err();
+        assert!(
+            err.contains("not found"),
+            "expected ids[1] (least-recently-touched) to be evicted, got: {err}"
         );
     }
 }

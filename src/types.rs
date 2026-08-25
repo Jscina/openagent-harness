@@ -131,16 +131,45 @@ pub struct WorkflowSummary {
     pub task_count: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct WorkflowTaskInput {
     pub agent: String,
     pub prompt: String,
     #[serde(default)]
     pub depends_on: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Task-level override for the fallback model chain.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_models: Option<Vec<String>>,
+}
+
+/// An in-progress plan draft accumulated via repeated `append_plan_task` calls, so a
+/// planner can build a workflow definition through many small tool calls instead of one
+/// large `save_plan` invocation carrying the entire tasks array.
+#[derive(Debug)]
+pub(crate) struct PlanDraft {
+    pub id: String,
+    /// Monotonically increasing creation order. Assigned once at creation and never
+    /// updated on later appends, so this reflects draft *age* only. Eviction is keyed
+    /// primarily on `last_touched_seq`, not this field; `seq` only serves as a
+    /// defensive secondary tie-breaker (see `append_plan_task`'s eviction logic).
+    pub seq: u64,
+    /// Monotonically increasing "last touched" order, drawn from the same counter as
+    /// `seq`. Set at creation (creation counts as the first touch) and refreshed on
+    /// every subsequent successful append. Eviction under `MAX_PLAN_DRAFTS` picks the
+    /// draft with the lowest `last_touched_seq` (true LRU), not the lowest `seq`
+    /// (which would be FIFO-by-creation and could evict a draft still actively being
+    /// built just because an older, untouched draft happened to be created first).
+    pub last_touched_seq: u64,
+    /// Ordered task entries, reusing the exact `WorkflowTaskInput` shape used by
+    /// `submit_workflow` so read-back requires zero transformation by the caller.
+    pub tasks: Vec<WorkflowTaskInput>,
+    /// Agent name per task, mirrored 1:1 with `tasks` and maintained incrementally
+    /// (one push per successful append) so `append_plan_task`'s response can include
+    /// the `agents` array in O(1) amortized time instead of remapping all of `tasks`
+    /// on every call.
+    pub agents: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

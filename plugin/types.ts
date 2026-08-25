@@ -8,7 +8,7 @@ export interface WorkflowTaskInput {
 }
 
 export interface PlanSaveInput {
-  plan_id?: string;
+  plan_id: string;
   summary: string[];
   recommendations?: string[];
   tasks: WorkflowTaskInput[];

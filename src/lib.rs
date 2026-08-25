@@ -153,5 +153,27 @@ mod wasm {
                 .submit_review(task_id, review_json)
                 .map_err(|e| JsValue::from_str(&e))
         }
+
+        pub fn append_plan_task(
+            &mut self,
+            task_json: &str,
+            plan_id: Option<String>,
+        ) -> Result<String, JsValue> {
+            self.0
+                .append_plan_task(task_json, plan_id.as_deref())
+                .map_err(|e| JsValue::from_str(&e))
+        }
+
+        pub fn get_plan_draft(&self, plan_id: &str) -> Result<String, JsValue> {
+            self.0
+                .get_plan_draft(plan_id)
+                .map_err(|e| JsValue::from_str(&e))
+        }
+
+        pub fn discard_plan_draft(&mut self, plan_id: &str) -> Result<String, JsValue> {
+            self.0
+                .discard_plan_draft(plan_id)
+                .map_err(|e| JsValue::from_str(&e))
+        }
     }
 }

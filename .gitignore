@@ -29,7 +29,14 @@ target
 /plugin/node_modules/
 /plugin/bun.lockb
 /plugin/package-lock.json
-/plugin/wasm
+
+# NOTE: plugin/wasm/ generated artifacts (openagent_harness.js,
+# openagent_harness.d.ts, openagent_harness_bg.wasm,
+# openagent_harness_bg.wasm.d.ts) are intentionally NOT ignored — they
+# must be committed whenever Rust WASM exports change (see AGENTS.md).
+# `make wasm` removes the wasm-pack byproducts (.gitignore, package.json,
+# README.md) from plugin/wasm/ after each rebuild, so nothing extra ends
+# up there that would need ignoring.
 
 # Generated orchestration plan artifacts
 .opencode/

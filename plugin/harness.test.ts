@@ -15,7 +15,10 @@
  * real native-dispatch tasks), and letting it fire nondeterministically
  * against the mocked client would make tests flaky.
  */
-import { describe, it, expect, vi, beforeAll, beforeEach, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
+import { mkdtempSync, rmSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 import type { PluginInput } from '@opencode-ai/plugin';
 
 // vi.mock factories are hoisted above top-level const declarations, so the
@@ -32,6 +35,7 @@ vi.mock('./memory.js', () => ({
 }));
 
 import harnessPlugin from './harness.js';
+import { loadPlanArtifact } from './plans.js';
 import {
   createCard as createCardImport,
   appendTrace as appendTraceImport,
@@ -388,5 +392,175 @@ describe('harness_task_complete — auto-trace-on-failure glue', () => {
     const result = JSON.parse(raw as string);
     expect(result.status).toBe('failed');
     expect(await getWorkflowStatus(workflow_id)).toBe('failed');
+  });
+});
+
+// ─── plan_task / save_plan ──────────────────────────────────────────────────
+//
+// Exercises the real WASM DagEngine's plan-draft accumulator (append_plan_task /
+// get_plan_draft / discard_plan_draft) through the tool layer end-to-end, plus
+// real plan-artifact disk I/O (redirected to a per-test temp dir, same approach
+// as plans.test.ts).
+
+describe('plan_task / save_plan tools', () => {
+  let planTmpDir: string;
+
+  beforeEach(() => {
+    planTmpDir = mkdtempSync(join(tmpdir(), 'harness-plan-task-test-'));
+    vi.spyOn(process, 'cwd').mockReturnValue(planTmpDir);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(planTmpDir, { recursive: true, force: true });
+  });
+
+  it('rejects plan_task and save_plan calls from a non-planner agent', async () => {
+    await expect(
+      plugin.tool.plan_task.execute(
+        { agent: 'builder', prompt: 'do work', depends_on: [] },
+        makeContext('orchestrator'),
+      ),
+    ).rejects.toThrow('plan_task can only be executed by the planner agent');
+
+    await expect(
+      plugin.tool.save_plan.execute(
+        { plan_id: 'whatever', summary: ['x'] },
+        makeContext('orchestrator'),
+      ),
+    ).rejects.toThrow('save_plan can only be executed by the planner agent');
+  });
+
+  it('accumulates tasks one call at a time and finalizes into a plan artifact', async () => {
+    const first = JSON.parse(
+      (await plugin.tool.plan_task.execute(
+        { agent: 'explorer', prompt: 'map the repo', depends_on: [] },
+        makeContext('planner'),
+      )) as string,
+    );
+    expect(first).toMatchObject({
+      task_index: 0,
+      task_count: 1,
+      agent: 'explorer',
+      prompt_chars: 'map the repo'.length,
+      agents: ['explorer'],
+    });
+    expect(typeof first.plan_id).toBe('string');
+    const planId = first.plan_id as string;
+
+    const second = JSON.parse(
+      (await plugin.tool.plan_task.execute(
+        { agent: 'builder', prompt: 'build it', depends_on: [0], plan_id: planId },
+        makeContext('planner'),
+      )) as string,
+    );
+    expect(second).toMatchObject({
+      plan_id: planId,
+      task_index: 1,
+      task_count: 2,
+      agent: 'builder',
+      agents: ['explorer', 'builder'],
+    });
+
+    const saved = JSON.parse(
+      (await plugin.tool.save_plan.execute(
+        { plan_id: planId, summary: ['step 1', 'step 2'], recommendations: ['do it well'] },
+        makeContext('planner'),
+      )) as string,
+    );
+
+    expect(saved).toEqual({
+      plan_id: planId,
+      path: expect.stringContaining(`${planId}.json`),
+      task_count: 2,
+      summary: ['step 1', 'step 2'],
+      recommendations: ['do it well'],
+    });
+
+    const artifact = loadPlanArtifact(planId);
+    expect(artifact.tasks).toEqual([
+      { agent: 'explorer', prompt: 'map the repo', depends_on: [] },
+      { agent: 'builder', prompt: 'build it', depends_on: [0] },
+    ]);
+  });
+
+  it('passes model through to the appended task and preserves it in the saved artifact', async () => {
+    const first = JSON.parse(
+      (await plugin.tool.plan_task.execute(
+        { agent: 'builder', prompt: 'build it', depends_on: [], model: 'anthropic/claude-sonnet-4-6' },
+        makeContext('planner'),
+      )) as string,
+    );
+    const planId = first.plan_id as string;
+
+    await plugin.tool.save_plan.execute(
+      { plan_id: planId, summary: ['done'] },
+      makeContext('planner'),
+    );
+
+    const artifact = loadPlanArtifact(planId);
+    expect(artifact.tasks[0].model).toBe('anthropic/claude-sonnet-4-6');
+  });
+
+  it('rejects an out-of-bounds depends_on index with the draft-scoped error', async () => {
+    const first = JSON.parse(
+      (await plugin.tool.plan_task.execute(
+        { agent: 'explorer', prompt: 'first', depends_on: [] },
+        makeContext('planner'),
+      )) as string,
+    );
+    const planId = first.plan_id as string;
+
+    await expect(
+      plugin.tool.plan_task.execute(
+        { agent: 'builder', prompt: 'second', depends_on: [5], plan_id: planId },
+        makeContext('planner'),
+      ),
+    ).rejects.toThrow(
+      `plan_task failed: plan draft '${planId}' depends_on index 5 is out of bounds (only 1 tasks)`,
+    );
+  });
+
+  it('rejects an invalid caller-supplied plan_id on the very first plan_task call, before any draft is built', async () => {
+    await expect(
+      plugin.tool.plan_task.execute(
+        { agent: 'explorer', prompt: 'first', depends_on: [], plan_id: '../escape' },
+        makeContext('planner'),
+      ),
+    ).rejects.toThrow('invalid plan artifact id: ../escape (must not contain "/", "\\" or "..")');
+  });
+
+  it('save_plan surfaces the exact Rust error when the draft is missing', async () => {
+    await expect(
+      plugin.tool.save_plan.execute(
+        { plan_id: 'never-appended-to', summary: ['x'] },
+        makeContext('planner'),
+      ),
+    ).rejects.toThrow(
+      "plan draft 'never-appended-to' not found — call plan_task before save_plan",
+    );
+  });
+
+  it('save_plan discards the draft after a successful save so it cannot be re-saved without new appends', async () => {
+    const first = JSON.parse(
+      (await plugin.tool.plan_task.execute(
+        { agent: 'explorer', prompt: 'only task', depends_on: [] },
+        makeContext('planner'),
+      )) as string,
+    );
+    const planId = first.plan_id as string;
+
+    await plugin.tool.save_plan.execute(
+      { plan_id: planId, summary: ['ok'] },
+      makeContext('planner'),
+    );
+
+    await expect(
+      plugin.tool.save_plan.execute({ plan_id: planId, summary: ['again'] }, makeContext('planner')),
+    ).rejects.toThrow(`plan draft '${planId}' not found — call plan_task before save_plan`);
+  });
+
+  it('does not accept a tasks argument on save_plan (draft-only finalize path)', () => {
+    expect((plugin.tool.save_plan as any).args).not.toHaveProperty('tasks');
   });
 });

@@ -35,7 +35,7 @@ Core runtime behavior:
 For planned coding work, the flow is:
 
 1. `orchestrator` delegates planning to `planner`.
-2. `planner` may ask clarifying questions (requires `permission: question: allow` in frontmatter), then saves a plan artifact under `.opencode/plans`.
+2. `planner` may ask clarifying questions (requires `permission: question: allow` in frontmatter), then builds the plan incrementally with `plan_task` (one call per task) and finalizes it with `save_plan`, which persists the artifact under `.opencode/plans`.
 3. `planner` returns a `plan_id` and structured summary.
 4. `orchestrator` asks the user for explicit approval (also requires `permission: question: allow`).
 5. On approval, `orchestrator` calls `submit_plan` with `native_dispatch: true`.
@@ -238,7 +238,8 @@ The following tools are exposed by the plugin to OpenCode agents:
 | Tool | Description |
 | --- | --- |
 | `submit_workflow(tasks)` | Submit a raw task array directly to the DAG (low-level) |
-| `save_plan(tasks, summary, recommendations)` | Planner saves a plan artifact to `.opencode/plans/` |
+| `plan_task(agent, prompt, depends_on?, model?, plan_id?)` | Planner appends one task to an in-progress plan draft; call once per task, threading the returned `plan_id` through subsequent calls |
+| `save_plan(plan_id, summary, recommendations?)` | Planner finalizes the accumulated plan draft (built via `plan_task`) into a persisted artifact under `.opencode/plans/` |
 | `submit_plan(plan_id, native_dispatch)` | Orchestrator loads a plan artifact and submits it to the DAG |
 | `harness_state(workflow_id?)` | Query workflow snapshot; lists all workflows if no ID given |
 | `harness_dispatch_tasks(workflow_id)` | Native dispatch: poll for ready tasks; blocks until at least one is ready |
