@@ -15,11 +15,10 @@
  * real native-dispatch tasks), and letting it fire nondeterministically
  * against the mocked client would make tests flaky.
  */
-import { describe, it, expect, vi, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach, afterAll, type MockInstance } from 'vitest';
 import { mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import type { PluginInput } from '@opencode-ai/plugin';
 
 // vi.mock factories are hoisted above top-level const declarations, so the
 // mock fns must be created inline here rather than referencing an outer
@@ -35,6 +34,7 @@ vi.mock('./memory.js', () => ({
 }));
 
 import harnessPlugin from './harness.js';
+import { DagEngine } from './wasm/openagent_harness.js';
 import { loadPlanArtifact } from './plans.js';
 import {
   createCard as createCardImport,
@@ -52,48 +52,128 @@ const memoryMocks = {
   listActiveCards: vi.mocked(listActiveCardsImport),
 };
 
-function makeClient() {
+// ─── v2 ctx mock ────────────────────────────────────────────────────────────
+
+/** Event stream that honours the AbortSignal, like the real `ctx.event.subscribe`. */
+type Counts = { subscribe: number; transform: number };
+
+function makeEventStream(counts: Counts) {
+  const pending: unknown[] = [];
+  let wake: (() => void) | null = null;
+  const signals: AbortSignal[] = [];
   return {
-    session: {
-      create: vi.fn().mockResolvedValue({ data: { id: 'ses_mock' } }),
-      promptAsync: vi.fn().mockResolvedValue({ data: {} }),
-      delete: vi.fn().mockResolvedValue({ data: {} }),
-      abort: vi.fn().mockResolvedValue({ data: {} }),
+    signals,
+    push(...batch: unknown[]) {
+      pending.push(...batch);
+      wake?.();
     },
-    tui: {
-      showToast: vi.fn().mockResolvedValue({ data: {} }),
-    },
-  } as unknown as PluginInput['client'];
+    subscribe: ((options?: { signal?: AbortSignal }) => {
+      counts.subscribe++;
+      if (options?.signal) signals.push(options.signal);
+      return {
+        [Symbol.asyncIterator]() {
+          return {
+            async next(): Promise<IteratorResult<unknown>> {
+              while (true) {
+                if (options?.signal?.aborted) return { done: true, value: undefined };
+                if (pending.length > 0) return { done: false, value: pending.shift() };
+                await new Promise<void>((resolve) => {
+                  wake = resolve;
+                  options?.signal?.addEventListener('abort', () => resolve(), { once: true });
+                });
+              }
+            },
+          };
+        },
+      };
+    }),
+  };
 }
 
-// Minimal ToolContext stub — only the fields the tools under test actually
-// read (submit_workflow reads .agent; harness_task_complete/memory_* tools
-// read none of it) are meaningful; the rest exist only to satisfy the type.
+let sessionCounter = 0;
+
+/** Build a v2 `Plugin.Context` mock, run the plugin's `setup`, and expose what it registered. */
+async function makeHarness() {
+  const counts: Counts = { subscribe: 0, transform: 0 };
+  const events = makeEventStream(counts);
+  const session = {
+    create: vi.fn(async () => ({ id: `ses_mock_${++sessionCounter}` })),
+    prompt: vi.fn().mockResolvedValue({}),
+    remove: vi.fn().mockResolvedValue(undefined),
+    interrupt: vi.fn().mockResolvedValue({ interrupted: true }),
+    switchAgent: vi.fn().mockResolvedValue(undefined),
+    switchModel: vi.fn().mockResolvedValue(undefined),
+  };
+
+  const tools = new Map<string, any>();
+  const toolDispose = vi.fn().mockResolvedValue(undefined);
+  const hooks = new Map<string, (event: any) => unknown>();
+  const hookDispose = vi.fn().mockResolvedValue(undefined);
+
+  const ctx = {
+    location: { directory: '/tmp' },
+    session,
+    event: { subscribe: events.subscribe },
+    tool: {
+      transform: async (cb: (editor: { add: (t: any) => void }) => void) => {
+        counts.transform++;
+        cb({ add: (t) => tools.set(t.name, t) });
+        return { dispose: toolDispose };
+      },
+      hook: vi.fn(async (name: string, cb: (event: any) => unknown) => {
+        hooks.set(name, cb);
+        return { dispose: hookDispose };
+      }),
+    },
+  };
+
+  const cleanup = (await (harnessPlugin as any).setup(ctx)) as () => Promise<void>;
+
+  /** Call a registered tool and return its `content` string (v2 result shape). */
+  const call = async (name: string, input: unknown, context = makeContext()) => {
+    const tool = tools.get(name);
+    if (!tool) throw new Error(`tool not registered: ${name}`);
+    const result = await tool.execute(input, context);
+    return result.content as string;
+  };
+
+  return { ctx, session, events, counts, tools, hooks, toolDispose, hookDispose, cleanup, call };
+}
+
+type Harness = Awaited<ReturnType<typeof makeHarness>>;
+
+/** Let the event pump and any chained promises settle (real setImmediate; see beforeAll). */
+const flush = async () => {
+  for (let i = 0; i < 3; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+};
+
+// Minimal v2 ToolContext stub — only the fields the tools under test actually
+// read (agent gating reads .agent; submit_review reads .sessionID).
 function makeContext(agent = 'orchestrator') {
   return {
     sessionID: 'ses_ctx',
     messageID: 'msg_ctx',
     agent,
-    directory: '/tmp',
-    worktree: '/tmp',
-    abort: new AbortController().signal,
-    metadata: () => {},
-    ask: async () => {},
+    id: 'call_ctx',
+    signal: new AbortController().signal,
+    progress: async () => {},
   } as any;
 }
 
-let plugin: Awaited<ReturnType<typeof harnessPlugin>>;
-let client: ReturnType<typeof makeClient>;
+let harness: Harness;
+const callTool = (name: string, input: unknown, context?: unknown) =>
+  harness.call(name, input, context as any);
 
 beforeAll(async () => {
   // Must be enabled before the plugin is instantiated so the setInterval it
   // registers internally is captured by the fake clock, not the real one.
-  vi.useFakeTimers();
-  client = makeClient();
-  plugin = await harnessPlugin({ client } as unknown as PluginInput);
+  // setImmediate/setTimeout stay real so tests can flush promises.
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
+  harness = await makeHarness();
 });
 
-afterAll(() => {
+afterAll(async () => {
+  await harness.cleanup();
   vi.useRealTimers();
 });
 
@@ -107,16 +187,17 @@ beforeEach(() => {
 
 /** Submit a single-task workflow directly against the real DAG and return its ids. */
 async function submitOneTask(agent = 'builder') {
-  const raw = await plugin.tool.submit_workflow.execute(
+  const raw = await callTool(
+    'submit_workflow',
     { tasks: [{ agent, prompt: 'do work', depends_on: [] }] },
     makeContext('orchestrator'),
   );
-  return JSON.parse(raw as string) as { workflow_id: string; task_ids: string[] };
+  return JSON.parse(raw) as { workflow_id: string; task_ids: string[] };
 }
 
 async function getWorkflowStatus(workflow_id: string): Promise<string | null> {
-  const raw = await plugin.tool.harness_state.execute({ workflow_id }, makeContext());
-  const parsed = JSON.parse(raw as string) as { snapshot: { status?: { type?: string } } };
+  const raw = await callTool('harness_state', { workflow_id }, makeContext());
+  const parsed = JSON.parse(raw) as { snapshot: { status?: { type?: string } } };
   return parsed.snapshot?.status?.type ?? null;
 }
 
@@ -126,7 +207,7 @@ describe('memory_card tool', () => {
   it('calls createCard with the given args and returns the created files + success', async () => {
     memoryMocks.createCard.mockReturnValue(['context.md', 'trace.md', 'benchmarks.md', 'artifacts/.gitkeep']);
 
-    const result = await plugin.tool.memory_card.execute(
+    const result = await callTool('memory_card', 
       { cardId: 'CARD-123', symptom: 'crash on export', source: 'ado', backlog: false },
       makeContext(),
     );
@@ -137,7 +218,7 @@ describe('memory_card tool', () => {
       source: 'ado',
       backlog: false,
     });
-    const parsed = JSON.parse(result as string);
+    const parsed = JSON.parse(result);
     expect(parsed).toEqual({
       success: true,
       cardId: 'CARD-123',
@@ -147,7 +228,7 @@ describe('memory_card tool', () => {
 
   it('passes through undefined optional args unchanged', async () => {
     memoryMocks.createCard.mockReturnValue(['context.md']);
-    await plugin.tool.memory_card.execute({ cardId: 'CARD-BACKLOG', backlog: true }, makeContext());
+    await callTool('memory_card', { cardId: 'CARD-BACKLOG', backlog: true }, makeContext());
     expect(memoryMocks.createCard).toHaveBeenCalledWith({
       cardId: 'CARD-BACKLOG',
       symptom: undefined,
@@ -162,7 +243,7 @@ describe('memory_card tool', () => {
     });
 
     await expect(
-      plugin.tool.memory_card.execute({ cardId: 'CARD-123' }, makeContext()),
+      callTool('memory_card', { cardId: 'CARD-123' }, makeContext()),
     ).rejects.toThrow(/memory_card failed:.*card already exists/);
   });
 
@@ -172,7 +253,7 @@ describe('memory_card tool', () => {
     });
 
     await expect(
-      plugin.tool.memory_card.execute({ cardId: 'CARD-123' }, makeContext()),
+      callTool('memory_card', { cardId: 'CARD-123' }, makeContext()),
     ).rejects.toThrow('memory_card failed: disk full');
   });
 });
@@ -190,7 +271,7 @@ describe('memory_trace tool', () => {
       formatted: 'Appended finding entry to /root/issues/active/CARD-1/trace.md (5 -> 9 lines)\n  ~30 tokens not pulled into context',
     });
 
-    const result = await plugin.tool.memory_trace.execute(
+    const result = await callTool('memory_trace', 
       { cardId: 'CARD-1', type: 'finding', body: 'Truncation is at export.c:342', session: 'opencode' },
       makeContext(),
     );
@@ -210,7 +291,7 @@ describe('memory_trace tool', () => {
     });
 
     await expect(
-      plugin.tool.memory_trace.execute({ cardId: 'CARD-1', type: 'next-step', body: '   ' }, makeContext()),
+      callTool('memory_trace', { cardId: 'CARD-1', type: 'next-step', body: '   ' }, makeContext()),
     ).rejects.toThrow(/memory_trace failed:.*empty entry body/);
   });
 });
@@ -221,7 +302,7 @@ describe('memory_context tool', () => {
   it('calls assembleContext with the given args and returns the assembled markdown', async () => {
     memoryMocks.assembleContext.mockReturnValue('# RAG Context — CARD-1\n\n...');
 
-    const result = await plugin.tool.memory_context.execute(
+    const result = await callTool('memory_context', 
       { cardId: 'CARD-1', mode: 'full', sections: ['known-behaviors'] },
       makeContext(),
     );
@@ -240,7 +321,7 @@ describe('memory_context tool', () => {
     });
 
     await expect(
-      plugin.tool.memory_context.execute({ cardId: 'CARD-NOPE' }, makeContext()),
+      callTool('memory_context', { cardId: 'CARD-NOPE' }, makeContext()),
     ).rejects.toThrow(/memory_context failed:.*card not found/);
   });
 });
@@ -255,7 +336,7 @@ describe('memory_promote tool', () => {
       created: true,
     });
 
-    const result = await plugin.tool.memory_promote.execute(
+    const result = await callTool('memory_promote', 
       {
         cardId: 'CARD-1',
         finding: 'Export truncates at 4096 bytes',
@@ -275,7 +356,7 @@ describe('memory_promote tool', () => {
       title: 'Export Truncation',
       sectionTitle: 'Size Limit',
     });
-    expect(JSON.parse(result as string)).toEqual({
+    expect(JSON.parse(result)).toEqual({
       success: true,
       systemPath: '/root/system/known-behaviors/export-truncation.md',
       benchmarksPath: '/root/issues/active/CARD-1/benchmarks.md',
@@ -289,7 +370,7 @@ describe('memory_promote tool', () => {
     });
 
     await expect(
-      plugin.tool.memory_promote.execute(
+      callTool('memory_promote', 
         { cardId: 'CARD-NOPE', finding: 'x', targetPath: 'known-behaviors/x.md' },
         makeContext(),
       ),
@@ -309,13 +390,13 @@ describe('harness_task_complete — auto-trace-on-failure glue', () => {
     memoryMocks.listActiveCards.mockReturnValue([]);
     const { workflow_id, task_ids } = await submitOneTask();
 
-    const raw = await plugin.tool.harness_task_complete.execute(
+    const raw = await callTool('harness_task_complete', 
       { task_id: task_ids[0], session_id: 'ses_a', status: 'failed', error: TERMINAL_ERROR },
       makeContext(),
     );
 
     expect(memoryMocks.appendTrace).not.toHaveBeenCalled();
-    expect(JSON.parse(raw as string).status).toBe('failed');
+    expect(JSON.parse(raw).status).toBe('failed');
     expect(await getWorkflowStatus(workflow_id)).toBe('failed');
   });
 
@@ -324,7 +405,7 @@ describe('harness_task_complete — auto-trace-on-failure glue', () => {
     const { workflow_id, task_ids } = await submitOneTask();
     const taskId = task_ids[0];
 
-    const raw = await plugin.tool.harness_task_complete.execute(
+    const raw = await callTool('harness_task_complete', 
       { task_id: taskId, session_id: 'ses_b', status: 'failed', error: TERMINAL_ERROR },
       makeContext(),
     );
@@ -336,7 +417,7 @@ describe('harness_task_complete — auto-trace-on-failure glue', () => {
     expect(call.body).toContain(taskId);
     expect(call.body).toContain(TERMINAL_ERROR);
 
-    expect(JSON.parse(raw as string).status).toBe('failed');
+    expect(JSON.parse(raw).status).toBe('failed');
     expect(await getWorkflowStatus(workflow_id)).toBe('failed');
   });
 
@@ -344,13 +425,13 @@ describe('harness_task_complete — auto-trace-on-failure glue', () => {
     memoryMocks.listActiveCards.mockReturnValue(['CARD-A', 'CARD-B']);
     const { workflow_id, task_ids } = await submitOneTask();
 
-    const raw = await plugin.tool.harness_task_complete.execute(
+    const raw = await callTool('harness_task_complete', 
       { task_id: task_ids[0], session_id: 'ses_c', status: 'failed', error: TERMINAL_ERROR },
       makeContext(),
     );
 
     expect(memoryMocks.appendTrace).not.toHaveBeenCalled();
-    expect(JSON.parse(raw as string).status).toBe('failed');
+    expect(JSON.parse(raw).status).toBe('failed');
     expect(await getWorkflowStatus(workflow_id)).toBe('failed');
   });
 
@@ -361,7 +442,7 @@ describe('harness_task_complete — auto-trace-on-failure glue', () => {
     });
     const { workflow_id, task_ids } = await submitOneTask();
 
-    const raw = await plugin.tool.harness_task_complete.execute(
+    const raw = await callTool('harness_task_complete', 
       { task_id: task_ids[0], session_id: 'ses_d', status: 'failed', error: TERMINAL_ERROR },
       makeContext(),
     );
@@ -369,7 +450,7 @@ describe('harness_task_complete — auto-trace-on-failure glue', () => {
     // The glue attempted the call (and threw internally) but that must not
     // propagate: the tool call itself resolves normally...
     expect(memoryMocks.appendTrace).toHaveBeenCalledTimes(1);
-    const result = JSON.parse(raw as string);
+    const result = JSON.parse(raw);
     expect(result.registered).toBe(true);
     expect(result.status).toBe('failed');
     expect(result.error).toBe(TERMINAL_ERROR);
@@ -383,13 +464,13 @@ describe('harness_task_complete — auto-trace-on-failure glue', () => {
     });
     const { workflow_id, task_ids } = await submitOneTask();
 
-    const raw = await plugin.tool.harness_task_complete.execute(
+    const raw = await callTool('harness_task_complete', 
       { task_id: task_ids[0], session_id: 'ses_e', status: 'failed', error: TERMINAL_ERROR },
       makeContext(),
     );
 
     expect(memoryMocks.appendTrace).not.toHaveBeenCalled();
-    const result = JSON.parse(raw as string);
+    const result = JSON.parse(raw);
     expect(result.status).toBe('failed');
     expect(await getWorkflowStatus(workflow_id)).toBe('failed');
   });
@@ -417,14 +498,14 @@ describe('plan_task / save_plan tools', () => {
 
   it('rejects plan_task and save_plan calls from a non-planner agent', async () => {
     await expect(
-      plugin.tool.plan_task.execute(
+      callTool('plan_task', 
         { agent: 'builder', prompt: 'do work', depends_on: [] },
         makeContext('orchestrator'),
       ),
     ).rejects.toThrow('plan_task can only be executed by the planner agent');
 
     await expect(
-      plugin.tool.save_plan.execute(
+      callTool('save_plan', 
         { plan_id: 'whatever', summary: ['x'] },
         makeContext('orchestrator'),
       ),
@@ -433,7 +514,7 @@ describe('plan_task / save_plan tools', () => {
 
   it('accumulates tasks one call at a time and finalizes into a plan artifact', async () => {
     const first = JSON.parse(
-      (await plugin.tool.plan_task.execute(
+      (await callTool('plan_task', 
         { agent: 'explorer', prompt: 'map the repo', depends_on: [] },
         makeContext('planner'),
       )) as string,
@@ -449,7 +530,7 @@ describe('plan_task / save_plan tools', () => {
     const planId = first.plan_id as string;
 
     const second = JSON.parse(
-      (await plugin.tool.plan_task.execute(
+      (await callTool('plan_task', 
         { agent: 'builder', prompt: 'build it', depends_on: [0], plan_id: planId },
         makeContext('planner'),
       )) as string,
@@ -463,7 +544,7 @@ describe('plan_task / save_plan tools', () => {
     });
 
     const saved = JSON.parse(
-      (await plugin.tool.save_plan.execute(
+      (await callTool('save_plan', 
         { plan_id: planId, summary: ['step 1', 'step 2'], recommendations: ['do it well'] },
         makeContext('planner'),
       )) as string,
@@ -486,14 +567,14 @@ describe('plan_task / save_plan tools', () => {
 
   it('passes model through to the appended task and preserves it in the saved artifact', async () => {
     const first = JSON.parse(
-      (await plugin.tool.plan_task.execute(
+      (await callTool('plan_task', 
         { agent: 'builder', prompt: 'build it', depends_on: [], model: 'anthropic/claude-sonnet-4-6' },
         makeContext('planner'),
       )) as string,
     );
     const planId = first.plan_id as string;
 
-    await plugin.tool.save_plan.execute(
+    await callTool('save_plan', 
       { plan_id: planId, summary: ['done'] },
       makeContext('planner'),
     );
@@ -504,7 +585,7 @@ describe('plan_task / save_plan tools', () => {
 
   it('rejects an out-of-bounds depends_on index with the draft-scoped error', async () => {
     const first = JSON.parse(
-      (await plugin.tool.plan_task.execute(
+      (await callTool('plan_task', 
         { agent: 'explorer', prompt: 'first', depends_on: [] },
         makeContext('planner'),
       )) as string,
@@ -512,7 +593,7 @@ describe('plan_task / save_plan tools', () => {
     const planId = first.plan_id as string;
 
     await expect(
-      plugin.tool.plan_task.execute(
+      callTool('plan_task', 
         { agent: 'builder', prompt: 'second', depends_on: [5], plan_id: planId },
         makeContext('planner'),
       ),
@@ -523,7 +604,7 @@ describe('plan_task / save_plan tools', () => {
 
   it('rejects an invalid caller-supplied plan_id on the very first plan_task call, before any draft is built', async () => {
     await expect(
-      plugin.tool.plan_task.execute(
+      callTool('plan_task', 
         { agent: 'explorer', prompt: 'first', depends_on: [], plan_id: '../escape' },
         makeContext('planner'),
       ),
@@ -532,7 +613,7 @@ describe('plan_task / save_plan tools', () => {
 
   it('save_plan surfaces the exact Rust error when the draft is missing', async () => {
     await expect(
-      plugin.tool.save_plan.execute(
+      callTool('save_plan', 
         { plan_id: 'never-appended-to', summary: ['x'] },
         makeContext('planner'),
       ),
@@ -543,24 +624,464 @@ describe('plan_task / save_plan tools', () => {
 
   it('save_plan discards the draft after a successful save so it cannot be re-saved without new appends', async () => {
     const first = JSON.parse(
-      (await plugin.tool.plan_task.execute(
+      (await callTool('plan_task', 
         { agent: 'explorer', prompt: 'only task', depends_on: [] },
         makeContext('planner'),
       )) as string,
     );
     const planId = first.plan_id as string;
 
-    await plugin.tool.save_plan.execute(
+    await callTool('save_plan', 
       { plan_id: planId, summary: ['ok'] },
       makeContext('planner'),
     );
 
     await expect(
-      plugin.tool.save_plan.execute({ plan_id: planId, summary: ['again'] }, makeContext('planner')),
+      callTool('save_plan', { plan_id: planId, summary: ['again'] }, makeContext('planner')),
     ).rejects.toThrow(`plan draft '${planId}' not found — call plan_task before save_plan`);
   });
 
   it('does not accept a tasks argument on save_plan (draft-only finalize path)', () => {
-    expect((plugin.tool.save_plan as any).args).not.toHaveProperty('tasks');
+    expect(harness.tools.get('save_plan').input.properties).not.toHaveProperty('tasks');
+  });
+});
+
+// ─── v2 entrypoint & tool registration ─────────────────────────────────────
+
+const EXPECTED_TOOLS = [
+  'submit_workflow',
+  'plan_task',
+  'save_plan',
+  'submit_plan',
+  'harness_state',
+  'harness_cancel',
+  'harness_dispatch_tasks',
+  'harness_task_complete',
+  'submit_review',
+  'memory_card',
+  'memory_trace',
+  'memory_context',
+  'memory_promote',
+];
+
+describe('plugin entrypoint (v2)', () => {
+  it('is a Plugin.define() plugin with the openagent-harness id', () => {
+    expect((harnessPlugin as any).id).toBe('openagent-harness');
+    expect(typeof (harnessPlugin as any).setup).toBe('function');
+  });
+
+  it('registers exactly the 13 un-namespaced tools via ctx.tool.transform', () => {
+    expect([...harness.tools.keys()].sort()).toEqual([...EXPECTED_TOOLS].sort());
+    expect(harness.counts.transform).toBe(1);
+    for (const tool of harness.tools.values()) {
+      expect(typeof tool.description).toBe('string');
+      expect(tool.options?.namespace).toBeUndefined();
+    }
+  });
+
+  it('declares every tool input as a closed JSON Schema object', () => {
+    for (const tool of harness.tools.values()) {
+      expect(tool.input.type).toBe('object');
+      expect(tool.input.additionalProperties).toBe(false);
+    }
+  });
+
+  it('keeps required/optional, enums, arrays and nested objects in the schemas', () => {
+    const t = (n: string) => harness.tools.get(n).input;
+
+    expect(t('submit_workflow')).toEqual({
+      type: 'object',
+      properties: {
+        tasks: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              agent: { type: 'string' },
+              prompt: { type: 'string' },
+              depends_on: { type: 'array', items: { type: 'number' } },
+              model: { type: 'string' },
+            },
+            required: ['agent', 'prompt', 'depends_on'],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ['tasks'],
+      additionalProperties: false,
+    });
+
+    expect(t('plan_task').required).toEqual(['agent', 'prompt']);
+    expect(Object.keys(t('plan_task').properties)).toEqual(['agent', 'prompt', 'depends_on', 'model', 'plan_id']);
+    expect(t('save_plan').required).toEqual(['plan_id', 'summary']);
+    expect(t('submit_plan').required).toEqual(['plan_id']);
+    expect(t('harness_state').required).toBeUndefined();
+    expect(t('harness_cancel').required).toBeUndefined();
+    expect(t('harness_dispatch_tasks').required).toEqual(['workflow_id']);
+    expect(t('harness_dispatch_tasks').properties.timeout_ms).toEqual({ type: 'number' });
+    expect(t('harness_task_complete').required).toEqual(['task_id', 'session_id', 'status']);
+    expect(t('harness_task_complete').properties.status).toEqual({ type: 'string', enum: ['done', 'failed'] });
+    expect(t('memory_card').properties.source.enum).toEqual(['ado', 'qa', 'prod', 'other']);
+    expect(t('memory_trace').properties.type.enum).toEqual(['finding', 'ruled-out', 'hypothesis', 'next-step']);
+    expect(t('memory_context').properties.mode.enum).toEqual(['compact', 'full']);
+    expect(t('memory_promote').required).toEqual(['cardId', 'finding', 'targetPath']);
+
+    const findings = t('submit_review').properties.findings;
+    expect(t('submit_review').required).toEqual(['task_id', 'status', 'summary']);
+    expect(findings.type).toBe('array');
+    expect(findings.items.required).toEqual(['message']);
+    expect(findings.items.additionalProperties).toBe(false);
+    expect(Object.keys(findings.items.properties)).toEqual(['message', 'file', 'line', 'severity']);
+  });
+
+  it('wraps the tool string result as { content } and keeps the orchestrator/planner gating', async () => {
+    const raw = await harness.tools.get('harness_state').execute({}, makeContext());
+    expect(Object.keys(raw)).toEqual(['content']);
+    expect(JSON.parse(raw.content)).toEqual({ workflows: expect.any(Array) });
+
+    await expect(
+      callTool('submit_workflow', { tasks: [] }, makeContext('builder')),
+    ).rejects.toThrow('submit_workflow can only be executed by the orchestrator agent');
+    await expect(
+      callTool('submit_plan', { plan_id: 'x' }, makeContext('planner')),
+    ).rejects.toThrow('submit_plan can only be executed by the orchestrator agent');
+  });
+
+  it('describes harness_dispatch_tasks / harness_task_complete in terms of the v2 subagent tool', () => {
+    const dispatch = harness.tools.get('harness_dispatch_tasks').description as string;
+    const complete = harness.tools.get('harness_task_complete').description as string;
+    for (const text of [dispatch, complete]) {
+      expect(text).toContain('subagent');
+      expect(text).toContain('sessionID');
+      expect(text).not.toContain('Task tool');
+      expect(text).not.toContain("'task_id: <session_id>'");
+    }
+    expect(dispatch).toContain('<subagent sessionID=');
+    expect(dispatch).toContain('Subagent failed (sessionID:');
+  });
+
+  it('registers only an execute.after tool hook (no empty execute.before)', () => {
+    expect([...harness.hooks.keys()]).toEqual(['execute.after']);
+  });
+
+  it('subscribes to events with an AbortSignal', () => {
+    expect(harness.counts.subscribe).toBe(1);
+    expect(harness.events.signals).toHaveLength(1);
+  });
+});
+
+// ─── v2 events, hook and cleanup (real WASM engine) ────────────────────────
+
+const ev = (type: string, data: unknown) => ({ id: 'evt', created: 0, type, data });
+const idleEvent = (sessionID: string) => ev('session.idle', { sessionID });
+const statusEvent = (sessionID: string, type: 'idle' | 'busy') =>
+  ev('session.status', { sessionID, status: { type } });
+const failedEvent = (sessionID: string, error: unknown) =>
+  ev('session.execution.failed', { sessionID, error });
+
+describe('v2 events, tool hook and cleanup', () => {
+  const harnesses: Harness[] = [];
+  let processEvent: MockInstance<DagEngine['process_event']>;
+
+  async function fresh(): Promise<Harness> {
+    const h = await makeHarness();
+    harnesses.push(h);
+    return h;
+  }
+
+  /** Submit a one-task workflow and tick it so it is Running, bound to `sid`. */
+  async function startTask(h: Harness, sid: string, agent = 'builder') {
+    h.session.create.mockResolvedValueOnce({ id: sid });
+    const { workflow_id, task_ids } = JSON.parse(
+      await h.call('submit_workflow', { tasks: [{ agent, prompt: 'do work', depends_on: [] }] }),
+    ) as { workflow_id: string; task_ids: string[] };
+    await vi.advanceTimersByTimeAsync(500);
+    await flush();
+    return { workflow_id, task_id: task_ids[0] };
+  }
+
+  const status = async (h: Harness, workflow_id: string) =>
+    (JSON.parse(await h.call('harness_state', { workflow_id })) as { snapshot: { status?: { type?: string } } })
+      .snapshot?.status?.type;
+
+  const engineCalls = (type: string) => processEvent.mock.calls.filter((c) => c[0] === type);
+
+  beforeEach(() => {
+    processEvent = vi.spyOn(DagEngine.prototype, 'process_event');
+  });
+
+  afterEach(async () => {
+    processEvent.mockRestore();
+    while (harnesses.length) await harnesses.pop()!.cleanup();
+  });
+
+  it('starts a task through the v2 session adapter on tick', async () => {
+    const h = await fresh();
+    await startTask(h, 'ses_start', 'builder');
+    expect(h.session.create).toHaveBeenCalledWith(expect.objectContaining({ parentID: 'ses_ctx', agent: 'builder' }));
+    expect(h.session.switchAgent).toHaveBeenCalledWith({ sessionID: 'ses_start', agent: 'builder' });
+    expect(h.session.prompt).toHaveBeenCalledWith({ sessionID: 'ses_start', text: 'do work' });
+  });
+
+  it('completes a task on a v2 session.idle event (reads data.sessionID)', async () => {
+    const h = await fresh();
+    const { workflow_id } = await startTask(h, 'ses_idle');
+    expect(await status(h, workflow_id)).toBe('running');
+
+    h.events.push(idleEvent('ses_idle'));
+    await flush();
+
+    expect(await status(h, workflow_id)).toBe('done');
+    const [, sessionId, payload] = engineCalls('session.idle')[0];
+    expect(sessionId).toBe('ses_idle');
+    expect(JSON.parse(payload as string)).toEqual({ sessionID: 'ses_idle' });
+    expect(h.session.remove).toHaveBeenCalledWith({ sessionID: 'ses_idle' });
+  });
+
+  it('derives idle from session.status with status.type "idle"', async () => {
+    const h = await fresh();
+    const { workflow_id } = await startTask(h, 'ses_status');
+
+    h.events.push(statusEvent('ses_status', 'busy'));
+    await flush();
+    expect(engineCalls('session.idle')).toHaveLength(0);
+    expect(await status(h, workflow_id)).toBe('running');
+
+    h.events.push(statusEvent('ses_status', 'idle'));
+    await flush();
+    expect(await status(h, workflow_id)).toBe('done');
+    expect(engineCalls('session.idle')).toHaveLength(1);
+  });
+
+  it('de-duplicates session.idle + session.status(idle) per session', async () => {
+    const h = await fresh();
+    await startTask(h, 'ses_dup');
+
+    h.events.push(idleEvent('ses_dup'), statusEvent('ses_dup', 'idle'), idleEvent('ses_dup'));
+    await flush();
+    expect(engineCalls('session.idle')).toHaveLength(1);
+  });
+
+  it('lets a later idle through after a busy status or once the dedupe window has passed', async () => {
+    const h = await fresh();
+    await startTask(h, 'ses_again');
+
+    h.events.push(idleEvent('ses_again'));
+    await flush();
+    h.events.push(statusEvent('ses_again', 'busy'), idleEvent('ses_again'));
+    await flush();
+    expect(engineCalls('session.idle')).toHaveLength(2);
+
+    vi.setSystemTime(Date.now() + 5000);
+    h.events.push(statusEvent('ses_again', 'idle'));
+    await flush();
+    expect(engineCalls('session.idle')).toHaveLength(3);
+  });
+
+  it('maps session.execution.failed to a "session.error" engine event with a string error', async () => {
+    const h = await fresh();
+    await startTask(h, 'ses_fail');
+
+    h.events.push(failedEvent('ses_fail', { type: 'ApiError', message: 'Unauthorized', status: 401 }));
+    await flush();
+
+    const [call] = engineCalls('session.error');
+    expect(call[1]).toBe('ses_fail');
+    expect(JSON.parse(call[2] as string)).toEqual({
+      sessionID: 'ses_fail',
+      error: 'ApiError: Unauthorized (HTTP 401)',
+    });
+  });
+
+  it('fails the task for a terminal v2 error (auth / context overflow)', async () => {
+    const h = await fresh();
+    const a = await startTask(h, 'ses_auth');
+    h.events.push(failedEvent('ses_auth', { name: 'ProviderAuthError', data: { message: 'bad key' } }));
+    await flush();
+    expect(await status(h, a.workflow_id)).toBe('failed');
+
+    const b = await startTask(h, 'ses_ctxovf');
+    h.events.push(failedEvent('ses_ctxovf', { type: 'ContextOverflowError', message: 'too long' }));
+    await flush();
+    expect(await status(h, b.workflow_id)).toBe('failed');
+  });
+
+  it('falls back (task goes Pending again) on a retryable v2 error when fallbacks exist', async () => {
+    const h = await fresh();
+    // docs-writer ships fallback_models in its frontmatter.
+    const { workflow_id } = await startTask(h, 'ses_429', 'docs-writer');
+
+    h.events.push(failedEvent('ses_429', { type: 'ApiError', message: 'Too many requests', status: 429 }));
+    await flush();
+
+    expect(await status(h, workflow_id)).toBe('running');
+    expect(h.session.remove).toHaveBeenCalledWith({ sessionID: 'ses_429' });
+
+    // Next tick re-dispatches the task on a new session with the fallback model.
+    h.session.create.mockResolvedValueOnce({ id: 'ses_retry' });
+    await vi.advanceTimersByTimeAsync(500);
+    await flush();
+    expect(h.session.prompt).toHaveBeenCalledWith({ sessionID: 'ses_retry', text: 'do work' });
+  });
+
+  it('fails a retryable error when the task has no fallbacks left', async () => {
+    const h = await fresh();
+    const { workflow_id } = await startTask(h, 'ses_nofb', 'no-fallback-agent');
+    h.events.push(failedEvent('ses_nofb', { type: 'ApiError', message: 'overloaded', status: 503 }));
+    await flush();
+    expect(await status(h, workflow_id)).toBe('failed');
+  });
+
+  it('drops late idle/failed events for cancelled sessions (cancelledSessions guard)', async () => {
+    const h = await fresh();
+    const a = await startTask(h, 'ses_cx1');
+    await h.call('harness_cancel', { workflow_id: a.workflow_id });
+    expect(h.session.interrupt).toHaveBeenCalledWith({ sessionID: 'ses_cx1' });
+
+    h.events.push(failedEvent('ses_cx1', { type: 'MessageAbortedError', message: 'aborted' }));
+    await flush();
+    expect(engineCalls('session.error')).toHaveLength(0);
+    expect(await status(h, a.workflow_id)).toBe('cancelled');
+
+    const b = await startTask(h, 'ses_cx2');
+    await h.call('harness_cancel', { task_id: b.task_id });
+    h.events.push(idleEvent('ses_cx2'));
+    await flush();
+    expect(engineCalls('session.idle')).toHaveLength(0);
+  });
+
+  it('drops the second idle signal of a cancelled session instead of buffering it', async () => {
+    const h = await fresh();
+    const a = await startTask(h, 'ses_cx3');
+    await h.call('harness_cancel', { workflow_id: a.workflow_id });
+
+    h.events.push(idleEvent('ses_cx3'), statusEvent('ses_cx3', 'idle'));
+    await flush();
+    expect(engineCalls('session.idle')).toHaveLength(0);
+  });
+
+  it('buffers an orphaned idle and replays its payload when harness_task_complete registers the session', async () => {
+    const h = await fresh();
+    const { workflow_id, task_ids } = JSON.parse(
+      await h.call('submit_workflow', { tasks: [{ agent: 'builder', prompt: 'native work', depends_on: [] }] }),
+    ) as { workflow_id: string; task_ids: string[] };
+
+    // Flag native dispatch (timeout 0 returns immediately), then let the tick buffer the task.
+    const first = JSON.parse(await h.call('harness_dispatch_tasks', { workflow_id, timeout_ms: 0 }));
+    expect(first.status).toBe('timeout');
+    await vi.advanceTimersByTimeAsync(500);
+    await flush();
+    const ready = JSON.parse(await h.call('harness_dispatch_tasks', { workflow_id, timeout_ms: 0 }));
+    expect(ready.status).toBe('tasks_ready');
+    expect(ready.tasks[0]).toMatchObject({
+      task_id: task_ids[0],
+      agent: 'builder',
+      prompt: 'native work',
+      description: `[harness-task:${task_ids[0]}] @builder`,
+    });
+    expect(h.session.create).not.toHaveBeenCalled();
+
+    // The subagent finished before harness_task_complete ran.
+    h.events.push(idleEvent('ses_native'));
+    await flush();
+    expect(engineCalls('session.idle')).toHaveLength(1);
+    expect(await status(h, workflow_id)).toBe('running');
+
+    const done = JSON.parse(
+      await h.call('harness_task_complete', { task_id: task_ids[0], session_id: 'ses_native', status: 'done' }),
+    );
+    expect(done.status).toBe('done');
+    const replay = engineCalls('session.idle')[1];
+    expect(JSON.parse(replay[2] as string)).toEqual({ sessionID: 'ses_native' });
+    expect(await status(h, workflow_id)).toBe('done');
+  });
+
+  it('buffers an orphaned failure and uses its readable message in harness_task_complete', async () => {
+    const h = await fresh();
+    const { workflow_id, task_ids } = JSON.parse(
+      await h.call('submit_workflow', { tasks: [{ agent: 'builder', prompt: 'native work', depends_on: [] }] }),
+    ) as { workflow_id: string; task_ids: string[] };
+    await h.call('harness_dispatch_tasks', { workflow_id, timeout_ms: 0 });
+    await vi.advanceTimersByTimeAsync(500);
+    await flush();
+
+    h.events.push(failedEvent('ses_nat_err', { type: 'UnknownError', message: 'boom', status: 400 }));
+    await flush();
+
+    const out = JSON.parse(
+      await h.call('harness_task_complete', { task_id: task_ids[0], session_id: 'ses_nat_err', status: 'failed' }),
+    );
+    expect(out.status).toBe('failed');
+    expect(out.error).toBe('UnknownError: boom (HTTP 400)');
+    expect(await status(h, workflow_id)).toBe('failed');
+  });
+
+  it('forwards tool execute.after to the engine with tool/callID/args/result', async () => {
+    const h = await fresh();
+    const hook = h.hooks.get('execute.after')!;
+
+    hook({
+      tool: 'bash',
+      sessionID: 'ses_hook',
+      agent: 'builder',
+      messageID: 'msg',
+      id: 'call_1',
+      input: { command: 'ls' },
+      status: 'completed',
+      result: { content: 'file.txt' },
+    });
+    const [, sessionId, payload] = engineCalls('tool.execute.after')[0];
+    expect(sessionId).toBe('ses_hook');
+    expect(JSON.parse(payload as string)).toEqual({
+      tool: 'bash',
+      callID: 'call_1',
+      args: { command: 'ls' },
+      result: 'file.txt',
+    });
+
+    // Array content is joined; string output is the fallback; errors carry no result.
+    hook({ tool: 't', sessionID: 's', id: 'c2', input: {}, status: 'completed', result: { content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }] } });
+    hook({ tool: 't', sessionID: 's', id: 'c3', input: {}, status: 'completed', result: { output: 'structured' } });
+    hook({ tool: 't', sessionID: 's', id: 'c4', input: {}, status: 'error', error: { message: 'x' } });
+    const results = engineCalls('tool.execute.after').slice(1).map((c) => JSON.parse(c[2] as string).result);
+    expect(results).toEqual(['a\nb', 'structured', undefined]);
+  });
+
+  it('skips tool execute.after for cancelled sessions', async () => {
+    const h = await fresh();
+    const a = await startTask(h, 'ses_cx_hook');
+    await h.call('harness_cancel', { workflow_id: a.workflow_id });
+
+    h.hooks.get('execute.after')!({
+      tool: 'bash', sessionID: 'ses_cx_hook', id: 'c', input: {}, status: 'completed', result: { content: 'late' },
+    });
+    expect(engineCalls('tool.execute.after')).toHaveLength(0);
+  });
+
+  it('ignores unrelated events', async () => {
+    const h = await fresh();
+    h.events.push(ev('session.created', { sessionID: 's' }), ev('session.execution.succeeded', { sessionID: 's' }));
+    await flush();
+    expect(processEvent).not.toHaveBeenCalled();
+  });
+
+  it('cleanup clears the tick interval, aborts the subscription and disposes registrations', async () => {
+    const h = await fresh();
+    const timersBefore = vi.getTimerCount();
+
+    await h.cleanup();
+
+    expect(vi.getTimerCount()).toBe(timersBefore - 1);
+    expect(h.events.signals[0].aborted).toBe(true);
+    expect(h.toolDispose).toHaveBeenCalledTimes(1);
+    expect(h.hookDispose).toHaveBeenCalledTimes(1);
+
+    // Idempotent, and events/ticks after cleanup are inert.
+    await h.cleanup();
+    expect(h.toolDispose).toHaveBeenCalledTimes(1);
+    h.events.push(idleEvent('ses_after'));
+    await vi.advanceTimersByTimeAsync(1000);
+    await flush();
+    expect(engineCalls('session.idle')).toHaveLength(0);
   });
 });

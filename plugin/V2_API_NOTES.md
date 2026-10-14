@@ -89,7 +89,21 @@ Implemented in core, not in `node_modules`; this section is from `anomalyco/open
 ## Tooling
 
 - `typescript` resolved to `7.0.2`; `npm --prefix plugin run typecheck` runs `tsc --noEmit`. `skipLibCheck` was enabled in `plugin/tsconfig.json` (`json-schema` types missing from `@ai-sdk/provider`, duplicate `containSubset` in chai/vitest).
-- `harness.ts` / `harness.test.ts` still import `@opencode-ai/plugin` and use the v1 client; migrated in the follow-up task.
+
+## harness.ts migration decisions
+
+- **Entrypoint**: `Plugin.define({ id: "openagent-harness", setup(ctx) })`; `ctx.session` is passed to every `client.ts` helper. `setup` returns an async cleanup that clears the 500ms tick `setInterval`, aborts the `ctx.event.subscribe` signal, disposes the tool/hook registrations and frees the DAG. The v1 `process.on("exit"|"SIGTERM"|"SIGINT")` handlers were dropped (the host owns the lifecycle; a plugin must not `process.exit`). No `ctx.location.directory` use was needed: `harness.ts` never read a directory/worktree (`plans.ts`/`memory.ts` still use `process.cwd()`).
+- **Tool names are NOT namespaced.** `editor.add({ name })` uses the explicit name and `options.namespace` is optional, so all 13 tools keep their v1 names. No agent/skill rename is required.
+- **Tools** are registered in one `ctx.tool.transform` callback with plain JSON Schema inputs (`plugin/json-schema.ts`: closed objects, required unless `optional()`). `execute` returns `{ content: <string> }`. Agent gating uses `context.agent` (orchestrator: `submit_workflow`/`submit_plan`; planner: `plan_task`/`save_plan`).
+- **Events** (payload in `event.data`; the Rust engine still receives the v1 names):
+  - `session.idle` and `session.status` with `status.type === "idle"` -> `process_event("session.idle", sessionID, JSON(data))`. De-duplicated per session: a second idle within 2s with no `busy`/`retry` status in between is dropped (a busy/retry status resets the marker so reused sessions are never swallowed).
+  - `session.execution.failed` -> `process_event("session.error", sessionID, {"sessionID", "error": <string>})`. The error string comes from `extractErrorMessage` in `errors.ts` (`<type|name>: <message> (HTTP <status>)`; also accepts the v1 `{ name, data: { message, statusCode } }` union). The Rust engine reads `payload.error` as a string, so passing a string (v1 passed an object) also fixes the old "unknown error" fallback.
+  - `session.execution.interrupted` / `succeeded` / `retry.scheduled` are ignored.
+  - `orphanedIdleEvents`, `orphanedErrorEvents` and the `cancelledSessions` guard are kept. The guard is applied after the idle de-dupe so the second idle signal of a cancelled session is not buffered as an orphan.
+- **Error classification** (`classifyError`): terminal patterns (`ProviderAuthError`, `ContextOverflowError`, `MessageAbortedError`, content policy/filter, invalid API key, `HTTP 401/403`) are checked before retryable ones. Retryable also matches `HTTP 5xx`.
+- **tool.execute.after** -> `ctx.tool.hook("execute.after", ...)`; forwards `{ tool, callID: event.id, args: event.input, result }` where `result` is the string flattened from `result.content` (string, or joined text parts) falling back to a string `result.output`; no result for `status: "error"`. `tool.execute.before` was an empty no-op and is dropped.
+- **Native dispatch** text now names the `subagent` tool (`agent`, `description`, `prompt`) and tells the orchestrator to read the child id from `<subagent sessionID="ses_..." state="completed">` or `Subagent failed (sessionID: ses_...)`. `agents/orchestrator.md` already described this format. Fallback model for a re-spawned native task can now be passed as the `subagent` tool's `model` input.
+- **Rust/WASM**: untouched (`src/*.rs`, `plugin/wasm/`).
 
 ## Agent frontmatter and install (v2)
 
