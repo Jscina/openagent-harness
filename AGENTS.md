@@ -30,7 +30,7 @@ cargo fmt && cargo clippy     # default rustfmt/clippy config
 ## Agent capabilities & skills
 
 **Agents (11 total):**
-- **orchestrator** (primary) — mcp: [github, ado], tools: [harness_cancel], permission: question: allow
+- **orchestrator** (primary) — mcp: [github], tools: [harness_cancel], permissions: question allow
 - **planner** (subagent) — permission: question: allow, skills: [caveman, memory-context], tools: [plan_task, save_plan]
 - **explorer** (subagent) — mcp: [grep_app], skills: [caveman]
 - **researcher** (subagent) — mcp: [websearch, context7, grep_app], skills: [caveman]
@@ -46,7 +46,7 @@ cargo fmt && cargo clippy     # default rustfmt/clippy config
 - Skills are stored at `~/.config/opencode/skills/` — shipped by this repo via `src/skills.rs`.
 - `cargo run -- install` installs embedded skills alongside agents.
 - Currently shipped: `caveman` (ultra-compressed output mode, ~65% token reduction), `memory` + `memory-card` + `memory-trace` + `memory-context` + `memory-promote`.
-- Agents declare `skills:` in frontmatter; they must load the skill via the skill tool before acting.
+- Agents grant skills via `skill` rules in frontmatter `permissions:` (v2 has no per-agent `skills:`/`mcp:` keys; MCP grants are `<server>_*` rules). They must load the skill via the skill tool before acting.
 - **caveman** — loaded by: builder, debugger, planner, consultant, explorer, researcher, reviewer, vision, docs-writer. NOT loaded by: orchestrator, builder-junior.
 - **memory** — router skill; loaded by: debugger. Routes to specific memory sub-skills based on operation.
 - **memory-card** — loaded by: debugger. Create new investigation cards.
@@ -87,8 +87,8 @@ cargo fmt && cargo clippy     # default rustfmt/clippy config
 - Fallback chain behavior: when a provider returns 429/5xx or a transient error, the task is re-queued with the next model in its chain. The task is only marked `Failed` after all fallbacks are exhausted or the error is classified as terminal (auth failure, content policy, etc.).
 - `model_attempt` on a task tracks which model in the chain is active: `0` means the primary model, `1` means the first fallback, and so on. This field is visible in workflow snapshots.
 - Agent fallback configs are loaded from frontmatter at startup via `agent_fallback_configs_json()` + `set_agent_fallbacks()`; they apply to every task dispatched to that agent unless the task supplies its own `fallback_models`.
-- The orchestrator agent needs `permission: question: allow` in its frontmatter to use OpenCode's built-in question tool for plan approval. Without this, the question tool calls will be denied.
-- The planner agent now also needs `permission: question: allow` so it can resolve missing requirements before saving a plan artifact.
+- The orchestrator agent needs a `question` allow rule in its frontmatter `permissions:` list to use OpenCode's built-in question tool for plan approval. Without this, the question tool calls will be denied.
+- The planner agent now also needs the `question` allow rule so it can resolve missing requirements before saving a plan artifact.
 - Native dispatch: when `submit_plan` is called with `native_dispatch: true`, the orchestrator must run the `harness_dispatch_tasks` / Task tool / `harness_task_complete` loop manually.
 - Cancellation: `cancel_task()` returns a JSON object `{"cancelled_task_ids": [...], "session_ids": [...]}` and cascades to all transitive dependents. Cancelled tasks never trigger fallback — they are permanently marked `Cancelled` and do not attempt recovery. Late events for cancelled sessions are silently dropped.
 - External skills (git-workflow, azure-workflow, pr-workflow) are NOT shipped by this repo — they must be installed separately. If a declared skill is missing at `~/.config/opencode/skills/`, the agent that needs it will be blocked.

@@ -90,3 +90,19 @@ Implemented in core, not in `node_modules`; this section is from `anomalyco/open
 
 - `typescript` resolved to `7.0.2`; `npm --prefix plugin run typecheck` runs `tsc --noEmit`. `skipLibCheck` was enabled in `plugin/tsconfig.json` (`json-schema` types missing from `@ai-sdk/provider`, duplicate `containSubset` in chai/vitest).
 - `harness.ts` / `harness.test.ts` still import `@opencode-ai/plugin` and use the v1 client; migrated in the follow-up task.
+
+## Agent frontmatter and install (v2)
+
+Sources: https://opencode.ai/v2/docs/{agents,permissions,skills}, `@opencode/schema` `config/agent.d.ts` (`ConfigAgent.Info`), and `https://opencode.ai/config.json`. The published `config.json` still describes the **v1** schema (`agent`, `permission`, `prompt`, `disable`); the installed `@opencode/schema` and the v2 docs are authoritative.
+
+- v2 agent fields (`ConfigAgent.Info`): `model`, `request`, `system`, `description`, `mode` (`primary|subagent|all`), `hidden`, `color`, `steps`, `disabled`, `permissions`. The Markdown body is `system`. Legacy `permission`, `tools`, `prompt`, `disable`, `temperature`, `top_p`, `maxSteps` are not valid for new v2 agents.
+- **Per-agent `mcp:` and `skills:` lists are NOT valid v2 frontmatter.** `mcp` (server definitions) and `skills` (extra source paths) exist only at the top level of the config, with different meaning. v2 equivalents are all `permissions` rules:
+  - MCP grant: `{ action: <server>_*, resource: "*", effect: allow }` (MCP actions are `<server>_<tool>`). Server definitions stay in the user's `opencode.json` `mcp` (see `install.sh`).
+  - Skill grant: `{ action: skill, resource: <skill-id>, effect: allow }`.
+  - Plugin tools (`plan_task`, `save_plan`, `harness_cancel`): `{ action: <tool>, resource: "*", effect: allow }`.
+- The base policy is `* * allow` and the last matching rule wins, so these allow rules are explicit grants, not an allowlist. Planner's `subagent` rules keep the broad deny first, then explorer/researcher/vision allows. A true "only plan_task/save_plan" tool allowlist would need a leading `* * deny`, which was not added because it would also block the read/glob/grep tools the agents use. Verify against a running opencode before tightening.
+- Model: `provider/model[#variant]`. `fallback_models` is harness-specific (not an opencode field), read only by `src/agents.rs`; confirm opencode tolerates the unknown frontmatter key.
+- `parse_agent_frontmatter` reads only column-0 `model:` / `fallback_models:` keys, so the `permissions:` list is ignored. It keeps `#variant` (`#` starts a comment only after whitespace), strips quotes and trailing comments, and accepts flow lists. The plugin's `parseModel` does not split `#variant`; `toModelRef` in `plugin/client.ts` does.
+- Discovery paths unchanged: `~/.config/opencode/agents/<name>.md` and `~/.config/opencode/skills/<id>/SKILL.md` (project `.opencode/...`; `~/.claude/skills` and `~/.agents/skills` are compatibility sources).
+- Stale v1 agents: `src/install.rs` `is_stale_v1_agent` (top-level `permission:` key in frontmatter) makes `install` overwrite an existing file without `--force`. The plugin-side equivalent in `harness.ts` `installAgentsIfNeeded` is a TODO.
+- Body references: the `task` tool is now `subagent`; the child session id is the `sessionID` attribute of `<subagent sessionID="..." state="completed">`, not a `task_id:` prefix.

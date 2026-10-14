@@ -110,6 +110,11 @@ function loadWasm(): DagEngine {
  *
  * This replaces the need to run `openagent-harness install` manually — the
  * configs are embedded in the WASM binary and installed automatically.
+ *
+ * TODO(opencode-v2): mirror src/install.rs `is_stale_v1_agent` here. An existing
+ * file whose frontmatter has a top-level `permission:` key (v1 map; v2 uses a
+ * `permissions:` rule list) is stale and must be overwritten even though the file
+ * exists, with a console log. Left unchanged for now: another task owns this file.
  */
 function installAgentsIfNeeded(): number {
   try {

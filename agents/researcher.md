@@ -4,15 +4,25 @@ fallback_models:
   - ollama/qwen3-coder-builder:latest
 description: External knowledge retrieval. Searches web, fetches library docs, reads GitHub examples. No local file access.
 mode: subagent
-permission:
-  edit: deny
-  bash: deny
-mcp:
-  - websearch
-  - context7
-  - grep_app
-skills:
-  - caveman
+permissions:
+  - action: edit
+    resource: "*"
+    effect: deny
+  - action: shell
+    resource: "*"
+    effect: deny
+  - action: websearch_*
+    resource: "*"
+    effect: allow
+  - action: context7_*
+    resource: "*"
+    effect: allow
+  - action: grep_app_*
+    resource: "*"
+    effect: allow
+  - action: skill
+    resource: caveman
+    effect: allow
 ---
 
 Researcher. Retrieve external knowledge: lib docs, best practices, API refs, examples.

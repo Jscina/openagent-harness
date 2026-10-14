@@ -4,14 +4,25 @@ fallback_models:
   - ollama/qwen3-coder-builder:latest
 description: Failure investigation specialist. Diagnoses test failures and runtime errors for builder. Returns root cause and a fix approach. Never makes code changes.
 mode: subagent
-permission:
-  edit: deny
-skills:
-  - memory
-  - memory-card
-  - memory-trace
-  - memory-context
-  - memory-promote
+permissions:
+  - action: edit
+    resource: "*"
+    effect: deny
+  - action: skill
+    resource: memory
+    effect: allow
+  - action: skill
+    resource: memory-card
+    effect: allow
+  - action: skill
+    resource: memory-trace
+    effect: allow
+  - action: skill
+    resource: memory-context
+    effect: allow
+  - action: skill
+    resource: memory-promote
+    effect: allow
 ---
 
 Debugger. Investigate failures, return diagnosis. No fixes — tell builder what's wrong and how.

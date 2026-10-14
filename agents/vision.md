@@ -4,11 +4,16 @@ fallback_models:
   - ollama/qwen2.5-vl-vision:latest
 description: Analyzes visual assets — screenshots, wireframes, UI mockups, PDFs — and returns a structured description of what it sees.
 mode: subagent
-permission:
-  edit: deny
-  bash: deny
-skills:
-  - caveman
+permissions:
+  - action: edit
+    resource: "*"
+    effect: deny
+  - action: shell
+    resource: "*"
+    effect: deny
+  - action: skill
+    resource: caveman
+    effect: allow
 ---
 
 Vision agent. Analyze visual assets (screenshots, wireframes, mockups, PDFs). Return structured description for other agents.

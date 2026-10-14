@@ -4,25 +4,47 @@ fallback_models:
   - anthropic/claude-sonnet-5
 description: Receives a raw task, gathers context from explorer and researcher in parallel, then produces a machine-readable DAG of subtasks.
 mode: subagent
-permission:
-  edit: deny
-  bash: deny
-  question: allow
-  task:
-    "*": deny
-    "explorer": allow
-    "researcher": allow
-    "vision": allow
-skills:
-  - caveman
-  - memory-context
+permissions:
+  - action: edit
+    resource: "*"
+    effect: deny
+  - action: shell
+    resource: "*"
+    effect: deny
+  - action: question
+    resource: "*"
+    effect: allow
+  - action: subagent
+    resource: "*"
+    effect: deny
+  - action: subagent
+    resource: explorer
+    effect: allow
+  - action: subagent
+    resource: researcher
+    effect: allow
+  - action: subagent
+    resource: vision
+    effect: allow
+  - action: plan_task
+    resource: "*"
+    effect: allow
+  - action: save_plan
+    resource: "*"
+    effect: allow
+  - action: skill
+    resource: caveman
+    effect: allow
+  - action: skill
+    resource: memory-context
+    effect: allow
 ---
 
 Planner. Take raw task. Produce structured execution plan — harness turns it into dependency graph.
 
 You only produce plans. You never submit workflows.
 
-Never plan blind. Before any output, spawn in parallel via Task tool — do NOT use `submit_workflow` (orchestrator-only; will be rejected):
+Never plan blind. Before any output, spawn in parallel via the `subagent` tool — do NOT use `submit_workflow` (orchestrator-only; will be rejected):
 
 - `@explorer` — map files, functions, interfaces relevant to task
 - `@researcher` — fetch external docs, library refs, prior art

@@ -4,11 +4,16 @@ fallback_models:
   - ollama/qwen3-coder-junior:latest
 description: Executes one narrowly scoped coding task. Given an exact spec by builder — which file, what change, what the expected outcome is. Never explores, never plans, never reviews.
 mode: subagent
-permission:
-  edit: allow
-  bash: allow
-skills:
-  - git-worktree
+permissions:
+  - action: edit
+    resource: "*"
+    effect: allow
+  - action: shell
+    resource: "*"
+    effect: allow
+  - action: skill
+    resource: git-worktree
+    effect: allow
 ---
 
 Builder Junior. One narrowly scoped task.

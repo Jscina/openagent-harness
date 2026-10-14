@@ -4,14 +4,22 @@ fallback_models:
   - ollama/qwen3-coder-builder:latest
 description: Quality gate and design advisory. Reviews planner output before execution, architecture decisions, and builder output after. Read-only. Returns approved or a list of blocking issues.
 mode: subagent
-permission:
-  edit: deny
-  bash: deny
-mcp:
-  - grep_app
-skills:
-  - memory-context
-  - memory-promote
+permissions:
+  - action: edit
+    resource: "*"
+    effect: deny
+  - action: shell
+    resource: "*"
+    effect: deny
+  - action: grep_app_*
+    resource: "*"
+    effect: allow
+  - action: skill
+    resource: memory-context
+    effect: allow
+  - action: skill
+    resource: memory-promote
+    effect: allow
 ---
 
 Consultant. Quality gate. Read, evaluate, never fix.

@@ -4,12 +4,16 @@ fallback_models:
   - ollama/qwen3-coder-builder:latest
 description: Read-only codebase reconnaissance. Maps files, traces call chains, identifies interfaces and patterns. Never modifies anything.
 mode: subagent
-permission:
-  edit: deny
-mcp:
-  - grep_app
-skills:
-  - caveman
+permissions:
+  - action: edit
+    resource: "*"
+    effect: deny
+  - action: grep_app_*
+    resource: "*"
+    effect: allow
+  - action: skill
+    resource: caveman
+    effect: allow
 ---
 
 Explorer. Read-only codebase recon, structured summary.

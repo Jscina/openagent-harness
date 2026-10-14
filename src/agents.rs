@@ -74,25 +74,62 @@ pub fn parse_agent_frontmatter(name: &str, content: &str) -> AgentConfig {
     let mut fallback_models: Vec<String> = vec![];
     let mut in_fallback_models = false;
 
+    // Only top-level (column 0) keys are inspected, so nested blocks such as the
+    // v2 `permissions:` rule list (`- action: ... / resource: ... / effect: ...`)
+    // are skipped without being misread as `model` or fallback entries.
     for line in frontmatter.lines() {
         if let Some(val) = line.strip_prefix("model:") {
-            model = val.trim().to_string();
+            model = clean_scalar(val);
             in_fallback_models = false;
-        } else if line.starts_with("fallback_models:") {
-            in_fallback_models = true;
+        } else if let Some(val) = line.strip_prefix("fallback_models:") {
+            let val = val.trim();
+            if let Some(inline) = val.strip_prefix('[') {
+                // Flow style: `fallback_models: [a/b, c/d]`.
+                let inline = inline.split(']').next().unwrap_or("");
+                fallback_models.extend(
+                    inline
+                        .split(',')
+                        .map(clean_scalar)
+                        .filter(|item| !item.is_empty()),
+                );
+                in_fallback_models = false;
+            } else {
+                in_fallback_models = true;
+            }
         } else if in_fallback_models {
-            if let Some(item) = line.strip_prefix("  - ") {
-                fallback_models.push(item.trim().to_string());
+            if let Some(item) = line.trim_start().strip_prefix("- ") {
+                let item = clean_scalar(item);
+                if !item.is_empty() {
+                    fallback_models.push(item);
+                }
             } else if !line.starts_with(' ') && !line.is_empty() {
                 // A non-indented, non-empty line ends the fallback_models block.
                 in_fallback_models = false;
             }
-        } else {
-            in_fallback_models = false;
         }
     }
 
     AgentConfig::new(name.to_string(), model, fallback_models)
+}
+
+/// Normalise a YAML scalar: trim, drop a trailing ` # comment`, strip matching quotes.
+///
+/// A `#` not preceded by whitespace is part of the value, so the v2
+/// `provider/model#variant` form is preserved.
+fn clean_scalar(raw: &str) -> String {
+    let mut val = raw.trim();
+    if let Some(pos) = val.find(" #") {
+        val = val[..pos].trim_end();
+    }
+    for quote in ['"', '\''] {
+        if let Some(inner) = val
+            .strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+        {
+            return inner.to_string();
+        }
+    }
+    val.to_string()
 }
 
 /// Returns an `AgentConfig` for every embedded agent.
@@ -180,6 +217,74 @@ mod tests {
         assert_eq!(cfg.name, "explorer");
         assert_eq!(cfg.model, "anthropic/claude-sonnet-4-6");
         assert!(cfg.fallback_models.is_empty());
+    }
+
+    const V2_SAMPLE: &str = "---\nmodel: anthropic/claude-opus-5#high\nfallback_models:\n  - openai/gpt-5.4#low\n  - ollama/qwen3-coder:30b\ndescription: v2 agent.\nmode: subagent\npermissions:\n  - action: edit\n    resource: \"*\"\n    effect: deny\n  - action: subagent\n    resource: explorer\n    effect: allow\n  - action: skill\n    resource: caveman\n    effect: allow\n---\n\nBody.\n";
+
+    #[test]
+    fn parse_agent_frontmatter_v2_sample_ignores_permissions_and_keeps_variant() {
+        let cfg = parse_agent_frontmatter("planner", V2_SAMPLE);
+        assert_eq!(cfg.model, "anthropic/claude-opus-5#high");
+        assert_eq!(
+            cfg.fallback_models,
+            vec!["openai/gpt-5.4#low", "ollama/qwen3-coder:30b"]
+        );
+    }
+
+    #[test]
+    fn parse_agent_frontmatter_permissions_directly_after_fallbacks() {
+        // No key between the fallback list and `permissions:`; its rules must not
+        // be treated as fallback entries.
+        let md = "---\nmodel: a/b\nfallback_models:\n  - c/d\npermissions:\n  - action: edit\n    resource: \"*\"\n    effect: deny\n---\n";
+        let cfg = parse_agent_frontmatter("x", md);
+        assert_eq!(cfg.model, "a/b");
+        assert_eq!(cfg.fallback_models, vec!["c/d"]);
+    }
+
+    #[test]
+    fn parse_agent_frontmatter_ignores_nested_model_keys() {
+        let md = "---\nmodel: a/b\npermissions:\n  - action: model\n    resource: \"*\"\n    effect: allow\n  model: ignored/x\n---\n";
+        let cfg = parse_agent_frontmatter("x", md);
+        assert_eq!(cfg.model, "a/b");
+    }
+
+    #[test]
+    fn parse_agent_frontmatter_handles_comments_quotes_and_flow_lists() {
+        let md =
+            "---\nmodel: \"a/b#max\" # primary\nfallback_models: [c/d, 'e/f#low'] # chain\n---\n";
+        let cfg = parse_agent_frontmatter("x", md);
+        assert_eq!(cfg.model, "a/b#max");
+        assert_eq!(cfg.fallback_models, vec!["c/d", "e/f#low"]);
+    }
+
+    #[test]
+    fn embedded_agents_use_v2_frontmatter() {
+        for (name, content) in AGENTS {
+            let end = content[4..].find("\n---").expect("frontmatter end") + 4;
+            let fm = &content[..end];
+            assert!(
+                fm.contains("\npermissions:\n"),
+                "agent '{name}' missing v2 `permissions:` list"
+            );
+            for stale in [
+                "\npermission:",
+                "\ntools:",
+                "\nmcp:",
+                "\nskills:",
+                "\nprompt:",
+            ] {
+                assert!(
+                    !fm.contains(stale),
+                    "agent '{name}' frontmatter has v1 key {stale:?}"
+                );
+            }
+            for stale in ["bash", "task", "write", "patch"] {
+                assert!(
+                    !fm.contains(&format!("action: {stale}\n")),
+                    "agent '{name}' uses v1 action name '{stale}'"
+                );
+            }
+        }
     }
 
     #[test]

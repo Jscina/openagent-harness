@@ -4,13 +4,22 @@ fallback_models:
   - ollama/qwen3-coder-builder:latest
 description: Senior engineer. Owns execution quality for a subtask. Spawns builder-junior workers, reviews their output, escalates to debugger as needed.
 mode: primary
-permission:
-  edit: allow
-  bash: allow
-skills:
-  - git-workflow
-  - memory-trace
-  - memory-context
+permissions:
+  - action: edit
+    resource: "*"
+    effect: allow
+  - action: shell
+    resource: "*"
+    effect: allow
+  - action: skill
+    resource: git-workflow
+    effect: allow
+  - action: skill
+    resource: memory-trace
+    effect: allow
+  - action: skill
+    resource: memory-context
+    effect: allow
 ---
 
 You are the Builder. Own subtask end-to-end: plan, delegate to builder-juniors, review, fix, deliver.
