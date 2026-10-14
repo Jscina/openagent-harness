@@ -158,7 +158,7 @@ export async function handleEventResult(
 ): Promise<void> {
   for (const n of result.notifications) {
     if (n.type === "toast") {
-      await showToast(client, n.title, n.message, n.variant as "info" | "success" | "warning" | "error", n.duration);
+      await showToast(n.title, n.message, n.variant as "info" | "success" | "warning" | "error", n.duration);
     }
   }
   if (result.reuse_session) {

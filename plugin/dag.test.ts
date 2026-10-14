@@ -166,9 +166,8 @@ describe('sleep', () => {
 
 describe('handleEventResult', () => {
   it('fires showToast for each toast notification', async () => {
-    const client = {
-      tui: { showToast: vi.fn().mockResolvedValue(undefined) },
-    } as any;
+    const client = {} as any;
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
     const dag = { task_started: vi.fn() } as any;
 
     await handleEventResult(
@@ -183,11 +182,12 @@ describe('handleEventResult', () => {
       dag,
     );
 
-    expect(client.tui.showToast).toHaveBeenCalledTimes(2);
+    expect(info).toHaveBeenCalledTimes(2);
+    info.mockRestore();
   });
 
   it('calls dag.task_started when reuse_session is set', async () => {
-    const client = { tui: { showToast: vi.fn() } } as any;
+    const client = {} as any;
     const dag = { task_started: vi.fn() } as any;
 
     await handleEventResult(
@@ -205,24 +205,22 @@ describe('handleEventResult', () => {
 
   it('calls deleteSession when delete_session is set', async () => {
     const client = {
-      tui: { showToast: vi.fn() },
-      session: { delete: vi.fn().mockResolvedValue({}) },
+      session: { remove: vi.fn().mockResolvedValue({}) },
     } as any;
     const dag = { task_started: vi.fn() } as any;
 
     await handleEventResult(
       { notifications: [], delete_session: 'ses_old' },
-      client,
+      client.session,
       dag,
     );
 
-    expect(client.session.delete).toHaveBeenCalledWith({ path: { id: 'ses_old' } });
+    expect(client.session.remove).toHaveBeenCalledWith({ sessionID: 'ses_old' });
   });
 
   it('prefers reuse_session over delete_session when both are present', async () => {
     const client = {
-      tui: { showToast: vi.fn() },
-      session: { delete: vi.fn() },
+      session: { remove: vi.fn() },
     } as any;
     const dag = { task_started: vi.fn() } as any;
 
@@ -236,25 +234,23 @@ describe('handleEventResult', () => {
       dag,
     );
 
-    expect(client.session.delete).not.toHaveBeenCalled();
+    expect(client.session.remove).not.toHaveBeenCalled();
     expect(dag.task_started).toHaveBeenCalledWith('task_B', 'ses_A');
   });
 
   it('does nothing when notifications is empty and neither session key is set', async () => {
     const client = {
-      tui: { showToast: vi.fn() },
-      session: { delete: vi.fn() },
+      session: { remove: vi.fn() },
     } as any;
     const dag = { task_started: vi.fn() } as any;
 
     await handleEventResult(
       { notifications: [], delete_session: null },
-      client,
+      client.session,
       dag,
     );
 
-    expect(client.tui.showToast).not.toHaveBeenCalled();
-    expect(client.session.delete).not.toHaveBeenCalled();
+    expect(client.session.remove).not.toHaveBeenCalled();
     expect(dag.task_started).not.toHaveBeenCalled();
   });
 });
@@ -268,7 +264,7 @@ describe('cleanupOrphanedSession', () => {
 
     const client = {
       session: {
-        abort: vi.fn().mockImplementation(async () => {
+        interrupt: vi.fn().mockImplementation(async () => {
           // At the moment abort is invoked, the session must already be
           // tracked — this is what guarantees the abort-induced session.error
           // gets dropped by the cancelledSessions guard instead of being
@@ -276,14 +272,14 @@ describe('cleanupOrphanedSession', () => {
           callOrder.push(cancelledSessions.has('ses_orphan') ? 'tracked-then-abort' : 'abort-before-tracked');
           return undefined;
         }),
-        delete: vi.fn().mockImplementation(async () => {
+        remove: vi.fn().mockImplementation(async () => {
           callOrder.push('delete');
           return {};
         }),
       },
     } as any;
 
-    await cleanupOrphanedSession(client, 'ses_orphan', cancelledSessions);
+    await cleanupOrphanedSession(client.session, 'ses_orphan', cancelledSessions);
 
     expect(callOrder).toEqual(['tracked-then-abort', 'delete']);
   });
@@ -292,35 +288,35 @@ describe('cleanupOrphanedSession', () => {
     const cancelledSessions = new BoundedSet<string>(1000);
     const client = {
       session: {
-        abort: vi.fn().mockResolvedValue(undefined),
-        delete: vi.fn().mockResolvedValue({}),
+        interrupt: vi.fn().mockResolvedValue(undefined),
+        remove: vi.fn().mockResolvedValue({}),
       },
     } as any;
 
-    await cleanupOrphanedSession(client, 'ses_orphan', cancelledSessions);
+    await cleanupOrphanedSession(client.session, 'ses_orphan', cancelledSessions);
 
-    expect(client.session.abort).toHaveBeenCalledWith({ path: { id: 'ses_orphan' } });
-    expect(client.session.delete).toHaveBeenCalledWith({ path: { id: 'ses_orphan' } });
+    expect(client.session.interrupt).toHaveBeenCalledWith({ sessionID: 'ses_orphan' });
+    expect(client.session.remove).toHaveBeenCalledWith({ sessionID: 'ses_orphan' });
     expect(cancelledSessions.has('ses_orphan')).toBe(true);
   });
 
   it('returns true when abortSession succeeds and false when it fails, without throwing', async () => {
     const cancelledSessions = new BoundedSet<string>(1000);
     const okClient = {
-      session: { abort: vi.fn().mockResolvedValue(undefined), delete: vi.fn().mockResolvedValue({}) },
+      session: { interrupt: vi.fn().mockResolvedValue(undefined), remove: vi.fn().mockResolvedValue({}) },
     } as any;
-    await expect(cleanupOrphanedSession(okClient, 'ses_ok', cancelledSessions)).resolves.toBe(true);
+    await expect(cleanupOrphanedSession(okClient.session, 'ses_ok', cancelledSessions)).resolves.toBe(true);
 
     const failClient = {
       session: {
-        abort: vi.fn().mockRejectedValue(new Error('gone')),
-        delete: vi.fn().mockResolvedValue({}),
+        interrupt: vi.fn().mockRejectedValue(new Error('gone')),
+        remove: vi.fn().mockResolvedValue({}),
       },
     } as any;
-    await expect(cleanupOrphanedSession(failClient, 'ses_fail', cancelledSessions)).resolves.toBe(false);
+    await expect(cleanupOrphanedSession(failClient.session, 'ses_fail', cancelledSessions)).resolves.toBe(false);
     // Even when abort fails, delete must still run and the session must
     // still end up tracked as cancelled.
-    expect(failClient.session.delete).toHaveBeenCalledWith({ path: { id: 'ses_fail' } });
+    expect(failClient.session.remove).toHaveBeenCalledWith({ sessionID: 'ses_fail' });
     expect(cancelledSessions.has('ses_fail')).toBe(true);
   });
 
@@ -343,17 +339,17 @@ describe('bindSessionOrCleanup', () => {
     const cancelledSessions = new BoundedSet<string>(1000);
     const client = {
       session: {
-        abort: vi.fn().mockResolvedValue(undefined),
-        delete: vi.fn().mockResolvedValue({}),
+        interrupt: vi.fn().mockResolvedValue(undefined),
+        remove: vi.fn().mockResolvedValue({}),
       },
     } as any;
 
-    const result = await bindSessionOrCleanup(dag, client, 'task_1', 'ses_ok', cancelledSessions);
+    const result = await bindSessionOrCleanup(dag, client.session, 'task_1', 'ses_ok', cancelledSessions);
 
     expect(result).toBe(true);
     expect(dag.task_started).toHaveBeenCalledWith('task_1', 'ses_ok');
-    expect(client.session.abort).not.toHaveBeenCalled();
-    expect(client.session.delete).not.toHaveBeenCalled();
+    expect(client.session.interrupt).not.toHaveBeenCalled();
+    expect(client.session.remove).not.toHaveBeenCalled();
     expect(cancelledSessions.has('ses_ok')).toBe(false);
   });
 
@@ -366,19 +362,19 @@ describe('bindSessionOrCleanup', () => {
     const cancelledSessions = new BoundedSet<string>(1000);
     const client = {
       session: {
-        abort: vi.fn().mockResolvedValue(undefined),
-        delete: vi.fn().mockResolvedValue({}),
+        interrupt: vi.fn().mockResolvedValue(undefined),
+        remove: vi.fn().mockResolvedValue({}),
       },
     } as any;
 
     const sessionId = 'ses_race';
-    const result = await bindSessionOrCleanup(dag, client, 'task_1', sessionId, cancelledSessions);
+    const result = await bindSessionOrCleanup(dag, client.session, 'task_1', sessionId, cancelledSessions);
 
     expect(result).toBe(false);
     expect(dag.task_started).toHaveBeenCalledWith('task_1', sessionId);
     // The orphaned session was aborted and deleted...
-    expect(client.session.abort).toHaveBeenCalledWith({ path: { id: sessionId } });
-    expect(client.session.delete).toHaveBeenCalledWith({ path: { id: sessionId } });
+    expect(client.session.interrupt).toHaveBeenCalledWith({ sessionID: sessionId });
+    expect(client.session.remove).toHaveBeenCalledWith({ sessionID: sessionId });
     // ...and is now tracked, so a late session.idle/session.error event hook
     // (which checks `cancelledSessions.has(sessionId)` before calling
     // dag.process_event) would drop it instead of resurrecting the task.
