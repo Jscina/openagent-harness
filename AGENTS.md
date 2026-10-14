@@ -30,17 +30,17 @@ cargo fmt && cargo clippy     # default rustfmt/clippy config
 ## Agent capabilities & skills
 
 **Agents (11 total):**
-- **orchestrator** (primary) — mcp: [github], tools: [harness_cancel], permissions: question allow
-- **planner** (subagent) — permission: question: allow, skills: [caveman, memory-context], tools: [plan_task, save_plan]
-- **explorer** (subagent) — mcp: [grep_app], skills: [caveman]
-- **researcher** (subagent) — mcp: [websearch, context7, grep_app], skills: [caveman]
-- **vision** (subagent) — skills: [caveman]
-- **builder** (primary) — skills: [git-workflow, caveman, memory-trace, memory-context]
-- **builder-junior** (subagent) — skills: [git-worktree]
-- **reviewer** (primary) — mcp: [github, grep_app], skills: [caveman]
-- **consultant** (subagent) — mcp: [grep_app], skills: [caveman, memory-context, memory-promote]
-- **debugger** (subagent) — skills: [caveman, memory, memory-card, memory-trace, memory-context, memory-promote]
-- **docs-writer** (subagent) — model: anthropic/claude-haiku-4-5, fallback: ollama/qwen3-docs:latest, skills: [caveman]
+- **orchestrator** (primary) — permissions: question, github_*, harness_cancel allow
+- **planner** (subagent) — permissions: question, subagent (explorer/researcher/vision), plan_task, save_plan, skill (caveman/memory-context) allow
+- **explorer** (subagent) — permissions: grep_app_*, skill (caveman) allow
+- **researcher** (subagent) — permissions: websearch_*, context7_*, grep_app_*, skill (caveman) allow
+- **vision** (subagent) — permissions: skill (caveman) allow
+- **builder** (primary) — permissions: skill (git-workflow/caveman/memory-trace/memory-context) allow
+- **builder-junior** (subagent) — permissions: skill (git-worktree) allow
+- **reviewer** (primary) — permissions: github_*, grep_app_*, skill (caveman) allow
+- **consultant** (subagent) — permissions: grep_app_*, skill (caveman/memory-context/memory-promote) allow
+- **debugger** (subagent) — permissions: skill (memory/memory-card/memory-trace/memory-context/memory-promote) allow
+- **docs-writer** (subagent) — model: anthropic/claude-haiku-4-5, fallback: ollama/qwen3-docs:latest, permissions: skill (caveman) allow
 
 **Skills system:**
 - Skills are stored at `~/.config/opencode/skills/` — shipped by this repo via `src/skills.rs`.
@@ -67,17 +67,19 @@ cargo fmt && cargo clippy     # default rustfmt/clippy config
 
 ## Runtime behavior (don't mis-assume)
 
+- **OpenCode v2 plugin entrypoint**: `Plugin.define({ id: "openagent-harness", setup(ctx) })` receives `ctx.session`, `ctx.event`, and `ctx.tool` from the host.
 - Plugin loads WASM synchronously: `initSync(readFileSync(...))` before hooks run.
-- Startup calls `get_agent_configs()` once; missing agent `.md` files are auto-installed on first boot.
+- Startup calls `get_agent_configs()` once; missing agent `.md` files are auto-installed on first boot. Stale v1 agent files (with top-level `permission:` key) are auto-overwritten on install.
 - Startup also calls `agent_fallback_configs_json()` and passes the result to `dag.set_agent_fallbacks()` to register per-agent fallback chains.
 - Tick loop (`setInterval`, 500ms) only starts tasks (`dag.tick()` + session create/send + `dag.task_started()`).
-- Task completion/failure is event-driven via `session.idle` / `session.error` → `dag.process_event()`.
-- ACP send endpoint is `POST /session/{id}/prompt_async` (fire-and-forget).
+- Task completion/failure is event-driven: `ctx.event.subscribe()` receives `session.idle`, `session.status`, and `session.execution.failed` events with payload in `event.data` (e.g., `event.data.sessionID`); these are mapped onto v1 names and passed to `dag.process_event()`.
+- Session send: `ctx.session.switchAgent()` (if agent) → `ctx.session.switchModel()` (if model) → `ctx.session.prompt({ sessionID, text })` (enqueue only, non-blocking via `/api/session/{id}/prompt`).
 - Error classification happens in the TypeScript plugin (`classifyError` in `harness.ts`), not in WASM.
 - Fallback decisions are made in the plugin; the WASM engine exposes `try_fallback()` to atomically advance the model and reset task state to Pending.
 - Plugin errors are logged; they are not propagated to OpenCode.
+- Tools are registered via `ctx.tool.transform()` with plain JSON Schema; agent gating uses `context.agent` in the execute handler.
 - Orchestrator flow: planner may clarify via question tool → planner builds plan incrementally via `plan_task` (one task per call), threading `plan_id` through all calls → planner finalizes with `save_plan` (reads accumulated draft via engine, writes `.opencode/plans/{plan_id}.json`, discards draft) → user approval (via question tool) → orchestrator calls `submit_plan` with `native_dispatch: true` → native dispatch loop (`harness_dispatch_tasks` polls → spawn `subagent` tool calls in parallel → `harness_task_complete` per task) → report results. The orchestrator never submits a workflow without user confirmation.
-- **Cancellation:** `harness_cancel({ workflow_id })` or `harness_cancel({ task_id, reason? })` aborts in-flight OpenCode sessions via `POST /session/{id}/abort` (cooperative — no force-kill), deletes the sessions, and marks the task(s) `Cancelled`. For `cancel_task`, dependents are also cancelled. Late `session.idle`/`session.error` events for cancelled sessions are dropped. Workflow status becomes `Cancelled` if any Pending/Running task was cancelled; precedence is `Failed` > `Cancelled` > `Done`. The plugin's `harness_dispatch_tasks` treats `"cancelled"` as a terminal workflow status, exiting the native dispatch loop.
+- **Cancellation:** `harness_cancel({ workflow_id })` or `harness_cancel({ task_id, reason? })` aborts in-flight OpenCode sessions via `ctx.session.interrupt()` (cooperative), removes the sessions, and marks the task(s) `Cancelled`. For `cancel_task`, dependents are also cancelled. Late `session.idle`/`session.execution.failed` events for aborted sessions are dropped. Workflow status becomes `Cancelled` if any Pending/Running task was cancelled; precedence is `Failed` > `Cancelled` > `Done`. The plugin's `harness_dispatch_tasks` treats `"cancelled"` as a terminal workflow status, exiting the native dispatch loop.
 
 ## Non-obvious gotchas
 

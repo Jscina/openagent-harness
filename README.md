@@ -25,8 +25,8 @@ At startup, the plugin:
 Core runtime behavior:
 
 - The DAG state is **in-memory only** (restarts clear active workflow/task state).
-- The plugin sends prompts asynchronously to OpenCode ACP via `POST /session/{id}/prompt_async`.
-- Task progression is event-driven from `session.idle` / `session.error` events back into the DAG.
+- The plugin sends prompts asynchronously to OpenCode v2 via `ctx.session.prompt({ sessionID, text })` (enqueued only, non-blocking).
+- Task progression is event-driven from `session.idle` / `session.status` / `session.execution.failed` events (via `ctx.event.subscribe()`) back into the DAG.
 - Plans are persisted to `.opencode/plans`, while live workflow state stays in memory.
 - After a task completes, the plugin may reuse its session for a downstream task (session reuse), avoiding a redundant `createSession` call.
 
@@ -49,9 +49,9 @@ Execution modes:
 
 Any agent may call `harness_cancel` to abort a workflow or single task:
 
-- `harness_cancel({ workflow_id })` cancels all Pending/Running tasks in the workflow, marks them `Cancelled`, aborts their in-flight OpenCode sessions (cooperative via `POST /session/{id}/abort`), and transitions the workflow to `Cancelled` status.
+- `harness_cancel({ workflow_id })` cancels all Pending/Running tasks in the workflow, marks them `Cancelled`, aborts their in-flight OpenCode sessions (cooperative via `ctx.session.interrupt()`), and transitions the workflow to `Cancelled` status.
 - `harness_cancel({ task_id })` cancels the specified task and all its transitive dependents (tasks blocked on it). Cancelled tasks never attempt fallback recovery.
-- Late `session.idle` / `session.error` events for aborted sessions are dropped by the plugin, preventing race conditions.
+- Late `session.idle` / `session.execution.failed` events for aborted sessions are dropped by the plugin, preventing race conditions.
 - In native dispatch, `harness_dispatch_tasks` treats `cancelled` as a terminal status, exiting the poll loop.
 
 ### Task state machine
@@ -68,6 +68,8 @@ Running
 
 ## Installation
 
+Requires **OpenCode v2.x**. This harness no longer supports OpenCode v1.
+
 ### Install a release (recommended)
 
 Use the release installer script with a pinned tag:
@@ -78,7 +80,7 @@ curl -fsSL https://raw.githubusercontent.com/Jscina/openagent-harness/v0.3.2/ins
 
 The installer configures OpenCode to use this harness, including:
 
-- plugin wiring for `plugin/harness.ts`
+- plugin wiring for `plugin/harness.ts` via the `plugins` config key
 - remote MCP servers for Exa websearch, Context7, and grep.app
 - disabling default OpenCode `build`, `plan`, and `general` agents in favor of harness-managed agents
 
@@ -91,7 +93,7 @@ cargo install wasm-pack
 make wasm
 ```
 
-`opencode.json` example:
+**opencode.json** (v2 config):
 
 ```json
 {
@@ -99,7 +101,27 @@ make wasm
 }
 ```
 
-OpenCode v2 renamed the v1 `plugin` key to `plugins`; entries may also be `{ "package": "...", "options": {} }`. Alternatively, symlink the plugin directory into `.opencode/plugins/` (project) or `~/.config/opencode/plugins/` (global) for auto-discovery.
+Plugin entries may also be `{ "package": "...", "options": {} }`. Alternatively, symlink the plugin directory into `.opencode/plugins/` (project) or `~/.config/opencode/plugins/` (global) for auto-discovery.
+
+### Migrating from OpenCode v1
+
+If upgrading from v1:
+
+1. Run `openagent-harness install --force` to overwrite all agent markdown files with v2 frontmatter.
+2. Update your `opencode.json`:
+   - Rename the `plugin` key to `plugins` (now an array).
+   - Rename the `permission` key to `permissions` (object → array of rules).
+
+Example:
+
+```json
+{
+  "plugins": ["/path/to/openagent-harness/plugin/harness.ts"],
+  "permissions": [
+    { "action": "*", "resource": "*", "effect": "allow" }
+  ]
+}
+```
 
 ### Optional native agent install commands
 
@@ -133,7 +155,7 @@ The typical delivery flow is: `orchestrator` → `planner` → implementation ag
 
 ### Skills
 
-Agents grant their skills with `skill` rules in frontmatter `permissions:` (opencode v2 has no per-agent `skills:` list); they are loaded on demand via the `skill` tool. Skills live at `~/.config/opencode/skills/` and are **not** auto-installed by this repo.
+Agents grant their skills with `skill` rules in frontmatter `permissions:` (OpenCode v2 has no per-agent `skills:` list in frontmatter); they are loaded on demand via the `skill` tool. Skills live at `~/.config/opencode/skills/`; built-in caveman skill is auto-installed by this repo, while external skills must be installed separately.
 
 | Skill | Used by | Purpose |
 | --- | --- | --- |
