@@ -46,7 +46,7 @@
  * interrupted sessions are dropped via the `cancelledSessions` guard so they
  * can't resurrect a cancelled task through orphaned-event replay.
  */
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync } from "fs";
 import { dirname, join } from "path";
 import { homedir } from "os";
 import { fileURLToPath } from "url";
@@ -61,6 +61,7 @@ import {
 
 import type { EventResult, WorkflowTaskInput } from "./types.js";
 import { classifyError, extractErrorMessage } from "./errors.js";
+import { installAgentsInto } from "./agent-install.js";
 import {
   createPlanArtifact,
   savePlanArtifact,
@@ -145,7 +146,9 @@ function loadWasm(): DagEngine {
 
 /**
  * Write all embedded agent configs to `~/.config/opencode/agents/` the first
- * time the plugin loads.  Skips existing files so user edits are preserved.
+ * time the plugin loads.  Skips existing files so user edits are preserved,
+ * except stale v1-format files (top-level `permission:` map), which are
+ * overwritten — same rule as `openagent-harness install`.
  *
  * This replaces the need to run `openagent-harness install` manually — the
  * configs are embedded in the WASM binary and installed automatically.
@@ -153,18 +156,8 @@ function loadWasm(): DagEngine {
 function installAgentsIfNeeded(): number {
   try {
     const agentsDir = join(homedir(), ".config", "opencode", "agents");
-    mkdirSync(agentsDir, { recursive: true });
-
     const configs: Record<string, string> = JSON.parse(get_agent_configs());
-    let installed = 0;
-    for (const [name, content] of Object.entries(configs)) {
-      const dest = join(agentsDir, `${name}.md`);
-      if (!existsSync(dest)) {
-        writeFileSync(dest, content, "utf8");
-        installed++;
-      }
-    }
-    return installed;
+    return installAgentsInto(agentsDir, configs);
   } catch (e) {
     console.error("[harness-plugin] agent install failed (non-fatal):", e);
     return 0;

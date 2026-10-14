@@ -63,11 +63,14 @@ fi
 
 OLD_PLUGIN_PATH="$INSTALL_DIR/plugin/harness.ts"
 tmp_file=$(mktemp)
+# opencode v2 config: `plugins` (not v1 `plugin`), `agents.<id>.disabled` (not v1 `agent.<id>.disable`).
 jq --arg path "$PLUGIN_PATH" --arg old_path "$OLD_PLUGIN_PATH" '
-	.plugin = ((.plugin // []) | if type == "array" then (map(select(. != $old_path)) | if index($path) == null then . + [$path] else . end) else [., $path] end) |
-	.agent.build.disable = true |
-	.agent.plan.disable = true |
-	.agent.general.disable = true |
+	(if (.plugin | type) == "array" then .plugin |= map(select(. != $path and . != $old_path)) else . end) |
+	(if (.plugin | type) == "array" and (.plugin | length) == 0 then del(.plugin) else . end) |
+	.plugins = ((.plugins // []) | if type == "array" then (map(select(. != $old_path)) | if index($path) == null then . + [$path] else . end) else [., $path] end) |
+	.agents.build.disabled = true |
+	.agents.plan.disabled = true |
+	.agents.general.disabled = true |
 	.mcp.websearch = {"type": "remote", "url": "https://mcp.exa.ai/mcp"} |
 	.mcp.context7 = {"type": "remote", "url": "https://mcp.context7.com/mcp"} |
 	.mcp.grep_app = {"type": "remote", "url": "https://mcp.grep.app"}

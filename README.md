@@ -84,7 +84,7 @@ The installer configures OpenCode to use this harness, including:
 
 ### Local development setup
 
-Install wasm-pack, rebuild WASM artifacts, and point OpenCode at the local plugin path:
+Install wasm-pack, rebuild WASM artifacts, and point OpenCode (v2) at the local plugin path. Run `npm --prefix plugin install` first so `@opencode/plugin` resolves:
 
 ```sh
 cargo install wasm-pack
@@ -95,9 +95,11 @@ make wasm
 
 ```json
 {
-  "plugin": ["/path/to/openagent-harness/plugin/harness.ts"]
+  "plugins": ["/path/to/openagent-harness/plugin/harness.ts"]
 }
 ```
+
+OpenCode v2 renamed the v1 `plugin` key to `plugins`; entries may also be `{ "package": "...", "options": {} }`. Alternatively, symlink the plugin directory into `.opencode/plugins/` (project) or `~/.config/opencode/plugins/` (global) for auto-discovery.
 
 ### Optional native agent install commands
 

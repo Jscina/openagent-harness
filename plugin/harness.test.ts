@@ -164,6 +164,16 @@ let harness: Harness;
 const callTool = (name: string, input: unknown, context?: unknown) =>
   harness.call(name, input, context as any);
 
+// setup() installs agent files under homedir(); keep that out of the real
+// ~/.config/opencode (it overwrites stale v1 agents).
+const realHome = process.env.HOME;
+const fakeHome = mkdtempSync(join(tmpdir(), 'harness-test-home-'));
+process.env.HOME = fakeHome;
+afterAll(() => {
+  process.env.HOME = realHome;
+  rmSync(fakeHome, { recursive: true, force: true });
+});
+
 beforeAll(async () => {
   // Must be enabled before the plugin is instantiated so the setInterval it
   // registers internally is captured by the fake clock, not the real one.
