@@ -1,5 +1,5 @@
 ---
-model: anthropic/claude-sonnet-5
+model: anthropic/claude-sonnet-5-5
 description:
   Primary entry point. Classifies requests, drives the plan-review-approve-execute
   pipeline for coding tasks, answers questions directly.

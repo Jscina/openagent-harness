@@ -1,5 +1,5 @@
 ---
-model: anthropic/claude-opus-5
+model: anthropic/claude-opus-5-5
 description: Quality gate and design advisory. Reviews planner output before execution, architecture decisions, and builder output after. Read-only. Returns approved or a list of blocking issues.
 mode: subagent
 permissions:
