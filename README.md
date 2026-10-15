@@ -77,7 +77,7 @@ curl -fsSL https://raw.githubusercontent.com/Jscina/openagent-harness/v0.3.2/ins
 
 The installer configures OpenCode to use this harness, including:
 
-- plugin wiring: registers the install directory (`~/.openagent-harness`, entrypoint via `package.json` `exports`) in the `plugins` config key
+- plugin wiring: registers the install directory (`~/.openagent-harness`, entrypoint `index.ts` → `harness.ts`) in the `plugins` config key
 - remote MCP servers for Exa websearch, Context7, and grep.app
 - disabling default OpenCode `build`, `plan`, and `general` agents in favor of harness-managed agents
 
@@ -98,7 +98,7 @@ make wasm
 }
 ```
 
-`plugins` entries must be directories (resolved via `package.json` `exports` → `harness.ts`); file paths are rejected with `configured plugin path must be a directory`. Entries may also be `{ "package": "...", "options": {} }`. Alternatively, symlink the plugin directory into `.opencode/plugins/` (project) or `~/.config/opencode/plugins/` (global) for auto-discovery.
+`plugins` entries must be directories (resolved via `<dir>/server` or `<dir>/index`, not `package.json` `exports`; `plugin/index.ts` re-exports `harness.ts`, and a directory without either is silently skipped); file paths are rejected with `configured plugin path must be a directory`. Entries may also be `{ "package": "...", "options": {} }`. Alternatively, symlink the plugin directory into `.opencode/plugins/` (project) or `~/.config/opencode/plugins/` (global) for auto-discovery.
 
 ### Migrating from OpenCode v1
 

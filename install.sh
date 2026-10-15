@@ -54,7 +54,8 @@ echo "📦 Installing plugin dependencies..."
 echo "🔌 Registering plugin..."
 CONFIG_DIR="$HOME/.config/opencode"
 CONFIG_FILE="$CONFIG_DIR/opencode.json"
-# v2 requires a directory (package.json exports -> harness.ts), not a file path.
+# v2 requires a directory (resolved via <dir>/server or <dir>/index; index.ts
+# re-exports harness.ts), not a file path. package.json exports is not used.
 PLUGIN_PATH="$INSTALL_DIR"
 
 mkdir -p "$CONFIG_DIR"
