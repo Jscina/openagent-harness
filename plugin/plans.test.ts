@@ -161,6 +161,30 @@ describe('loadPlanArtifact', () => {
     expect(loaded.tasks[1].depends_on).toEqual([0]);
   });
 
+  it('round-trips the plan-level card_id and per-task card_id', () => {
+    const withCard = createPlanArtifact({
+      plan_id: 'plan-card',
+      summary: ['s'],
+      card_id: 'CARD-1',
+      tasks: [{ agent: 'builder', prompt: 'Build', depends_on: [], card_id: 'CARD-1' }],
+    });
+    savePlanArtifact(withCard);
+    const loaded = loadPlanArtifact('plan-card');
+    expect(loaded.card_id).toBe('CARD-1');
+    expect(loaded.tasks[0].card_id).toBe('CARD-1');
+  });
+
+  it('omits card_id from the persisted JSON when absent, and loads legacy artifacts without it', () => {
+    const created = createPlanArtifact({ plan_id: 'plan-nocard', summary: ['s'], tasks: minimal.tasks });
+    savePlanArtifact(created);
+    const raw = readFileSync(join(tmpDir, '.opencode', 'plans', 'plan-nocard.json'), 'utf8');
+    expect(raw).not.toContain('card_id');
+
+    const dir = join(tmpDir, '.opencode', 'plans');
+    writeFileSync(join(dir, 'legacy.json'), JSON.stringify(minimal), 'utf8');
+    expect(loadPlanArtifact('legacy').card_id).toBeUndefined();
+  });
+
   it('preserves optional model field on tasks', () => {
     const withModel: PlanArtifact = {
       ...minimal,

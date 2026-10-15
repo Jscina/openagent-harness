@@ -32,6 +32,8 @@ import {
   appendTrace,
   assembleContext,
   promoteFinding,
+  buildTaskMemoryPreamble,
+  hasMemoryPreamble,
   memoryRoot,
   CORPUS_GITIGNORE,
 } from './memory.js';
@@ -575,5 +577,142 @@ describe('promoteFinding', () => {
     expect(() =>
       promoteFinding({ cardId: 'CARD-BACKLOGONLY', finding: 'x', targetPath: 'known-behaviors/x.md' }, root),
     ).toThrow(/backlog/);
+  });
+});
+
+// ─── card-less (system-level) mode ───────────────────────────────────────────
+
+describe('assembleContext without a card', () => {
+  it('returns a "nothing recorded" payload and does not scaffold when the corpus is missing', () => {
+    const root = memoryRoot();
+    const out = assembleContext({}, root);
+    expect(out).toContain('# RAG Context — system (no card)');
+    expect(out).toContain('No system knowledge has been recorded yet');
+    expect(existsSync(join(root, 'system'))).toBe(false);
+    expect(assembleContext({ cardId: '  ' }, root)).toContain('system (no card)');
+  });
+
+  it('returns system knowledge and lists active cards', () => {
+    const root = memoryRoot();
+    createCard({ cardId: 'CARD-SYS1', symptom: 'x' }, root);
+    mkdirSync(join(root, 'system', 'known-behaviors'), { recursive: true });
+    writeFileSync(
+      join(root, 'system', 'known-behaviors', 'foo.md'),
+      '---\ntitle: Foo\n---\n\n# Foo\n\n## Section A\nBody.\n',
+      'utf8',
+    );
+    const out = assembleContext({ mode: 'full' }, root);
+    expect(out).toContain('# RAG Context — system (no card)');
+    expect(out).toContain('Mode: full');
+    expect(out).toContain('### known-behaviors/foo.md');
+    expect(out).toContain('Body.');
+    expect(out).toContain('CARD-SYS1');
+  });
+
+  it('keeps card mode unchanged and still throws for an explicit missing card', () => {
+    const root = memoryRoot();
+    createCard({ cardId: 'CARD-SYS2', symptom: 'x' }, root);
+    const out = assembleContext({ cardId: 'CARD-SYS2' }, root);
+    expect(out).toContain('# RAG Context — CARD-SYS2');
+    expect(out).toContain('## Investigation History');
+    expect(() => assembleContext({ cardId: 'CARD-MISSING' }, root)).toThrow(/card not found/);
+  });
+});
+
+describe('promoteFinding without a card', () => {
+  it('writes system file with no-card attribution and no benchmarks entry', () => {
+    const root = memoryRoot();
+    const result = promoteFinding(
+      { finding: 'Session-level insight', targetPath: 'known-behaviors/nocard.md', title: 'No Card' },
+      root,
+    );
+    expect(result.created).toBe(true);
+    expect(result.benchmarksPath).toBeNull();
+    const content = readFileSync(result.systemPath, 'utf8');
+    expect(content).toContain('source_cards: []');
+    expect(content).toContain('**Source**: no-card (session-level finding)');
+    expect(content).toContain('**Finding**: Session-level insight');
+
+    const again = promoteFinding({ finding: 'Second', targetPath: 'known-behaviors/nocard.md' }, root);
+    expect(again.created).toBe(false);
+    const updated = readFileSync(again.systemPath, 'utf8');
+    expect(updated).toContain('source_cards: []');
+    expect(updated.match(/no-card \(session-level finding\)/g)?.length).toBe(2);
+  });
+
+  it('still validates targetPath without a card', () => {
+    expect(() => promoteFinding({ finding: 'x', targetPath: '../escape.md' }, memoryRoot())).toThrow(
+      /invalid targetPath/,
+    );
+  });
+});
+
+describe('appendTrace error guidance', () => {
+  it('tells the caller to create a card and use memory_promote in no-card mode', () => {
+    const root = memoryRoot();
+    expect(() => appendTrace({ cardId: 'CARD-NONE', type: 'finding', body: 'x' }, root)).toThrow(
+      /memory_card[\s\S]*memory_promote/,
+    );
+  });
+});
+
+describe('buildTaskMemoryPreamble / hasMemoryPreamble', () => {
+  it('card mode: wraps compact context with card instructions', () => {
+    const root = memoryRoot();
+    createCard({ cardId: 'CARD-PRE1', symptom: 'boom' }, root);
+    const out = buildTaskMemoryPreamble({ cardId: 'PRE1', agent: 'builder', root });
+    expect(out.startsWith('<memory-context>')).toBe(true);
+    expect(out.trimEnd().endsWith('</memory-context>')).toBe(true);
+    expect(out).toContain('# RAG Context — CARD-PRE1');
+    expect(out).toContain('MANDATORY: Card: CARD-PRE1');
+    expect(out).toContain('memory_trace(cardId="CARD-PRE1")');
+    expect(out).toContain('ruled-out');
+  });
+
+  it('no-card mode: system-only with no-card instructions', () => {
+    const root = memoryRoot();
+    const out = buildTaskMemoryPreamble({ root });
+    expect(out).toContain('system (no card)');
+    expect(out).toContain('MANDATORY: No card');
+    expect(out).toContain('memory_promote');
+    expect(out).not.toContain('memory_trace(');
+  });
+
+  it('missing card: falls back to system-only and notes the missing card', () => {
+    const root = memoryRoot();
+    const out = buildTaskMemoryPreamble({ cardId: 'CARD-GONE', root });
+    expect(out).toContain('CARD-GONE was requested but not found');
+    expect(out).toContain('system (no card)');
+    expect(out).toContain('MANDATORY: No card');
+  });
+
+  it('truncates to maxChars with a note', () => {
+    const root = memoryRoot();
+    mkdirSync(join(root, 'system', 'known-behaviors'), { recursive: true });
+    writeFileSync(
+      join(root, 'system', 'known-behaviors', 'big.md'),
+      '# Big\n\n' + '## Heading\n'.repeat(500),
+      'utf8',
+    );
+    const out = buildTaskMemoryPreamble({ root, maxChars: 300 });
+    expect(out).toContain('truncated to 300 chars');
+    expect(out.length).toBeLessThan(1200);
+    expect(out.trimEnd().endsWith('</memory-context>')).toBe(true);
+  });
+
+  it('never throws', () => {
+    const root = memoryRoot();
+    let out = '';
+    expect(() => {
+      out = buildTaskMemoryPreamble({ cardId: '///', root });
+    }).not.toThrow();
+    expect(out).toContain('Memory context unavailable');
+    expect(hasMemoryPreamble(out)).toBe(true);
+    expect(() => buildTaskMemoryPreamble({ root: join(root, 'does', 'not', 'exist') })).not.toThrow();
+  });
+
+  it('hasMemoryPreamble detects the marker', () => {
+    expect(hasMemoryPreamble('<memory-context>\nx\n</memory-context>\n\ntask')).toBe(true);
+    expect(hasMemoryPreamble('plain task')).toBe(false);
   });
 });

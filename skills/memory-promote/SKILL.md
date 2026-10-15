@@ -1,26 +1,31 @@
 ---
 name: memory-promote
 description: >
-  Promote a confirmed, durable finding from a memory card into system/ knowledge via the
-  memory_promote tool. Use this skill when the user says "promote this finding", "this is a
-  benchmark moment", "add to system knowledge", "this belongs in known-behaviors", or otherwise
-  indicates a confirmed finding reveals something durable about the system's architecture,
-  schema, or service behavior. Load memory (router) first if unfamiliar with the two-layer corpus.
+  Promote a confirmed, durable finding into system/ knowledge via the memory_promote tool. Use
+  this skill when the user says "promote this finding", "this is a benchmark moment", "add to
+  system knowledge", "this belongs in known-behaviors", or when a confirmed finding reveals
+  something durable about the system's architecture, schema, or service behavior. cardId is
+  optional: omit it in no-card (system) mode. Load memory (router) first if unfamiliar with the
+  two-layer corpus.
 ---
 
 # Memory Promote
 
-Write a confirmed, durable finding from an investigation card into `system/` by calling the
-`memory_promote` tool.
+Write a confirmed, durable finding into `system/` by calling the `memory_promote` tool. Promoting
+confirmed durable findings is **mandatory** for agents allowed to call it (orchestrator, debugger,
+consultant).
 
 ## Tool call
 
 ```
-memory_promote({ cardId, finding, impact?, targetPath, title?, sectionTitle? })
+memory_promote({ cardId?, finding, impact?, targetPath, title?, sectionTitle? })
 ```
 
-- **`cardId`** (required) — the card the finding came from. Must not be a `backlog/` card.
-- **`finding`** (required) — the durable insight, written to stand on its own outside this card's
+- **`cardId`** (optional) — the card the finding came from; must not be a `backlog/` card. When
+  given, a `promoted` entry is also appended to the card's `benchmarks.md`. **Omit it** in no-card
+  (system) mode — the finding is written to `system/` only, with no benchmark entry. Never invent
+  an id.
+- **`finding`** (required) — the durable insight, written to stand on its own outside any card's
   context. Must not be empty.
 - **`impact`** — what this affects going forward. Optional but strongly recommended — a finding
   without stated impact is harder for a future reader to act on.
@@ -32,25 +37,34 @@ memory_promote({ cardId, finding, impact?, targetPath, title?, sectionTitle? })
 - **`sectionTitle`** — heading for this specific finding's section within the target file. Falls
   back to `title`, then `"Finding"`, if omitted.
 
-## Promote sparingly
+## Who may call it
+
+orchestrator, debugger, consultant. Other agents report durable findings to one of them.
+
+## Promote sparingly — but never skip a durable finding
 
 Not every trace entry deserves promotion. Promote only findings that will matter **beyond this one
 investigation** — a real architecture fact, a schema quirk, a service behavior that would recur
 across future issues. If a finding only explains why *this specific* card behaved the way it did,
-leave it in `trace.md` and don't call this tool.
+leave it in `trace.md` and don't call this tool. But a confirmed durable finding MUST be promoted.
 
 Good candidates: a hard-coded constant that causes a class of failures, an undocumented schema
 relationship, a service interaction pattern that silently misbehaves in a known edge case.
 
 Bad candidates: "the bug in this PR was a typo on line 42" — true, but doesn't generalize.
 
+## No-card mode
+
+Outside work context there is no card and no `trace.md`. `memory_promote` without `cardId` is the
+way to persist durable findings. Fine to call at the end of any task.
+
 ## What this does NOT touch
 
-`memory_promote` never touches `trace.md`. It writes/appends to the `system/` target file and
-appends a `promoted` entry to the card's `benchmarks.md`. If a `pending` benchmark entry already
-exists for this finding, this call is what turns it into `promoted` — but the tool itself doesn't
-read `benchmarks.md` for pending entries, so track that manually if the corpus is using that
-convention.
+`memory_promote` never touches `trace.md`. It writes/appends to the `system/` target file and,
+when a `cardId` is given, appends a `promoted` entry to the card's `benchmarks.md`. If a `pending`
+benchmark entry already exists for this finding, this call is what turns it into `promoted` — but
+the tool itself doesn't read `benchmarks.md` for pending entries, so track that manually if the
+corpus is using that convention.
 
 ## Before closing a card
 

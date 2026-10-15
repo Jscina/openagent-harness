@@ -31,17 +31,22 @@ vi.mock('./memory.js', () => ({
   assembleContext: vi.fn(),
   promoteFinding: vi.fn(),
   listActiveCards: vi.fn(),
+  buildTaskMemoryPreamble: vi.fn(),
+  hasMemoryPreamble: vi.fn(),
 }));
 
 import harnessPlugin from './harness.js';
 import { DagEngine } from './wasm/openagent_harness.js';
-import { loadPlanArtifact } from './plans.js';
+import { loadPlanArtifact, savePlanArtifact } from './plans.js';
+import { MEMORY_TOOL_ACCESS } from './memory-access.js';
 import {
   createCard as createCardImport,
   appendTrace as appendTraceImport,
   assembleContext as assembleContextImport,
   promoteFinding as promoteFindingImport,
   listActiveCards as listActiveCardsImport,
+  buildTaskMemoryPreamble as buildTaskMemoryPreambleImport,
+  hasMemoryPreamble as hasMemoryPreambleImport,
 } from './memory.js';
 
 const memoryMocks = {
@@ -50,7 +55,13 @@ const memoryMocks = {
   assembleContext: vi.mocked(assembleContextImport),
   promoteFinding: vi.mocked(promoteFindingImport),
   listActiveCards: vi.mocked(listActiveCardsImport),
+  buildTaskMemoryPreamble: vi.mocked(buildTaskMemoryPreambleImport),
+  hasMemoryPreamble: vi.mocked(hasMemoryPreambleImport),
 };
+
+/** What the mocked preamble builder produces for a task. */
+const preambleFor = (cardId: string | undefined, agent: string | undefined) =>
+  `<memory-context>\ncard=${cardId ?? 'none'} agent=${agent}\n</memory-context>\n`;
 
 // ─── v2 ctx mock ────────────────────────────────────────────────────────────
 
@@ -149,9 +160,9 @@ const flush = async () => {
 
 // Minimal v2 ToolContext stub — only the fields the tools under test actually
 // read (agent gating reads .agent; submit_review reads .sessionID).
-function makeContext(agent = 'orchestrator') {
+function makeContext(agent = 'orchestrator', sessionID = 'ses_ctx') {
   return {
-    sessionID: 'ses_ctx',
+    sessionID,
     messageID: 'msg_ctx',
     agent,
     id: 'call_ctx',
@@ -180,6 +191,7 @@ beforeAll(async () => {
   // setImmediate/setTimeout stay real so tests can flush promises.
   vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
   harness = await makeHarness();
+  await ackMemory(harness);
 });
 
 afterAll(async () => {
@@ -193,7 +205,20 @@ beforeEach(() => {
   memoryMocks.assembleContext.mockReset();
   memoryMocks.promoteFinding.mockReset();
   memoryMocks.listActiveCards.mockReset();
+  memoryMocks.buildTaskMemoryPreamble.mockReset();
+  memoryMocks.hasMemoryPreamble.mockReset();
+  memoryMocks.buildTaskMemoryPreamble.mockImplementation((opts) => preambleFor(opts?.cardId, opts?.agent));
+  memoryMocks.hasMemoryPreamble.mockImplementation((p) => p.includes('<memory-context>'));
 });
+
+/**
+ * Satisfy the memory_context acknowledgement gate for `sessionID` with a
+ * card-less call (the same no-card call the gate error tells agents to make).
+ */
+async function ackMemory(h: Harness, sessionID = 'ses_ctx') {
+  memoryMocks.assembleContext.mockReturnValue('# RAG Context — system (no card)');
+  await h.call('memory_context', {}, makeContext('orchestrator', sessionID));
+}
 
 /** Submit a single-task workflow directly against the real DAG and return its ids. */
 async function submitOneTask(agent = 'builder') {
@@ -391,9 +416,7 @@ describe('memory_promote tool', () => {
 // ─── harness_task_complete auto-trace glue ─────────────────────────────────
 
 describe('harness_task_complete — auto-trace-on-failure glue', () => {
-  // "Unexpected error" is classified as terminal (see errors.test.ts), so
-  // every scenario below reaches the dag.fail_task() call deterministically
-  // without going through the retryable-fallback branch first.
+  // Every scenario below reaches the dag.fail_task() call deterministically.
   const TERMINAL_ERROR = 'Unexpected error: build step blew up';
 
   it('does not call appendTrace when zero active cards exist, and still fails the task', async () => {
@@ -711,18 +734,20 @@ describe('plugin entrypoint (v2)', () => {
               prompt: { type: 'string' },
               depends_on: { type: 'array', items: { type: 'number' } },
               model: { type: 'string' },
+              card_id: { type: 'string' },
             },
             required: ['agent', 'prompt', 'depends_on'],
             additionalProperties: false,
           },
         },
+        card_id: { type: 'string' },
       },
       required: ['tasks'],
       additionalProperties: false,
     });
 
     expect(t('plan_task').required).toEqual(['agent', 'prompt']);
-    expect(Object.keys(t('plan_task').properties)).toEqual(['agent', 'prompt', 'depends_on', 'model', 'plan_id']);
+    expect(Object.keys(t('plan_task').properties)).toEqual(['agent', 'prompt', 'depends_on', 'model', 'plan_id', 'card_id']);
     expect(t('save_plan').required).toEqual(['plan_id', 'summary']);
     expect(t('submit_plan').required).toEqual(['plan_id']);
     expect(t('harness_state').required).toBeUndefined();
@@ -734,7 +759,10 @@ describe('plugin entrypoint (v2)', () => {
     expect(t('memory_card').properties.source.enum).toEqual(['ado', 'qa', 'prod', 'other']);
     expect(t('memory_trace').properties.type.enum).toEqual(['finding', 'ruled-out', 'hypothesis', 'next-step']);
     expect(t('memory_context').properties.mode.enum).toEqual(['compact', 'full']);
-    expect(t('memory_promote').required).toEqual(['cardId', 'finding', 'targetPath']);
+    expect(t('memory_promote').required).toEqual(['finding', 'targetPath']);
+    expect(t('memory_context').required).toBeUndefined();
+    expect(t('memory_card').required).toEqual(['cardId']);
+    expect(t('memory_trace').required).toEqual(['cardId', 'type', 'body']);
 
     const findings = t('submit_review').properties.findings;
     expect(t('submit_review').required).toEqual(['task_id', 'status', 'summary']);
@@ -796,6 +824,7 @@ describe('v2 events, tool hook and cleanup', () => {
   async function fresh(): Promise<Harness> {
     const h = await makeHarness();
     harnesses.push(h);
+    await ackMemory(h);
     return h;
   }
 
@@ -830,7 +859,10 @@ describe('v2 events, tool hook and cleanup', () => {
     await startTask(h, 'ses_start', 'builder');
     expect(h.session.create).toHaveBeenCalledWith(expect.objectContaining({ parentID: 'ses_ctx', agent: 'builder' }));
     expect(h.session.switchAgent).toHaveBeenCalledWith({ sessionID: 'ses_start', agent: 'builder' });
-    expect(h.session.prompt).toHaveBeenCalledWith({ sessionID: 'ses_start', text: 'do work' });
+    expect(h.session.prompt).toHaveBeenCalledWith({
+      sessionID: 'ses_start',
+      text: `${preambleFor(undefined, 'builder')}\ndo work`,
+    });
   });
 
   it('completes a task on a v2 session.idle event (reads data.sessionID)', async () => {
@@ -916,30 +948,21 @@ describe('v2 events, tool hook and cleanup', () => {
     expect(await status(h, b.workflow_id)).toBe('failed');
   });
 
-  it('falls back (task goes Pending again) on a retryable v2 error when fallbacks exist', async () => {
+  it('fails the task and deletes the session on a transient (429) v2 error', async () => {
     const h = await fresh();
-    // docs-writer ships fallback_models in its frontmatter.
-    const { workflow_id } = await startTask(h, 'ses_429', 'docs-writer');
+    const { workflow_id } = await startTask(h, 'ses_429');
 
     h.events.push(failedEvent('ses_429', { type: 'ApiError', message: 'Too many requests', status: 429 }));
     await flush();
 
-    expect(await status(h, workflow_id)).toBe('running');
+    expect(await status(h, workflow_id)).toBe('failed');
     expect(h.session.remove).toHaveBeenCalledWith({ sessionID: 'ses_429' });
 
-    // Next tick re-dispatches the task on a new session with the fallback model.
-    h.session.create.mockResolvedValueOnce({ id: 'ses_retry' });
+    // No retry: the next tick must not create a new session.
+    h.session.create.mockClear();
     await vi.advanceTimersByTimeAsync(500);
     await flush();
-    expect(h.session.prompt).toHaveBeenCalledWith({ sessionID: 'ses_retry', text: 'do work' });
-  });
-
-  it('fails a retryable error when the task has no fallbacks left', async () => {
-    const h = await fresh();
-    const { workflow_id } = await startTask(h, 'ses_nofb', 'no-fallback-agent');
-    h.events.push(failedEvent('ses_nofb', { type: 'ApiError', message: 'overloaded', status: 503 }));
-    await flush();
-    expect(await status(h, workflow_id)).toBe('failed');
+    expect(h.session.create).not.toHaveBeenCalled();
   });
 
   it('drops late idle/failed events for cancelled sessions (cancelledSessions guard)', async () => {
@@ -986,7 +1009,7 @@ describe('v2 events, tool hook and cleanup', () => {
     expect(ready.tasks[0]).toMatchObject({
       task_id: task_ids[0],
       agent: 'builder',
-      prompt: 'native work',
+      prompt: `${preambleFor(undefined, 'builder')}\nnative work`,
       description: `[harness-task:${task_ids[0]}] @builder`,
     });
     expect(h.session.create).not.toHaveBeenCalled();
@@ -1093,5 +1116,486 @@ describe('v2 events, tool hook and cleanup', () => {
     await vi.advanceTimersByTimeAsync(1000);
     await flush();
     expect(engineCalls('session.idle')).toHaveLength(0);
+  });
+});
+
+// ─── memory tool agent gating ───────────────────────────────────────────────
+
+const ALL_AGENTS = [
+  'orchestrator', 'planner', 'explorer', 'researcher', 'vision', 'builder',
+  'builder-junior', 'reviewer', 'consultant', 'debugger', 'docs-writer',
+];
+
+const GATING_INPUTS: Record<string, unknown> = {
+  memory_context: {},
+  memory_card: { cardId: 'CARD-G', symptom: 'boom' },
+  memory_trace: { cardId: 'CARD-G', type: 'finding', body: 'b' },
+  memory_promote: { finding: 'f', targetPath: 'known-behaviors/x.md' },
+};
+
+describe('memory tool agent gating', () => {
+  beforeEach(() => {
+    memoryMocks.createCard.mockReturnValue(['context.md']);
+    memoryMocks.appendTrace.mockReturnValue({ formatted: 'appended' } as any);
+    memoryMocks.assembleContext.mockReturnValue('# ctx');
+    memoryMocks.promoteFinding.mockReturnValue({ systemPath: '/s/x.md', benchmarksPath: null, created: true });
+  });
+
+  it('exposes exactly the documented matrix', () => {
+    expect(MEMORY_TOOL_ACCESS).toEqual({
+      memory_context: [
+        'orchestrator', 'planner', 'builder', 'debugger', 'consultant',
+        'explorer', 'researcher', 'reviewer', 'docs-writer', 'vision',
+      ],
+      memory_card: ['orchestrator', 'debugger'],
+      memory_trace: ['orchestrator', 'builder', 'debugger', 'consultant'],
+      memory_promote: ['orchestrator', 'debugger', 'consultant'],
+    });
+    for (const allowed of Object.values(MEMORY_TOOL_ACCESS)) {
+      expect(allowed).not.toContain('builder-junior');
+    }
+  });
+
+  for (const tool of Object.keys(GATING_INPUTS)) {
+    it(`${tool}: allows only its listed agents, denies everyone else (incl. builder-junior)`, async () => {
+      for (const agent of ALL_AGENTS) {
+        const call = callTool(tool, GATING_INPUTS[tool], makeContext(agent));
+        if (MEMORY_TOOL_ACCESS[tool].includes(agent)) {
+          await expect(call).resolves.toBeTypeOf('string');
+        } else {
+          await expect(call).rejects.toThrow(`${tool} is not permitted for agent ${agent}`);
+        }
+      }
+    });
+
+    it(`${tool}: denies an undefined agent without touching memory`, async () => {
+      memoryMocks.createCard.mockClear();
+      memoryMocks.appendTrace.mockClear();
+      memoryMocks.assembleContext.mockClear();
+      memoryMocks.promoteFinding.mockClear();
+      await expect(
+        callTool(tool, GATING_INPUTS[tool], { ...makeContext(), agent: undefined }),
+      ).rejects.toThrow(`${tool} is not permitted for agent`);
+      expect(memoryMocks.createCard).not.toHaveBeenCalled();
+      expect(memoryMocks.appendTrace).not.toHaveBeenCalled();
+      expect(memoryMocks.assembleContext).not.toHaveBeenCalled();
+      expect(memoryMocks.promoteFinding).not.toHaveBeenCalled();
+    });
+  }
+
+  it('memory_context with no card succeeds and passes cardId undefined', async () => {
+    const out = await callTool('memory_context', {}, makeContext('explorer'));
+    expect(out).toBe('# ctx');
+    expect(memoryMocks.assembleContext).toHaveBeenCalledWith({
+      cardId: undefined,
+      mode: undefined,
+      sections: undefined,
+    });
+  });
+
+  it('memory_promote with no card returns a null benchmarksPath', async () => {
+    const out = JSON.parse(
+      await callTool('memory_promote', { finding: 'f', targetPath: 'known-behaviors/x.md' }, makeContext('consultant')),
+    );
+    expect(out).toEqual({ success: true, systemPath: '/s/x.md', benchmarksPath: null, created: true });
+    expect(memoryMocks.promoteFinding).toHaveBeenCalledWith(expect.objectContaining({ cardId: undefined }));
+  });
+});
+
+// ─── memory_context acknowledgement gate ────────────────────────────────────
+
+describe('memory_context acknowledgement gate', () => {
+  let h: Harness;
+  let tmp: string;
+
+  beforeEach(async () => {
+    tmp = mkdtempSync(join(tmpdir(), 'harness-ack-test-'));
+    vi.spyOn(process, 'cwd').mockReturnValue(tmp);
+    memoryMocks.assembleContext.mockReturnValue('# ctx');
+    h = await makeHarness();
+  });
+
+  afterEach(async () => {
+    await h.cleanup();
+    vi.restoreAllMocks();
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const planner = (sid = 'ses_gate') => makeContext('planner', sid);
+  const orch = (sid = 'ses_gate') => makeContext('orchestrator', sid);
+  const task = { agent: 'explorer', prompt: 'look', depends_on: [] };
+
+  it('blocks plan_task before memory_context and spells out the exact no-card call', async () => {
+    const err = await h.call('plan_task', task, planner()).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain('requires memory_context');
+    expect((err as Error).message).toContain('memory_context({ cardId: "<id>" })');
+    expect((err as Error).message).toContain('memory_context({})');
+  });
+
+  it('allows plan_task after a card-less memory_context call from that session', async () => {
+    await h.call('memory_context', {}, planner());
+    const out = JSON.parse(await h.call('plan_task', task, planner()));
+    expect(out.task_count).toBe(1);
+  });
+
+  it('allows plan_task after memory_context with a cardId', async () => {
+    await h.call('memory_context', { cardId: 'CARD-A' }, planner());
+    await expect(h.call('plan_task', task, planner())).resolves.toBeTypeOf('string');
+  });
+
+  it('does not acknowledge when memory_context itself fails (e.g. unknown card)', async () => {
+    memoryMocks.assembleContext.mockImplementation(() => {
+      throw new Error('assembleContext: card not found: CARD-NOPE');
+    });
+    await expect(h.call('memory_context', { cardId: 'CARD-NOPE' }, planner())).rejects.toThrow(/card not found/);
+    await expect(h.call('plan_task', task, planner())).rejects.toThrow('requires memory_context');
+  });
+
+  it('is per session: another session is still blocked', async () => {
+    await h.call('memory_context', {}, planner('ses_a'));
+    await expect(h.call('plan_task', task, planner('ses_b'))).rejects.toThrow('requires memory_context');
+  });
+
+  it('keeps the agent check ahead of the ack check', async () => {
+    await expect(h.call('plan_task', task, orch())).rejects.toThrow(
+      'plan_task can only be executed by the planner agent',
+    );
+  });
+
+  it('blocks submit_workflow before memory_context and allows it after a card-less call', async () => {
+    const input = { tasks: [{ agent: 'builder', prompt: 'x', depends_on: [] }] };
+    await expect(h.call('submit_workflow', input, orch())).rejects.toThrow(/requires memory_context.*memory_context\(\{\}\)/);
+    await h.call('memory_context', {}, orch());
+    const out = JSON.parse(await h.call('submit_workflow', input, orch()));
+    expect(out.task_ids).toHaveLength(1);
+  });
+
+  it('blocks submit_plan before memory_context and allows it after a card-less call', async () => {
+    savePlanArtifact({
+      id: 'ack-plan',
+      created_at: '2026-01-01T00:00:00.000Z',
+      summary: ['s'],
+      tasks: [{ agent: 'builder', prompt: 'x', depends_on: [] }],
+    });
+    await expect(h.call('submit_plan', { plan_id: 'ack-plan' }, orch())).rejects.toThrow(
+      /requires memory_context.*memory_context\(\{\}\)/,
+    );
+    await h.call('memory_context', {}, orch());
+    const out = JSON.parse(await h.call('submit_plan', { plan_id: 'ack-plan' }, orch()));
+    expect(out.workflow_id).toBeTypeOf('string');
+  });
+});
+
+// ─── card_id threading + preamble (real WASM engine) ────────────────────────
+
+describe('card_id threading and task memory preamble', () => {
+  const harnesses: Harness[] = [];
+  let tmp: string;
+
+  async function fresh(): Promise<Harness> {
+    const h = await makeHarness();
+    harnesses.push(h);
+    await ackMemory(h);
+    return h;
+  }
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'harness-card-test-'));
+    vi.spyOn(process, 'cwd').mockReturnValue(tmp);
+  });
+
+  afterEach(async () => {
+    while (harnesses.length) await harnesses.pop()!.cleanup();
+    vi.restoreAllMocks();
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const tickOnce = async () => {
+    await vi.advanceTimersByTimeAsync(500);
+    await flush();
+  };
+
+  /** Flag a workflow native, tick, and return the drained dispatch result. */
+  async function dispatchNative(h: Harness, workflow_id: string) {
+    await h.call('harness_dispatch_tasks', { workflow_id, timeout_ms: 0 });
+    await tickOnce();
+    return JSON.parse(await h.call('harness_dispatch_tasks', { workflow_id, timeout_ms: 0 }));
+  }
+
+  it('flows plan_task -> save_plan artifact -> submit_plan -> snapshot -> dispatch output', async () => {
+    const h = await fresh();
+    const first = JSON.parse(
+      await h.call('plan_task', { agent: 'explorer', prompt: 'map', depends_on: [], card_id: 'CARD-1' }, makeContext('planner')),
+    );
+    expect(first.card_id).toBe('CARD-1');
+    const planId = first.plan_id as string;
+    await h.call('plan_task', { agent: 'builder', prompt: 'build', depends_on: [0], plan_id: planId }, makeContext('planner'));
+
+    const saved = JSON.parse(await h.call('save_plan', { plan_id: planId, summary: ['s'] }, makeContext('planner')));
+    expect(saved.card_id).toBe('CARD-1');
+    const artifact = loadPlanArtifact(planId);
+    expect(artifact.card_id).toBe('CARD-1');
+    expect(artifact.tasks.map((t) => t.card_id)).toEqual(['CARD-1', 'CARD-1']);
+
+    const { workflow_id } = JSON.parse(await h.call('submit_plan', { plan_id: planId, native_dispatch: true }, makeContext('orchestrator')));
+    const snap = JSON.parse(await h.call('harness_state', { workflow_id })).snapshot;
+    expect(snap.card_id).toBe('CARD-1');
+    expect(snap.tasks.every((t: any) => t.card_id === 'CARD-1')).toBe(true);
+
+    await tickOnce();
+    const ready = JSON.parse(await h.call('harness_dispatch_tasks', { workflow_id, timeout_ms: 0 }));
+    expect(ready.status).toBe('tasks_ready');
+    expect(ready.tasks[0]).toMatchObject({
+      agent: 'explorer',
+      card_id: 'CARD-1',
+      prompt: `${preambleFor('CARD-1', 'explorer')}\nmap`,
+    });
+  });
+
+  it('submits a legacy artifact without card_id as no-card work', async () => {
+    const h = await fresh();
+    savePlanArtifact({
+      id: 'legacy',
+      created_at: '2026-01-01T00:00:00.000Z',
+      summary: ['s'],
+      tasks: [{ agent: 'builder', prompt: 'work', depends_on: [] }],
+    });
+    expect(loadPlanArtifact('legacy').card_id).toBeUndefined();
+
+    const { workflow_id } = JSON.parse(await h.call('submit_plan', { plan_id: 'legacy' }, makeContext('orchestrator')));
+    expect(JSON.parse(await h.call('harness_state', { workflow_id })).snapshot).not.toHaveProperty('card_id');
+
+    const ready = await dispatchNative(h, workflow_id);
+    expect(ready.tasks[0]).not.toHaveProperty('card_id');
+    expect(ready.tasks[0].prompt).toBe(`${preambleFor(undefined, 'builder')}\nwork`);
+  });
+
+  it('save_plan omits card_id from the artifact when the plan has none', async () => {
+    const h = await fresh();
+    const { plan_id } = JSON.parse(await h.call('plan_task', { agent: 'explorer', prompt: 'x' }, makeContext('planner')));
+    const saved = JSON.parse(await h.call('save_plan', { plan_id, summary: ['s'] }, makeContext('planner')));
+    expect(saved).not.toHaveProperty('card_id');
+    expect(loadPlanArtifact(plan_id)).not.toHaveProperty('card_id');
+  });
+
+  it('prepends the preamble once on the plugin tick-loop path (card and no-card)', async () => {
+    const h = await fresh();
+    h.session.create.mockResolvedValueOnce({ id: 'ses_card' }).mockResolvedValueOnce({ id: 'ses_nocard' });
+    await h.call('submit_workflow', {
+      tasks: [{ agent: 'builder', prompt: 'with card', depends_on: [] }],
+      card_id: 'CARD-2',
+    });
+    await tickOnce();
+    await h.call('submit_workflow', { tasks: [{ agent: 'explorer', prompt: 'no card', depends_on: [] }] });
+    await tickOnce();
+
+    expect(h.session.prompt).toHaveBeenCalledWith({
+      sessionID: 'ses_card',
+      text: `${preambleFor('CARD-2', 'builder')}\nwith card`,
+    });
+    expect(h.session.prompt).toHaveBeenCalledWith({
+      sessionID: 'ses_nocard',
+      text: `${preambleFor(undefined, 'explorer')}\nno card`,
+    });
+  });
+
+  it('per-task card_id overrides the workflow card_id', async () => {
+    const h = await fresh();
+    const { workflow_id } = JSON.parse(
+      await h.call('submit_workflow', {
+        tasks: [{ agent: 'builder', prompt: 'p', depends_on: [], card_id: 'CARD-T' }],
+        card_id: 'CARD-W',
+      }),
+    );
+    const ready = await dispatchNative(h, workflow_id);
+    expect(ready.tasks[0].card_id).toBe('CARD-T');
+  });
+
+  it('does not double-prepend when the prompt already carries a preamble (both paths)', async () => {
+    const h = await fresh();
+    const prompt = '<memory-context>\nalready\n</memory-context>\nwork';
+    h.session.create.mockResolvedValueOnce({ id: 'ses_pre' });
+    await h.call('submit_workflow', { tasks: [{ agent: 'builder', prompt, depends_on: [] }] });
+    await tickOnce();
+    expect(h.session.prompt).toHaveBeenCalledWith({ sessionID: 'ses_pre', text: prompt });
+
+    const { workflow_id } = JSON.parse(
+      await h.call('submit_workflow', { tasks: [{ agent: 'builder', prompt, depends_on: [] }] }),
+    );
+    const ready = await dispatchNative(h, workflow_id);
+    expect(ready.tasks[0].prompt).toBe(prompt);
+    expect(memoryMocks.buildTaskMemoryPreamble).not.toHaveBeenCalled();
+  });
+
+  it('never blocks dispatch when the preamble builder throws', async () => {
+    const h = await fresh();
+    memoryMocks.buildTaskMemoryPreamble.mockImplementation(() => {
+      throw new Error('preamble exploded');
+    });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    h.session.create.mockResolvedValueOnce({ id: 'ses_boom' });
+    await h.call('submit_workflow', { tasks: [{ agent: 'builder', prompt: 'raw', depends_on: [] }] });
+    await tickOnce();
+    expect(h.session.prompt).toHaveBeenCalledWith({ sessionID: 'ses_boom', text: 'raw' });
+  });
+});
+
+// ─── auto-trace on task completion ──────────────────────────────────────────
+
+describe('harness_task_complete — auto-trace with card_id', () => {
+  let h: Harness;
+
+  beforeEach(async () => {
+    h = await makeHarness();
+    await ackMemory(h);
+  });
+
+  afterEach(async () => {
+    await h.cleanup();
+  });
+
+  async function submitCardTask(card_id?: string, agent = 'builder') {
+    const raw = await h.call(
+      'submit_workflow',
+      { tasks: [{ agent, prompt: 'do work', depends_on: [] }], ...(card_id ? { card_id } : {}) },
+      makeContext('orchestrator'),
+    );
+    return JSON.parse(raw) as { workflow_id: string; task_ids: string[] };
+  }
+
+  it('traces success to the task card', async () => {
+    const { task_ids } = await submitCardTask('CARD-T');
+    const out = JSON.parse(
+      await h.call('harness_task_complete', { task_id: task_ids[0], session_id: 'ses_s1', status: 'done' }),
+    );
+    expect(out).toMatchObject({ status: 'done', auto_traced: true });
+    expect(memoryMocks.appendTrace).toHaveBeenCalledTimes(1);
+    expect(memoryMocks.appendTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cardId: 'CARD-T',
+        type: 'finding',
+        body: `Task ${task_ids[0]} (@builder) completed`,
+      }),
+    );
+    expect(memoryMocks.listActiveCards).not.toHaveBeenCalled();
+  });
+
+  it('traces failure to the task card even when several cards are active (no heuristic)', async () => {
+    memoryMocks.listActiveCards.mockReturnValue(['A', 'B']);
+    const { workflow_id, task_ids } = await submitCardTask('CARD-T');
+    const out = JSON.parse(
+      await h.call('harness_task_complete', {
+        task_id: task_ids[0], session_id: 'ses_f1', status: 'failed', error: 'kaboom',
+      }),
+    );
+    expect(out).toMatchObject({ status: 'failed', auto_traced: true });
+    expect(memoryMocks.appendTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cardId: 'CARD-T',
+        type: 'finding',
+        body: `Task ${task_ids[0]} (@builder) failed: kaboom`,
+      }),
+    );
+    expect(memoryMocks.listActiveCards).not.toHaveBeenCalled();
+    expect(JSON.parse(await h.call('harness_state', { workflow_id })).snapshot.status.type).toBe('failed');
+  });
+
+  it('does not trace success for a task without a card', async () => {
+    const { task_ids } = await submitCardTask();
+    const out = JSON.parse(
+      await h.call('harness_task_complete', { task_id: task_ids[0], session_id: 'ses_s2', status: 'done' }),
+    );
+    expect(out.auto_traced).toBe(false);
+    expect(memoryMocks.appendTrace).not.toHaveBeenCalled();
+  });
+
+  it('uses the single-active-card heuristic for failures only when the task has no card', async () => {
+    memoryMocks.listActiveCards.mockReturnValue(['ONLY']);
+    const { task_ids } = await submitCardTask();
+    const out = JSON.parse(
+      await h.call('harness_task_complete', {
+        task_id: task_ids[0], session_id: 'ses_f2', status: 'failed', error: 'nope',
+      }),
+    );
+    expect(out.auto_traced).toBe(true);
+    expect(memoryMocks.appendTrace).toHaveBeenCalledWith(
+      expect.objectContaining({ cardId: 'ONLY', body: `Task ${task_ids[0]} (@builder) failed: nope` }),
+    );
+  });
+
+  it('is non-fatal when the card does not exist / is not active', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    memoryMocks.appendTrace.mockImplementation(() => {
+      throw new Error('appendTrace: no active card CARD-GONE');
+    });
+    const { task_ids } = await submitCardTask('CARD-GONE');
+    const out = JSON.parse(
+      await h.call('harness_task_complete', { task_id: task_ids[0], session_id: 'ses_s3', status: 'done' }),
+    );
+    expect(out).toMatchObject({ registered: true, status: 'done', auto_traced: false });
+    expect(errSpy).toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+});
+
+describe('event-driven auto-trace', () => {
+  const harnesses: Harness[] = [];
+
+  afterEach(async () => {
+    while (harnesses.length) await harnesses.pop()!.cleanup();
+  });
+
+  async function startCardTask(sid: string, card_id?: string) {
+    const h = await makeHarness();
+    harnesses.push(h);
+    await ackMemory(h);
+    h.session.create.mockResolvedValueOnce({ id: sid });
+    await h.call('submit_workflow', {
+      tasks: [{ agent: 'builder', prompt: 'do work', depends_on: [] }],
+      ...(card_id ? { card_id } : {}),
+    });
+    await vi.advanceTimersByTimeAsync(500);
+    await flush();
+    return h;
+  }
+
+  it('traces a session.idle completion to the task card', async () => {
+    const h = await startCardTask('ses_ev_ok', 'CARD-E');
+    h.events.push(idleEvent('ses_ev_ok'));
+    await flush();
+    expect(memoryMocks.appendTrace).toHaveBeenCalledTimes(1);
+    expect(memoryMocks.appendTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cardId: 'CARD-E',
+        type: 'finding',
+        body: expect.stringMatching(/^Task \S+ \(@builder\) completed$/),
+      }),
+    );
+  });
+
+  it('traces a session.execution.failed failure to the task card', async () => {
+    const h = await startCardTask('ses_ev_bad', 'CARD-E');
+    h.events.push(failedEvent('ses_ev_bad', { type: 'ApiError', message: 'Unauthorized', status: 401 }));
+    await flush();
+    expect(memoryMocks.appendTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cardId: 'CARD-E',
+        body: expect.stringContaining('failed: ApiError: Unauthorized (HTTP 401)'),
+      }),
+    );
+  });
+
+  it('does not trace a card-less completion, and keeps the failure heuristic', async () => {
+    const ok = await startCardTask('ses_ev_nc_ok');
+    ok.events.push(idleEvent('ses_ev_nc_ok'));
+    await flush();
+    expect(memoryMocks.appendTrace).not.toHaveBeenCalled();
+
+    memoryMocks.listActiveCards.mockReturnValue(['ONLY']);
+    const bad = await startCardTask('ses_ev_nc_bad');
+    bad.events.push(failedEvent('ses_ev_nc_bad', { type: 'ApiError', message: 'x', status: 401 }));
+    await flush();
+    expect(memoryMocks.appendTrace).toHaveBeenCalledWith(expect.objectContaining({ cardId: 'ONLY' }));
   });
 });

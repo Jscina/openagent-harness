@@ -141,6 +141,22 @@ export class DagEngine {
         }
     }
     /**
+     * Plan-level card id bound to a draft, or `undefined` when unbound/unknown.
+     * @param {string} plan_id
+     * @returns {string | undefined}
+     */
+    get_plan_card_id(plan_id) {
+        const ptr0 = passStringToWasm0(plan_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmdagengine_get_plan_card_id(this.__wbg_ptr, ptr0, len0);
+        let v2;
+        if (ret[0] !== 0) {
+            v2 = getStringFromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v2;
+    }
+    /**
      * @param {string} plan_id
      * @returns {string}
      */
@@ -279,14 +295,6 @@ export class DagEngine {
         }
     }
     /**
-     * @param {string} json
-     */
-    set_agent_fallbacks(json) {
-        const ptr0 = passStringToWasm0(json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        wasm.wasmdagengine_set_agent_fallbacks(this.__wbg_ptr, ptr0, len0);
-    }
-    /**
      * @param {string} task_id
      * @param {string} review_json
      * @returns {string}
@@ -316,28 +324,31 @@ export class DagEngine {
     /**
      * @param {string} tasks_json
      * @param {string | null} [parent_session_id]
+     * @param {string | null} [card_id]
      * @returns {string}
      */
-    submit_workflow(tasks_json, parent_session_id) {
-        let deferred4_0;
-        let deferred4_1;
+    submit_workflow(tasks_json, parent_session_id, card_id) {
+        let deferred5_0;
+        let deferred5_1;
         try {
             const ptr0 = passStringToWasm0(tasks_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             const len0 = WASM_VECTOR_LEN;
             var ptr1 = isLikeNone(parent_session_id) ? 0 : passStringToWasm0(parent_session_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             var len1 = WASM_VECTOR_LEN;
-            const ret = wasm.wasmdagengine_submit_workflow(this.__wbg_ptr, ptr0, len0, ptr1, len1);
-            var ptr3 = ret[0];
-            var len3 = ret[1];
+            var ptr2 = isLikeNone(card_id) ? 0 : passStringToWasm0(card_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            var len2 = WASM_VECTOR_LEN;
+            const ret = wasm.wasmdagengine_submit_workflow(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+            var ptr4 = ret[0];
+            var len4 = ret[1];
             if (ret[3]) {
-                ptr3 = 0; len3 = 0;
+                ptr4 = 0; len4 = 0;
                 throw takeFromExternrefTable0(ret[2]);
             }
-            deferred4_0 = ptr3;
-            deferred4_1 = len3;
-            return getStringFromWasm0(ptr3, len3);
+            deferred5_0 = ptr4;
+            deferred5_1 = len4;
+            return getStringFromWasm0(ptr4, len4);
         } finally {
-            wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+            wasm.__wbindgen_free(deferred5_0, deferred5_1, 1);
         }
     }
     /**
@@ -368,55 +379,8 @@ export class DagEngine {
             wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
         }
     }
-    /**
-     * @param {string} task_id
-     * @param {string} error_msg
-     * @returns {string}
-     */
-    try_fallback(task_id, error_msg) {
-        let deferred4_0;
-        let deferred4_1;
-        try {
-            const ptr0 = passStringToWasm0(task_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-            const len0 = WASM_VECTOR_LEN;
-            const ptr1 = passStringToWasm0(error_msg, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-            const len1 = WASM_VECTOR_LEN;
-            const ret = wasm.wasmdagengine_try_fallback(this.__wbg_ptr, ptr0, len0, ptr1, len1);
-            var ptr3 = ret[0];
-            var len3 = ret[1];
-            if (ret[3]) {
-                ptr3 = 0; len3 = 0;
-                throw takeFromExternrefTable0(ret[2]);
-            }
-            deferred4_0 = ptr3;
-            deferred4_1 = len3;
-            return getStringFromWasm0(ptr3, len3);
-        } finally {
-            wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
-        }
-    }
 }
 if (Symbol.dispose) DagEngine.prototype[Symbol.dispose] = DagEngine.prototype.free;
-
-/**
- * Return parsed agent fallback configs as a JSON object `{name: config, ...}`.
- *
- * The TypeScript plugin calls this on startup and registers per-agent
- * fallback chains in the DAG engine.
- * @returns {string}
- */
-export function agent_fallback_configs_json() {
-    let deferred1_0;
-    let deferred1_1;
-    try {
-        const ret = wasm.agent_fallback_configs_json();
-        deferred1_0 = ret[0];
-        deferred1_1 = ret[1];
-        return getStringFromWasm0(ret[0], ret[1]);
-    } finally {
-        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
-    }
-}
 
 /**
  * Return all agent configs as a JSON object `{name: content, ...}`.

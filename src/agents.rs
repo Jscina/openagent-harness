@@ -25,91 +25,55 @@ pub const AGENTS: &[(&str, &str)] = &[
 ];
 
 /// Parsed configuration extracted from an agent's YAML frontmatter.
-///
-/// Used at startup to register per-agent fallback chains via `DagEngine::set_agent_fallbacks`.
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentConfig {
     /// Agent name, matching the filename stem (e.g. `"planner"`).
     pub name: String,
     /// Primary model string in `provider/model` format.
     pub model: String,
-    /// Ordered fallback model chain; empty if none are declared in frontmatter.
-    pub fallback_models: Vec<String>,
 }
 
 impl AgentConfig {
-    pub fn new(name: String, model: String, fallback_models: Vec<String>) -> Self {
-        Self {
-            name,
-            model,
-            fallback_models,
-        }
+    pub fn new(name: String, model: String) -> Self {
+        Self { name, model }
     }
 }
 
-/// Parse the `model` and `fallback_models` fields from an agent's YAML frontmatter.
+/// Parse the `model` field from an agent's YAML frontmatter.
 ///
-/// Returns an `AgentConfig` with empty `model` and no `fallback_models` when the
-/// content has no valid `---` frontmatter block.  The `model` field is required
-/// for the agent to be dispatched; `fallback_models` is optional.
+/// Returns an `AgentConfig` with empty `model` when the content has no valid
+/// `---` frontmatter block.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_agent_frontmatter(name: &str, content: &str) -> AgentConfig {
     // Find the frontmatter block between the first two `---` delimiters.
     let after_first = match content.strip_prefix("---\n") {
         Some(rest) => rest,
         None => {
-            return AgentConfig::new(name.to_string(), String::new(), vec![]);
+            return AgentConfig::new(name.to_string(), String::new());
         }
     };
 
     let end = match after_first.find("\n---") {
         Some(pos) => pos,
         None => {
-            return AgentConfig::new(name.to_string(), String::new(), vec![]);
+            return AgentConfig::new(name.to_string(), String::new());
         }
     };
 
     let frontmatter = &after_first[..end];
 
     let mut model = String::new();
-    let mut fallback_models: Vec<String> = vec![];
-    let mut in_fallback_models = false;
 
     // Only top-level (column 0) keys are inspected, so nested blocks such as the
     // v2 `permissions:` rule list (`- action: ... / resource: ... / effect: ...`)
-    // are skipped without being misread as `model` or fallback entries.
+    // are skipped without being misread as `model`.
     for line in frontmatter.lines() {
         if let Some(val) = line.strip_prefix("model:") {
             model = clean_scalar(val);
-            in_fallback_models = false;
-        } else if let Some(val) = line.strip_prefix("fallback_models:") {
-            let val = val.trim();
-            if let Some(inline) = val.strip_prefix('[') {
-                // Flow style: `fallback_models: [a/b, c/d]`.
-                let inline = inline.split(']').next().unwrap_or("");
-                fallback_models.extend(
-                    inline
-                        .split(',')
-                        .map(clean_scalar)
-                        .filter(|item| !item.is_empty()),
-                );
-                in_fallback_models = false;
-            } else {
-                in_fallback_models = true;
-            }
-        } else if in_fallback_models {
-            if let Some(item) = line.trim_start().strip_prefix("- ") {
-                let item = clean_scalar(item);
-                if !item.is_empty() {
-                    fallback_models.push(item);
-                }
-            } else if !line.starts_with(' ') && !line.is_empty() {
-                // A non-indented, non-empty line ends the fallback_models block.
-                in_fallback_models = false;
-            }
         }
     }
 
-    AgentConfig::new(name.to_string(), model, fallback_models)
+    AgentConfig::new(name.to_string(), model)
 }
 
 /// Normalise a YAML scalar: trim, drop a trailing ` # comment`, strip matching quotes.
@@ -133,23 +97,12 @@ fn clean_scalar(raw: &str) -> String {
 }
 
 /// Returns an `AgentConfig` for every embedded agent.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn all_agent_configs() -> Vec<AgentConfig> {
     AGENTS
         .iter()
         .map(|(name, content)| parse_agent_frontmatter(name, content))
         .collect()
-}
-
-/// Serializes all agent configs as a JSON object keyed by agent name.
-///
-/// Consumed by the WASM export `agent_fallback_configs_json`.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub fn agent_fallback_configs_json() -> String {
-    let map: HashMap<String, AgentConfig> = all_agent_configs()
-        .into_iter()
-        .map(|cfg| (cfg.name.clone(), cfg))
-        .collect();
-    serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -199,46 +152,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_agent_frontmatter_with_fallback_models() {
-        let md = "---\nmodel: anthropic/claude-opus-4-6\nfallback_models:\n  - openai/gpt-5.4\n  - ollama/qwen3-coder:30b\n---\n\nBody text here.\n";
-        let cfg = parse_agent_frontmatter("planner", md);
-        assert_eq!(cfg.name, "planner");
-        assert_eq!(cfg.model, "anthropic/claude-opus-4-6");
-        assert_eq!(
-            cfg.fallback_models,
-            vec!["openai/gpt-5.4", "ollama/qwen3-coder:30b"]
-        );
-    }
-
-    #[test]
-    fn parse_agent_frontmatter_without_fallback_models() {
+    fn parse_agent_frontmatter_reads_model() {
         let md = "---\nmodel: anthropic/claude-sonnet-4-6\ndescription: A simple agent.\n---\n\nBody text.\n";
         let cfg = parse_agent_frontmatter("explorer", md);
         assert_eq!(cfg.name, "explorer");
         assert_eq!(cfg.model, "anthropic/claude-sonnet-4-6");
-        assert!(cfg.fallback_models.is_empty());
     }
 
-    const V2_SAMPLE: &str = "---\nmodel: anthropic/claude-opus-5#high\nfallback_models:\n  - openai/gpt-5.4#low\n  - ollama/qwen3-coder:30b\ndescription: v2 agent.\nmode: subagent\npermissions:\n  - action: edit\n    resource: \"*\"\n    effect: deny\n  - action: subagent\n    resource: explorer\n    effect: allow\n  - action: skill\n    resource: caveman\n    effect: allow\n---\n\nBody.\n";
+    const V2_SAMPLE: &str = "---\nmodel: anthropic/claude-opus-5#high\ndescription: v2 agent.\nmode: subagent\npermissions:\n  - action: edit\n    resource: \"*\"\n    effect: deny\n  - action: subagent\n    resource: explorer\n    effect: allow\n  - action: skill\n    resource: caveman\n    effect: allow\n---\n\nBody.\n";
 
     #[test]
     fn parse_agent_frontmatter_v2_sample_ignores_permissions_and_keeps_variant() {
         let cfg = parse_agent_frontmatter("planner", V2_SAMPLE);
         assert_eq!(cfg.model, "anthropic/claude-opus-5#high");
-        assert_eq!(
-            cfg.fallback_models,
-            vec!["openai/gpt-5.4#low", "ollama/qwen3-coder:30b"]
-        );
-    }
-
-    #[test]
-    fn parse_agent_frontmatter_permissions_directly_after_fallbacks() {
-        // No key between the fallback list and `permissions:`; its rules must not
-        // be treated as fallback entries.
-        let md = "---\nmodel: a/b\nfallback_models:\n  - c/d\npermissions:\n  - action: edit\n    resource: \"*\"\n    effect: deny\n---\n";
-        let cfg = parse_agent_frontmatter("x", md);
-        assert_eq!(cfg.model, "a/b");
-        assert_eq!(cfg.fallback_models, vec!["c/d"]);
     }
 
     #[test]
@@ -249,12 +175,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_agent_frontmatter_handles_comments_quotes_and_flow_lists() {
-        let md =
-            "---\nmodel: \"a/b#max\" # primary\nfallback_models: [c/d, 'e/f#low'] # chain\n---\n";
+    fn parse_agent_frontmatter_handles_comments_and_quotes() {
+        let md = "---\nmodel: \"a/b#max\" # primary\n---\n";
         let cfg = parse_agent_frontmatter("x", md);
         assert_eq!(cfg.model, "a/b#max");
-        assert_eq!(cfg.fallback_models, vec!["c/d", "e/f#low"]);
+    }
+
+    #[test]
+    fn embedded_agents_have_no_fallback_models_key() {
+        for (name, content) in AGENTS {
+            assert!(
+                !content.contains("fallback_models"),
+                "agent '{name}' still declares fallback_models"
+            );
+        }
     }
 
     #[test]
@@ -309,12 +243,6 @@ mod tests {
                 "agent '{name}' model should use provider/model format: '{}'",
                 cfg.model
             );
-            for fallback in &cfg.fallback_models {
-                assert!(
-                    fallback.contains('/'),
-                    "agent '{name}' fallback should use provider/model format: '{fallback}'"
-                );
-            }
         }
     }
 
@@ -329,29 +257,5 @@ mod tests {
                 cfg.name
             );
         }
-    }
-
-    #[test]
-    fn all_agent_configs_have_fallback_models() {
-        let configs = all_agent_configs();
-        for cfg in &configs {
-            assert!(
-                !cfg.fallback_models.is_empty(),
-                "agent '{}' has no fallback_models",
-                cfg.name
-            );
-        }
-    }
-
-    #[test]
-    fn agent_fallback_configs_json_is_valid_object() {
-        let json = agent_fallback_configs_json();
-        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(val.is_object());
-        let obj = val.as_object().unwrap();
-        assert_eq!(obj.len(), 11);
-        // Spot-check a known agent.
-        assert!(obj["planner"]["model"].is_string());
-        assert!(obj["planner"]["fallback_models"].is_array());
     }
 }

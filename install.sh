@@ -54,20 +54,23 @@ echo "📦 Installing plugin dependencies..."
 echo "🔌 Registering plugin..."
 CONFIG_DIR="$HOME/.config/opencode"
 CONFIG_FILE="$CONFIG_DIR/opencode.json"
-PLUGIN_PATH="$INSTALL_DIR/harness.ts"
+# v2 requires a directory (package.json exports -> harness.ts), not a file path.
+PLUGIN_PATH="$INSTALL_DIR"
 
 mkdir -p "$CONFIG_DIR"
 if [ ! -f "$CONFIG_FILE" ]; then
   echo "{}" >"$CONFIG_FILE"
 fi
 
+# Previous file-path registrations to migrate away from.
 OLD_PLUGIN_PATH="$INSTALL_DIR/plugin/harness.ts"
+OLD_PLUGIN_FILE="$INSTALL_DIR/harness.ts"
 tmp_file=$(mktemp)
 # opencode v2 config: `plugins` (not v1 `plugin`), `agents.<id>.disabled` (not v1 `agent.<id>.disable`).
-jq --arg path "$PLUGIN_PATH" --arg old_path "$OLD_PLUGIN_PATH" '
-	(if (.plugin | type) == "array" then .plugin |= map(select(. != $path and . != $old_path)) else . end) |
+jq --arg path "$PLUGIN_PATH" --arg old_path "$OLD_PLUGIN_PATH" --arg old_file "$OLD_PLUGIN_FILE" '
+	(if (.plugin | type) == "array" then .plugin |= map(select(. != $path and . != $old_path and . != $old_file)) else . end) |
 	(if (.plugin | type) == "array" and (.plugin | length) == 0 then del(.plugin) else . end) |
-	.plugins = ((.plugins // []) | if type == "array" then (map(select(. != $old_path)) | if index($path) == null then . + [$path] else . end) else [., $path] end) |
+	.plugins = ((.plugins // []) | if type == "array" then (map(select(. != $old_path and . != $old_file and . != $path)) + [$path]) else [., $path] end) |
 	.agents.build.disabled = true |
 	.agents.plan.disabled = true |
 	.agents.general.disabled = true |

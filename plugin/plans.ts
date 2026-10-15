@@ -42,6 +42,7 @@ export function createPlanArtifact({
   plan_id,
   summary,
   recommendations,
+  card_id,
   tasks,
 }: PlanSaveInput): PlanArtifact {
   const id = plan_id ?? generatePlanId();
@@ -62,6 +63,7 @@ export function createPlanArtifact({
     created_at,
     summary,
     recommendations,
+    ...(card_id ? { card_id } : {}),
     tasks,
   };
 }
@@ -73,6 +75,7 @@ export function savePlanArtifact(artifact: PlanArtifact): string {
     created_at: artifact.created_at,
     summary: artifact.summary,
     recommendations: artifact.recommendations,
+    ...(artifact.card_id ? { card_id: artifact.card_id } : {}),
     tasks: artifact.tasks,
   };
   writeFileSync(path, JSON.stringify(persisted, null, 2), "utf8");

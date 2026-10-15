@@ -26,9 +26,17 @@
  * collapsible subagent block inside the orchestrator's conversation.
  *
  * Protocol (orchestrator side):
+ *   0. memory_context(...) — acknowledgement gate. Call it with `cardId` when
+ *      the user supplied a ticket, or with no args (no-card / system-level
+ *      mode). plan_task (planner), submit_plan and submit_workflow
+ *      (orchestrator) throw until the calling session has done so.
  *   1. submit_plan({ plan_id, native_dispatch: true }) → { workflow_id }
+ *      (the plan's optional card_id is bound to the workflow and its tasks)
  *   2. LOOP until status is "done", "failed", or "cancelled":
  *      a. harness_dispatch_tasks({ workflow_id }) → { status, tasks }
+ *         Every task prompt (here and on the plugin tick-loop path) is
+ *         prefixed with a <memory-context> preamble for the task's card
+ *         (or system knowledge only when it has none).
  *      b. For each task call the `subagent` tool with the task's agent,
  *         description and prompt.
  *      c. When each subagent call returns, read the child session id from the
@@ -36,6 +44,10 @@
  *         (or from "Subagent failed (sessionID: ses_…)" when it errored).
  *      d. harness_task_complete({ task_id, session_id, status: "done" | "failed" })
  *   3. harness_state({ workflow_id }) for final results.
+ *
+ * Task outcomes (harness_task_complete and the event-driven path) are
+ * auto-traced to the task's card (best effort, never affects the DAG); tasks
+ * without a card only trace failures, and only when exactly one card is active.
  *
  * Cancellation
  * ────────────
@@ -54,13 +66,12 @@ import { fileURLToPath } from "url";
 import { Plugin } from "@opencode/plugin";
 import {
   DagEngine,
-  agent_fallback_configs_json,
   get_agent_configs,
   initSync,
 } from "./wasm/openagent_harness.js";
 
 import type { EventResult, WorkflowTaskInput } from "./types.js";
-import { classifyError, extractErrorMessage } from "./errors.js";
+import { extractErrorMessage } from "./errors.js";
 import { installAgentsInto } from "./agent-install.js";
 import {
   createPlanArtifact,
@@ -91,7 +102,10 @@ import {
   assembleContext,
   promoteFinding,
   listActiveCards,
+  buildTaskMemoryPreamble,
+  hasMemoryPreamble,
 } from "./memory.js";
+import { assertMemoryAccess, memoryAckRequiredMessage } from "./memory-access.js";
 import {
   type JsonSchema,
   arr,
@@ -122,6 +136,27 @@ interface HarnessToolDef<I> {
   description: string;
   input: JsonSchema;
   execute: (input: I, context: HarnessToolContext) => Promise<string>;
+}
+
+/** A ready task as returned by `dag.tick()`. */
+interface ReadyTask {
+  id: string;
+  prompt: string;
+  model: string;
+  agent: string | null;
+  parent_session_id: string | null;
+  existing_session_id?: string | null;
+  workflow_id?: string | null;
+  card_id?: string | null;
+}
+
+/** The subset of a DAG task the plugin reads back for tracing. */
+interface TaskView {
+  id: string;
+  agent: string | null;
+  session_id: string | null;
+  status: { type: string; message?: string };
+  card_id?: string | null;
 }
 
 /** Window in which a second idle signal for the same session is a duplicate. */
@@ -208,23 +243,6 @@ export default Plugin.define({
       );
     }
 
-    // Load agent fallback configs from WASM and register with DAG engine.
-    try {
-      const fallbackConfigs = agent_fallback_configs_json();
-      dag.set_agent_fallbacks(fallbackConfigs);
-      void showToast(
-        "Harness Plugin",
-        "Agent fallback models registered",
-        "info",
-        5000,
-      );
-    } catch (e) {
-      console.error(
-        "[harness-plugin] fallback config load failed (non-fatal):",
-        e,
-      );
-    }
-
     // ── Native-dispatch state ────────────────────────────────────────────────
     //
     // Workflows added to `nativeDispatchWorkflows` are dispatched through the
@@ -246,19 +264,7 @@ export default Plugin.define({
      * Buffer of tasks ready to be dispatched natively, keyed by workflow_id.
      * The tick loop populates this instead of creating sessions for these tasks.
      */
-    const nativeDispatchBuffer = new Map<
-      string,
-      Array<{
-        id: string;
-        prompt: string;
-        model: string;
-        agent: string | null;
-        parent_session_id: string | null;
-        fallback_models: string[];
-        existing_session_id?: string | null;
-        workflow_id?: string | null;
-      }>
-    >();
+    const nativeDispatchBuffer = new Map<string, ReadyTask[]>();
 
     /**
      * Buffer for idle events whose session ID is not yet registered in the
@@ -312,6 +318,102 @@ export default Plugin.define({
     // reused session's next idle is never swallowed).
     const idleHandledAt = new BoundedMap<string, number>(1000);
 
+    // ── Memory helpers ───────────────────────────────────────────────────────
+
+    // Sessions that have called memory_context (with OR without a cardId — a
+    // card-less call is a valid acknowledgement). Bounded to avoid growth.
+    const memoryAckedSessions = new BoundedSet<string>(1000);
+
+    /** Throw unless this session already called memory_context. */
+    const requireMemoryAck = (tool: string, sessionID: string): void => {
+      if (!memoryAckedSessions.has(sessionID)) {
+        throw new Error(memoryAckRequiredMessage(tool));
+      }
+    };
+
+    /** Prepend the memory preamble to a task prompt once. Never throws. */
+    const withMemoryPreamble = (
+      prompt: string,
+      task: { card_id?: string | null; agent?: string | null },
+    ): string => {
+      try {
+        if (hasMemoryPreamble(prompt)) return prompt;
+        const preamble = buildTaskMemoryPreamble({
+          cardId: task.card_id ?? undefined,
+          agent: task.agent ?? undefined,
+        });
+        return preamble ? `${preamble}\n${prompt}` : prompt;
+      } catch (e) {
+        console.error("[harness] memory preamble skipped (non-fatal):", e);
+        return prompt;
+      }
+    };
+
+    const getTaskView = (taskId: string): TaskView | null => {
+      try {
+        return JSON.parse(dag.get_task(taskId)) as TaskView | null;
+      } catch {
+        return null;
+      }
+    };
+
+    /** The Running/Pending task currently bound to `sessionId`, if any. */
+    const findActiveTaskBySession = (sessionId: string): TaskView | null => {
+      try {
+        const all = JSON.parse(dag.list_tasks()) as TaskView[];
+        return (
+          all.find(
+            (t) =>
+              t.session_id === sessionId &&
+              (t.status.type === "running" || t.status.type === "pending"),
+          ) ?? null
+        );
+      } catch {
+        return null;
+      }
+    };
+
+    /**
+     * Best-effort auto-trace of a task outcome. Tasks with a card_id trace to
+     * that card on success and failure. Tasks without one trace failures only,
+     * and only when exactly one card is active (otherwise attribution would be
+     * a guess). Strictly non-fatal: never affects the DAG or tool response.
+     *
+     * @returns whether a trace entry was written.
+     */
+    const autoTraceTask = (
+      taskId: string,
+      outcome: { ok: true } | { ok: false; error: string },
+      sessionId?: string,
+    ): boolean => {
+      try {
+        const task = getTaskView(taskId);
+        const agent = task?.agent ? ` (@${task.agent})` : "";
+        const body = outcome.ok
+          ? `Task ${taskId}${agent} completed`
+          : `Task ${taskId}${agent} failed: ${outcome.error}`;
+
+        let cardId = task?.card_id || undefined;
+        if (!cardId) {
+          if (outcome.ok) return false;
+          const active = listActiveCards();
+          if (active.length !== 1) return false;
+          cardId = active[0];
+        }
+
+        appendTrace({
+          cardId,
+          type: "finding",
+          body,
+          ...(sessionId ? { session: sessionId } : {}),
+        });
+        return true;
+      } catch (e) {
+        console.error("[harness] auto-trace skipped (non-fatal):", e);
+        return false;
+      }
+    };
+
     let disposed = false;
 
     // ── Tick loop ────────────────────────────────────────────────────────────
@@ -324,16 +426,7 @@ export default Plugin.define({
       if (ticking || disposed) return;
       ticking = true;
       try {
-        const readyTasks = JSON.parse(dag.tick()) as Array<{
-          id: string;
-          prompt: string;
-          model: string;
-          agent: string | null;
-          parent_session_id: string | null;
-          fallback_models: string[];
-          existing_session_id?: string | null;
-          workflow_id?: string | null;
-        }>;
+        const readyTasks = JSON.parse(dag.tick()) as ReadyTask[];
 
         for (const task of readyTasks) {
           // ── Native dispatch: buffer instead of creating a session ────────
@@ -390,7 +483,7 @@ export default Plugin.define({
             await sendMessage(
               client,
               sessionId,
-              task.prompt,
+              withMemoryPreamble(task.prompt, task),
               task.model,
               task.agent,
             );
@@ -406,34 +499,6 @@ export default Plugin.define({
               e,
             );
             const message = e instanceof Error ? e.message : String(e);
-            const classification = classifyError(message);
-            void showToast(
-              "Harness Plugin",
-              `Error classified as ${classification}`,
-              classification === "retryable" ? "warning" : "error",
-            );
-
-            if (
-              classification === "retryable" &&
-              task.fallback_models &&
-              task.fallback_models.length > 0
-            ) {
-              try {
-                const fallbackResult = JSON.parse(
-                  dag.try_fallback(task.id, message),
-                );
-                void showToast(
-                  "Fallback",
-                  `Task ${task.id} falling back to ${fallbackResult.new_model}`,
-                  "warning",
-                );
-                if (sessionId) await deleteSession(client, sessionId);
-                // Task is Pending again — next tick will pick it up
-                continue;
-              } catch {
-                // No more fallbacks — fall through to fail
-              }
-            }
 
             try {
               const { session_id } = JSON.parse(
@@ -470,11 +535,16 @@ export default Plugin.define({
         prompt: string;
         depends_on: number[];
         model?: string;
+        card_id?: string;
       }>;
+      card_id?: string;
     }>({
       name: "submit_workflow",
-      description:
+      description: [
         "Orchestrator-only low-level escape hatch: submit a workflow tasks array directly to the harness DAG. Returns a workflow_id for tracking.",
+        "Optional card_id (top-level, or per task to override) binds work to an investigation card; omit it for no-card (system-level) work.",
+        "Requires memory_context to have been called earlier in this session (with or without a cardId).",
+      ].join("\n"),
       input: obj({
         tasks: arr(
           obj({
@@ -482,16 +552,23 @@ export default Plugin.define({
             prompt: str(),
             depends_on: arr(num()),
             model: optional(str()),
+            card_id: optional(str()),
           }),
         ),
+        card_id: optional(str()),
       }),
-      async execute({ tasks }, context) {
+      async execute({ tasks, card_id }, context) {
         if (context.agent !== "orchestrator") {
           throw new Error(
             "submit_workflow can only be executed by the orchestrator agent",
           );
         }
-        return dag.submit_workflow(JSON.stringify(tasks), context.sessionID);
+        requireMemoryAck("submit_workflow", context.sessionID);
+        return dag.submit_workflow(
+          JSON.stringify(tasks),
+          context.sessionID,
+          card_id ?? null,
+        );
       },
     });
 
@@ -501,10 +578,15 @@ export default Plugin.define({
       depends_on?: number[];
       model?: string;
       plan_id?: string;
+      card_id?: string;
     }>({
       name: "plan_task",
       description: [
         "Planner-only: append exactly one task to an in-progress plan draft.",
+        "Requires memory_context to have been called earlier in this session",
+        "(with card_id if the user supplied a ticket, otherwise with no card).",
+        "Optional card_id binds the plan (and its tasks) to an investigation",
+        "card; omit it for no-card (system-level) work.",
         "Call this once per task instead of building the whole tasks array up",
         "front. The first call may omit plan_id — the response's plan_id must",
         "then be captured and passed on every subsequent call so all tasks land",
@@ -519,13 +601,18 @@ export default Plugin.define({
         depends_on: optional(arr(num())),
         model: optional(str()),
         plan_id: optional(str()),
+        card_id: optional(str()),
       }),
-      async execute({ agent, prompt, depends_on, model, plan_id }, context) {
+      async execute(
+        { agent, prompt, depends_on, model, plan_id, card_id },
+        context,
+      ) {
         if (context.agent !== "planner") {
           throw new Error(
             "plan_task can only be executed by the planner agent",
           );
         }
+        requireMemoryAck("plan_task", context.sessionID);
 
         if (plan_id !== undefined) {
           validatePlanId(plan_id);
@@ -536,6 +623,7 @@ export default Plugin.define({
           prompt,
           depends_on: depends_on ?? [],
           ...(model !== undefined ? { model } : {}),
+          ...(card_id !== undefined ? { card_id } : {}),
         });
 
         try {
@@ -576,12 +664,14 @@ export default Plugin.define({
         }
 
         const tasks = JSON.parse(draftJson) as WorkflowTaskInput[];
+        const card_id = dag.get_plan_card_id(plan_id) || undefined;
 
         const artifact = createPlanArtifact({
           plan_id,
           tasks,
           summary,
           recommendations,
+          card_id,
         });
 
         const path = savePlanArtifact(artifact);
@@ -604,6 +694,7 @@ export default Plugin.define({
           task_count: artifact.tasks.length,
           summary: artifact.summary,
           recommendations: artifact.recommendations,
+          ...(artifact.card_id ? { card_id: artifact.card_id } : {}),
         });
       },
     });
@@ -611,7 +702,7 @@ export default Plugin.define({
     defineTool<{ plan_id: string; native_dispatch?: boolean }>({
       name: "submit_plan",
       description:
-        "Orchestrator-only: load a saved plan artifact by plan_id and submit its tasks to the harness DAG. Set native_dispatch:true to execute agents as visible OpenCode subagents (recommended — agents appear inline in the conversation).",
+        "Orchestrator-only: load a saved plan artifact by plan_id and submit its tasks to the harness DAG (the plan's card_id, if any, is bound to the workflow). Requires memory_context to have been called earlier in this session (with or without a cardId). Set native_dispatch:true to execute agents as visible OpenCode subagents (recommended — agents appear inline in the conversation).",
       input: obj({
         plan_id: str(),
         native_dispatch: optional(bool()),
@@ -622,10 +713,12 @@ export default Plugin.define({
             "submit_plan can only be executed by the orchestrator agent",
           );
         }
+        requireMemoryAck("submit_plan", context.sessionID);
         const artifact = loadPlanArtifact(plan_id);
         const result = dag.submit_workflow(
           JSON.stringify(artifact.tasks),
           context.sessionID,
+          artifact.card_id ?? null,
         );
         const parsed = JSON.parse(result) as {
           workflow_id: string;
@@ -807,8 +900,12 @@ export default Plugin.define({
               tasks: tasks.map((t) => ({
                 task_id: t.id,
                 agent: t.agent ?? "builder",
-                prompt: t.prompt,
+                prompt: withMemoryPreamble(t.prompt, {
+                  card_id: t.card_id,
+                  agent: t.agent ?? "builder",
+                }),
                 model: t.model,
+                ...(t.card_id ? { card_id: t.card_id } : {}),
                 // Do NOT expose existing_session_id — native dispatch always spawns fresh.
                 description: `[harness-task:${t.id}] @${t.agent ?? "builder"}`,
               })),
@@ -864,7 +961,7 @@ export default Plugin.define({
         // DAG's guard also rejects Done/Failed defensively. In that case
         // it also cleans up the now-orphaned session; discard the result
         // gracefully here: never resurrect a terminal task into
-        // Done/Failed, and never register/replay/fallback for it.
+        // Done/Failed, and never register/replay for it.
         const bound = await bindSessionOrCleanup(
           dag,
           client,
@@ -908,11 +1005,14 @@ export default Plugin.define({
 
           await handleEventResult(result, client, dag);
 
+          const autoTraced = autoTraceTask(task_id, { ok: true }, session_id);
+
           return JSON.stringify({
             registered: true,
             task_id,
             session_id,
             status: "done",
+            auto_traced: autoTraced,
           });
         } else {
           // Failed path: use buffered error message or the caller-supplied error.
@@ -929,46 +1029,6 @@ export default Plugin.define({
           console.log(
             `[harness] task_complete failed: task_id=${task_id} session_id=${session_id} source=${errSource} errMsg=${errMsg}`,
           );
-          const classification = classifyError(errMsg);
-          console.log(
-            `[harness] task_complete classification=${classification} hasMoreFallbacks will be evaluated next`,
-          );
-          const taskJson = JSON.parse(dag.get_task(task_id)) as {
-            fallback_models?: string[];
-            model_attempt?: number;
-          } | null;
-
-          const hasMoreFallbacks =
-            taskJson != null &&
-            Array.isArray(taskJson.fallback_models) &&
-            (taskJson.model_attempt ?? 0) < taskJson.fallback_models.length;
-
-          if (classification === "retryable" && hasMoreFallbacks) {
-            try {
-              const fallbackResult = JSON.parse(
-                dag.try_fallback(task_id, errMsg),
-              ) as { fallback: boolean; new_model: string; attempt: number };
-              void showToast(
-                "Fallback",
-                `Task ${task_id} → ${fallbackResult.new_model} (attempt ${fallbackResult.attempt})`,
-                "warning",
-              );
-              // NOTE: For native-dispatch tasks, task.model is updated in the DAG to fallbackResult.new_model.
-              // The orchestrator can pass it as the `subagent` tool's `model` input when it re-spawns the
-              // task; otherwise the subagent uses its frontmatter model.
-              await deleteSession(client, session_id);
-              return JSON.stringify({
-                registered: true,
-                task_id,
-                session_id,
-                status: "retrying",
-                new_model: fallbackResult.new_model,
-              });
-            } catch {
-              // No more fallbacks — fall through to fail
-            }
-          }
-
           try {
             const { session_id: sid } = JSON.parse(
               dag.fail_task(task_id, errMsg),
@@ -978,29 +1038,14 @@ export default Plugin.define({
             // already terminal
           }
 
-          // Best-effort auto-trace: if there is exactly one active
-          // investigation card, log this task failure to its trace.md so
-          // the context isn't lost. Deliberately skipped when zero or
-          // multiple cards are active — there's no unambiguous card to
-          // attribute the failure to, and guessing would pollute the
-          // wrong card's trace. This is strictly additive: any failure
-          // here (missing corpus, fs error, whatever) must never affect
-          // the dag.fail_task outcome above or the response below.
-          try {
-            const activeCards = listActiveCards();
-            if (activeCards.length === 1) {
-              appendTrace({
-                cardId: activeCards[0],
-                type: "finding",
-                body: `Task ${task_id} failed: ${errMsg}`,
-              });
-            }
-          } catch (e) {
-            console.error(
-              "[harness] auto-trace on task failure skipped (non-fatal):",
-              e,
-            );
-          }
+          // Best-effort auto-trace to the task's card; without a card, falls
+          // back to the single-active-card heuristic (see autoTraceTask).
+          // Strictly additive: never affects the outcome above or below.
+          const autoTraced = autoTraceTask(
+            task_id,
+            { ok: false, error: errMsg },
+            session_id,
+          );
 
           return JSON.stringify({
             registered: true,
@@ -1008,6 +1053,7 @@ export default Plugin.define({
             session_id,
             status: "failed",
             error: errMsg,
+            auto_traced: autoTraced,
           });
         }
       },
@@ -1116,7 +1162,8 @@ export default Plugin.define({
         source: optional(enumOf("ado", "qa", "prod", "other")),
         backlog: optional(bool()),
       }),
-      async execute({ cardId, symptom, source, backlog }) {
+      async execute({ cardId, symptom, source, backlog }, context) {
+        assertMemoryAccess("memory_card", context.agent);
         try {
           const created = createCard({ cardId, symptom, source, backlog });
           return JSON.stringify({ success: true, cardId, created });
@@ -1145,7 +1192,8 @@ export default Plugin.define({
         body: str(),
         session: optional(str()),
       }),
-      async execute({ cardId, type, body, session }) {
+      async execute({ cardId, type, body, session }, context) {
+        assertMemoryAccess("memory_trace", context.agent);
         try {
           const result = appendTrace({ cardId, type, body, session });
           return result.formatted;
@@ -1157,25 +1205,32 @@ export default Plugin.define({
     });
 
     defineTool<{
-      cardId: string;
+      cardId?: string;
       mode?: "compact" | "full";
       sections?: string[];
     }>({
       name: "memory_context",
       description: [
-        "Assemble a focused markdown context payload for an investigation card,",
-        "pulling from its context.md/trace.md/benchmarks.md and selected system/",
-        "knowledge sections. Use mode:'compact' (default) to prime a new session",
+        "Assemble a focused markdown context payload from system/ knowledge and,",
+        "when cardId is given, that investigation card's context.md/trace.md/",
+        "benchmarks.md. Omit cardId for no-card (system-level) work: returns",
+        "system knowledge only and succeeds even if no corpus exists yet.",
+        "Calling this tool (with or without cardId) also satisfies the",
+        "acknowledgement required before plan_task, submit_plan and",
+        "submit_workflow. Use mode:'compact' (default) to prime a new session",
         "cheaply, or mode:'full' for the complete record.",
       ].join("\n"),
       input: obj({
-        cardId: str(),
+        cardId: optional(str()),
         mode: optional(enumOf("compact", "full")),
         sections: optional(arr(str())),
       }),
-      async execute({ cardId, mode, sections }) {
+      async execute({ cardId, mode, sections }, context) {
+        assertMemoryAccess("memory_context", context.agent);
         try {
-          return assembleContext({ cardId, mode, sections });
+          const payload = assembleContext({ cardId, mode, sections });
+          memoryAckedSessions.add(context.sessionID);
+          return payload;
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
           throw new Error(`memory_context failed: ${msg}`);
@@ -1184,7 +1239,7 @@ export default Plugin.define({
     });
 
     defineTool<{
-      cardId: string;
+      cardId?: string;
       finding: string;
       impact?: string;
       targetPath: string;
@@ -1193,13 +1248,14 @@ export default Plugin.define({
     }>({
       name: "memory_promote",
       description: [
-        "Promote a confirmed finding from an investigation card to durable",
-        "system/ knowledge (creating or appending to the target file), and",
-        "record a 'promoted' entry in the card's benchmarks.md. Never touches",
-        "trace.md.",
+        "Promote a confirmed finding to durable system/ knowledge (creating or",
+        "appending to the target file). With cardId, also record a 'promoted'",
+        "entry in that card's benchmarks.md. Omit cardId for no-card",
+        "(system-level) work: only system/ is written and benchmarksPath is",
+        "null. Never touches trace.md.",
       ].join("\n"),
       input: obj({
-        cardId: str(),
+        cardId: optional(str()),
         finding: str(),
         impact: optional(str()),
         targetPath: str(),
@@ -1213,7 +1269,8 @@ export default Plugin.define({
         targetPath,
         title,
         sectionTitle,
-      }) {
+      }, context) {
+        assertMemoryAccess("memory_promote", context.agent);
         try {
           const result = promoteFinding({
             cardId,
@@ -1275,9 +1332,13 @@ export default Plugin.define({
         return;
       }
 
+      const running = findActiveTaskBySession(sessionId);
       const result: EventResult = JSON.parse(
         dag.process_event("session.idle", sessionId, JSON.stringify(data)),
       );
+      if (running && getTaskView(running.id)?.status.type === "done") {
+        autoTraceTask(running.id, { ok: true }, sessionId);
+      }
 
       // Apply any deferred reviews now that tasks may have transitioned to Done.
       if (pendingReviews.size > 0) {
@@ -1299,7 +1360,6 @@ export default Plugin.define({
       const isNoop =
         result.delete_session === null &&
         result.reuse_session == null &&
-        result.fallback_hint == null &&
         result.notifications.length === 0;
 
       if (isNoop) {
@@ -1313,7 +1373,7 @@ export default Plugin.define({
     /**
      * Handle a failed session execution. `error` is the v2 structured error
      * (or any shape `extractErrorMessage` understands). Forwards to the engine
-     * as "session.error" with a string `error` so it can classify/fall back.
+     * as "session.error" with a string `error`; the engine marks the task Failed.
      */
     async function handleError(
       sessionId: string,
@@ -1323,8 +1383,7 @@ export default Plugin.define({
 
       // Cancelled sessions: same guard as idle above. This also covers the
       // abort/interrupt-induced failure OpenCode raises after we interrupt
-      // the session — it must never be classified/retried as a transient
-      // failure, since the DAG's session_to_task mapping was already removed
+      // the session — it must never be recorded as a task failure, since the DAG's session_to_task mapping was already removed
       // by cancel_task/cancel_workflow.
       if (cancelledSessions.has(sessionId)) {
         cancelledSessions.delete(sessionId);
@@ -1333,6 +1392,7 @@ export default Plugin.define({
 
       const errMsg = extractErrorMessage(error);
 
+      const active = findActiveTaskBySession(sessionId);
       const result: EventResult = JSON.parse(
         dag.process_event(
           "session.error",
@@ -1340,59 +1400,15 @@ export default Plugin.define({
           JSON.stringify({ sessionID: sessionId, error: errMsg }),
         ),
       );
+      if (active && getTaskView(active.id)?.status.type === "failed") {
+        autoTraceTask(active.id, { ok: false, error: errMsg }, sessionId);
+      }
 
-      // Detect no-op → buffer for later replay.
-      if (!result.fallback_hint) {
+      // The engine fails the task itself. A no-op result means the session is
+      // not yet registered: buffer for replay in harness_task_complete.
+      if (result.delete_session == null && result.notifications.length === 0) {
         orphanedErrorEvents.set(sessionId, errMsg);
         return;
-      }
-
-      // Check if this error is eligible for fallback
-      const { task_id, error_message, has_fallbacks } = result.fallback_hint;
-      const classification = classifyError(error_message);
-
-      if (classification === "retryable" && has_fallbacks) {
-        try {
-          const fallbackResult = JSON.parse(
-            dag.try_fallback(task_id, error_message),
-          ) as {
-            fallback: boolean;
-            new_model: string;
-            attempt: number;
-            session_id: string | null;
-          };
-          void showToast(
-            "Fallback",
-            `Task ${task_id} → ${fallbackResult.new_model} (attempt ${fallbackResult.attempt})`,
-            "warning",
-          );
-          // Clean up old session
-          if (fallbackResult.session_id) {
-            await deleteSession(client, fallbackResult.session_id);
-          }
-          // The task is now Pending again — the tick loop will pick it up
-          // Handle any notifications from the original event
-          await handleEventResult(result, client, dag);
-          return;
-        } catch (e) {
-          console.error(
-            `[harness-plugin] fallback attempt failed for task ${task_id}:`,
-            e,
-          );
-          // Fall through to fail the task
-        }
-      }
-
-      // Not retryable or no fallbacks — fail the task
-      try {
-        const { session_id } = JSON.parse(
-          dag.fail_task(task_id, error_message),
-        ) as {
-          session_id: string | null;
-        };
-        if (session_id) await deleteSession(client, session_id);
-      } catch {
-        // already terminal — ignore
       }
 
       await handleEventResult(result, client, dag);

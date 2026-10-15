@@ -622,7 +622,11 @@ export function appendTrace(opts: AppendTraceOptions, root: string = memoryRoot(
 
   const found = findCard(cardId, root);
   if (!found) {
-    throw new Error(`appendTrace: no active card ${cardId} (looked in ${join(root, "issues", "active", cardId)})`);
+    throw new Error(
+      `appendTrace: no active card ${cardId} (looked in ${join(root, "issues", "active", cardId)}). ` +
+        `Traces are per-card: create the card first with memory_card. ` +
+        `With no card (system-level work), record durable findings with memory_promote instead.`,
+    );
   }
   if (found.state !== "active") {
     throw new Error(
@@ -662,7 +666,8 @@ export function appendTrace(opts: AppendTraceOptions, root: string = memoryRoot(
 export type ContextMode = "compact" | "full";
 
 export interface AssembleContextOptions {
-  cardId: string;
+  /** Optional. Omit for a system-only (no-card) payload. */
+  cardId?: string;
   mode?: ContextMode;
   sections?: string[];
 }
@@ -755,13 +760,43 @@ function benchmarksHasEntries(content: string): boolean {
 }
 
 /**
+ * System-only (no-card) payload. Read-only: never scaffolds the corpus and
+ * never throws when it does not exist yet.
+ */
+function assembleSystemContext(mode: ContextMode, requested: string[] | undefined, root: string): string {
+  const header = [`# RAG Context — system (no card)`, `_Generated: ${nowMinuteIso()} | Mode: ${mode}_`, ""];
+  if (!existsSync(join(root, "system"))) {
+    return [
+      ...header,
+      "## Relevant System Knowledge",
+      "",
+      "_No system knowledge has been recorded yet._",
+      "",
+    ].join("\n");
+  }
+  const knowledgeSection = buildSystemKnowledgeSection(root, resolveSections(root, requested), mode);
+  const active = listActiveCards(root);
+  const activeLine =
+    active.length > 0
+      ? `Active cards (pass one as cardId if relevant): ${active.join(", ")}`
+      : "_No active cards._";
+  return [...header, "## Relevant System Knowledge", "", knowledgeSection, "", "## Active Cards", "", activeLine, ""].join(
+    "\n",
+  );
+}
+
+/**
  * Assemble a focused markdown context payload for priming a new AI analysis
  * session, pulling from the card (context.md/trace.md/benchmarks.md) and
- * selected `system/` sections.
+ * selected `system/` sections. Without a `cardId`, returns a system-only
+ * payload; an explicit but unknown `cardId` throws.
  */
 export function assembleContext(opts: AssembleContextOptions, root: string = memoryRoot()): string {
-  const cardId = sanitizeCardId(opts.cardId);
   const mode: ContextMode = opts.mode ?? "compact";
+  if (typeof opts.cardId !== "string" || opts.cardId.trim() === "") {
+    return assembleSystemContext(mode, opts.sections, root);
+  }
+  const cardId = sanitizeCardId(opts.cardId);
   const found = findCard(cardId, root);
   if (!found) {
     throw new Error(`assembleContext: card not found: ${cardId}`);
@@ -816,7 +851,8 @@ export function assembleContext(opts: AssembleContextOptions, root: string = mem
 // ─── Promotion ───────────────────────────────────────────────────────────────
 
 export interface PromoteFindingOptions {
-  cardId: string;
+  /** Optional. Omit for a session-level (no-card) finding. */
+  cardId?: string;
   finding: string;
   impact?: string;
   /** Path relative to system/, e.g. 'known-behaviors/foo.md'. */
@@ -829,7 +865,8 @@ export interface PromoteFindingOptions {
 
 export interface PromoteFindingResult {
   systemPath: string;
-  benchmarksPath: string;
+  /** Null when promoted without a card (nothing to record on). */
+  benchmarksPath: string | null;
   created: boolean;
 }
 
@@ -870,6 +907,8 @@ function renderSystemFrontmatter(f: {
   ].join("\n");
 }
 
+const NO_CARD_SOURCE = "no-card (session-level finding)";
+
 function extractBracketList(line: string): string[] {
   const m = line.match(/\[(.*)\]/);
   if (!m || !m[1].trim()) {
@@ -888,7 +927,7 @@ function extractBracketList(line: string): string[] {
  */
 function appendSystemSection(
   content: string,
-  opts: { sectionTitle: string; cardId: string; date: string; finding: string; impact?: string },
+  opts: { sectionTitle: string; cardId?: string; date: string; finding: string; impact?: string },
 ): string {
   const fmMatch = content.match(/^---\n([\s\S]*?)\n---\n/);
   let updated = content;
@@ -898,7 +937,7 @@ function appendSystemSection(
     const newLines = fmBody.split("\n").map((line) => {
       if (line.startsWith("source_cards:")) {
         const ids = extractBracketList(line);
-        if (!ids.includes(opts.cardId)) {
+        if (opts.cardId && !ids.includes(opts.cardId)) {
           ids.push(opts.cardId);
         }
         return `source_cards: [${ids.join(", ")}]`;
@@ -913,26 +952,32 @@ function appendSystemSection(
   }
 
   const impactLine = opts.impact ? `**Impact**: ${opts.impact}\n` : "";
-  const section = `\n## ${opts.sectionTitle}\n**Source**: ${opts.cardId} | ${opts.date}\n**Finding**: ${opts.finding}\n${impactLine}`;
+  const section = `\n## ${opts.sectionTitle}\n**Source**: ${opts.cardId ?? NO_CARD_SOURCE} | ${opts.date}\n**Finding**: ${opts.finding}\n${impactLine}`;
   return `${updated.trimEnd()}\n${section}`;
 }
 
 /**
- * Promote a confirmed finding from a card to `system/`. Writes a new file
+ * Promote a confirmed finding to `system/`. `cardId` is optional: without it
+ * the finding is attributed to `no-card (session-level finding)` and no card
+ * benchmarks entry is written. Writes a new file
  * with frontmatter (or appends a new `## section` to an existing file,
  * updating only `source_cards`/`updated`), then records a `promoted` entry
- * in the card's benchmarks.md. Never touches trace.md.
+ * in the card's benchmarks.md (card mode only). Never touches trace.md.
  */
 export function promoteFinding(opts: PromoteFindingOptions, root: string = memoryRoot()): PromoteFindingResult {
-  const cardId = sanitizeCardId(opts.cardId);
-  const found = findCard(cardId, root);
-  if (!found) {
-    throw new Error(`promoteFinding: card not found: ${cardId}`);
-  }
-  if (found.state === "backlog") {
-    throw new Error(
-      `promoteFinding: ${cardId} is in issues/backlog/; promote from an active (or done/archive) card`,
-    );
+  const hasCard = typeof opts.cardId === "string" && opts.cardId.trim() !== "";
+  const cardId = hasCard ? sanitizeCardId(opts.cardId as string) : undefined;
+  let found: FoundCard | null = null;
+  if (cardId) {
+    found = findCard(cardId, root);
+    if (!found) {
+      throw new Error(`promoteFinding: card not found: ${cardId}`);
+    }
+    if (found.state === "backlog") {
+      throw new Error(
+        `promoteFinding: ${cardId} is in issues/backlog/; promote from an active (or done/archive) card`,
+      );
+    }
   }
 
   const finding = opts.finding.trim();
@@ -946,6 +991,7 @@ export function promoteFinding(opts: PromoteFindingOptions, root: string = memor
   const session = opts.session ?? "opencode";
   const sectionTitle = opts.sectionTitle ?? opts.title ?? "Finding";
 
+  scaffoldCorpus(root);
   const alreadyExists = existsSync(systemPath);
   if (!alreadyExists) {
     mkdirSync(dirname(systemPath), { recursive: true });
@@ -955,12 +1001,12 @@ export function promoteFinding(opts: PromoteFindingOptions, root: string = memor
     const frontmatter = renderSystemFrontmatter({
       title,
       domain,
-      sourceCards: [cardId],
+      sourceCards: cardId ? [cardId] : [],
       created: date,
       updated: date,
     });
     const impactLine = opts.impact ? `**Impact**: ${opts.impact}\n` : "";
-    const body = `# ${title}\n\n## ${sectionTitle}\n**Source**: ${cardId} | ${date}\n**Finding**: ${finding}\n${impactLine}`;
+    const body = `# ${title}\n\n## ${sectionTitle}\n**Source**: ${cardId ?? NO_CARD_SOURCE} | ${date}\n**Finding**: ${finding}\n${impactLine}`;
     writeFileSync(systemPath, frontmatter + "\n" + body, "utf8");
   } else {
     const existingContent = readFileSync(systemPath, "utf8");
@@ -974,9 +1020,77 @@ export function promoteFinding(opts: PromoteFindingOptions, root: string = memor
     writeFileSync(systemPath, updatedContent, "utf8");
   }
 
+  if (!found) {
+    return { systemPath, benchmarksPath: null, created: !alreadyExists };
+  }
+
   const benchmarksPath = join(found.dir, "benchmarks.md");
   const entry = `\n---\ndate: ${date}\nsession: ${session}\nfinding: ${finding}\ntarget: system/${relTarget}\nstatus: promoted\n---\n`;
   appendFileSync(benchmarksPath, entry, "utf8"); // never touches trace.md
 
   return { systemPath, benchmarksPath, created: !alreadyExists };
+}
+
+// ─── Task preamble ───────────────────────────────────────────────────────────
+
+const MEMORY_OPEN = "<memory-context>";
+const MEMORY_CLOSE = "</memory-context>";
+const DEFAULT_PREAMBLE_MAX_CHARS = 6000;
+
+export interface TaskMemoryPreambleOptions {
+  cardId?: string;
+  agent?: string;
+  root?: string;
+  maxChars?: number;
+}
+
+/** True if the prompt already carries a memory preamble (avoids double-prepending on retries). */
+export function hasMemoryPreamble(prompt: string): boolean {
+  return typeof prompt === "string" && prompt.includes(MEMORY_OPEN);
+}
+
+/**
+ * Build the `<memory-context>` block prepended to every dispatched task
+ * prompt. Compact context (card mode if the card exists, system-only
+ * otherwise), truncated to `maxChars`, plus mandatory usage instructions.
+ * Never throws.
+ */
+export function buildTaskMemoryPreamble(opts: TaskMemoryPreambleOptions = {}): string {
+  try {
+    const root = opts.root ?? memoryRoot();
+    const maxChars = opts.maxChars && opts.maxChars > 0 ? opts.maxChars : DEFAULT_PREAMBLE_MAX_CHARS;
+    const rawCard = typeof opts.cardId === "string" ? opts.cardId.trim() : "";
+
+    let cardId: string | undefined;
+    let missingNote = "";
+    if (rawCard) {
+      const normalized = sanitizeCardId(rawCard);
+      if (findCard(normalized, root)) {
+        cardId = normalized;
+      } else {
+        missingNote = `_Note: card ${normalized} was requested but not found; showing system knowledge only._\n\n`;
+      }
+    }
+
+    let body = assembleContext({ cardId, mode: "compact" }, root);
+    if (body.length > maxChars) {
+      body = `${body.slice(0, maxChars).trimEnd()}\n\n_[memory context truncated to ${maxChars} chars; use memory_context for the full payload]_`;
+    }
+
+    const footer = cardId
+      ? [
+          `MANDATORY: Card: ${cardId}.`,
+          `Log significant findings with memory_trace(cardId="${cardId}") (if your agent may).`,
+          "Never re-investigate hypotheses listed as ruled-out above.",
+        ]
+      : [
+          "MANDATORY: No card. Use the system knowledge above;",
+          "report durable findings so they can be promoted (memory_promote).",
+        ];
+
+    return [MEMORY_OPEN, missingNote + body, "", ...footer, MEMORY_CLOSE, ""].join("\n");
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return [MEMORY_OPEN, `_Memory context unavailable: ${reason}_`, MEMORY_CLOSE, ""].join("\n");
+  }
 }

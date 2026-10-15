@@ -12,6 +12,10 @@ export class DagEngine {
     cancel_workflow(id: string): string;
     discard_plan_draft(plan_id: string): string;
     fail_task(id: string, reason: string): string;
+    /**
+     * Plan-level card id bound to a draft, or `undefined` when unbound/unknown.
+     */
+    get_plan_card_id(plan_id: string): string | undefined;
     get_plan_draft(plan_id: string): string;
     get_task(id: string): string;
     get_workflow(id: string): string;
@@ -20,21 +24,11 @@ export class DagEngine {
     list_workflow_summaries(): string;
     constructor();
     process_event(event_type: string, session_id: string, payload_json: string): string;
-    set_agent_fallbacks(json: string): void;
     submit_review(task_id: string, review_json: string): string;
-    submit_workflow(tasks_json: string, parent_session_id?: string | null): string;
+    submit_workflow(tasks_json: string, parent_session_id?: string | null, card_id?: string | null): string;
     task_started(task_id: string, session_id: string): boolean;
     tick(): string;
-    try_fallback(task_id: string, error_msg: string): string;
 }
-
-/**
- * Return parsed agent fallback configs as a JSON object `{name: config, ...}`.
- *
- * The TypeScript plugin calls this on startup and registers per-agent
- * fallback chains in the DAG engine.
- */
-export function agent_fallback_configs_json(): string;
 
 /**
  * Return all agent configs as a JSON object `{name: content, ...}`.
@@ -49,13 +43,13 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_dagengine_free: (a: number, b: number) => void;
-    readonly agent_fallback_configs_json: () => [number, number];
     readonly get_agent_configs: () => [number, number];
     readonly wasmdagengine_append_plan_task: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly wasmdagengine_cancel_task: (a: number, b: number, c: number) => [number, number, number, number];
     readonly wasmdagengine_cancel_workflow: (a: number, b: number, c: number) => [number, number, number, number];
     readonly wasmdagengine_discard_plan_draft: (a: number, b: number, c: number) => [number, number, number, number];
     readonly wasmdagengine_fail_task: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+    readonly wasmdagengine_get_plan_card_id: (a: number, b: number, c: number) => [number, number];
     readonly wasmdagengine_get_plan_draft: (a: number, b: number, c: number) => [number, number, number, number];
     readonly wasmdagengine_get_task: (a: number, b: number, c: number) => [number, number];
     readonly wasmdagengine_get_workflow: (a: number, b: number, c: number) => [number, number];
@@ -64,12 +58,10 @@ export interface InitOutput {
     readonly wasmdagengine_list_workflow_summaries: (a: number) => [number, number];
     readonly wasmdagengine_new: () => number;
     readonly wasmdagengine_process_event: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
-    readonly wasmdagengine_set_agent_fallbacks: (a: number, b: number, c: number) => void;
     readonly wasmdagengine_submit_review: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
-    readonly wasmdagengine_submit_workflow: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+    readonly wasmdagengine_submit_workflow: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
     readonly wasmdagengine_task_started: (a: number, b: number, c: number, d: number, e: number) => number;
     readonly wasmdagengine_tick: (a: number) => [number, number];
-    readonly wasmdagengine_try_fallback: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_exn_store: (a: number) => void;
     readonly __externref_table_alloc: () => number;

@@ -44,15 +44,6 @@ mod wasm {
         crate::agents::agent_configs_json()
     }
 
-    /// Return parsed agent fallback configs as a JSON object `{name: config, ...}`.
-    ///
-    /// The TypeScript plugin calls this on startup and registers per-agent
-    /// fallback chains in the DAG engine.
-    #[wasm_bindgen]
-    pub fn agent_fallback_configs_json() -> String {
-        crate::agents::agent_fallback_configs_json()
-    }
-
     /// WASM-exported DAG engine.  JavaScript sees this as `DagEngine`.
     #[wasm_bindgen(js_name = "DagEngine")]
     pub struct WasmDagEngine(crate::dag::DagEngine);
@@ -75,9 +66,14 @@ mod wasm {
             &mut self,
             tasks_json: &str,
             parent_session_id: Option<String>,
+            card_id: Option<String>,
         ) -> Result<String, JsValue> {
             self.0
-                .submit_workflow_with_parent_session(tasks_json, parent_session_id.as_deref())
+                .submit_workflow_with_card(
+                    tasks_json,
+                    parent_session_id.as_deref(),
+                    card_id.as_deref(),
+                )
                 .map_err(|e| JsValue::from_str(&e))
         }
 
@@ -134,16 +130,6 @@ mod wasm {
                 .map_err(|e| JsValue::from_str(&e))
         }
 
-        pub fn set_agent_fallbacks(&mut self, json: &str) {
-            self.0.set_agent_fallbacks(json);
-        }
-
-        pub fn try_fallback(&mut self, task_id: &str, error_msg: &str) -> Result<String, JsValue> {
-            self.0
-                .try_fallback(task_id, error_msg)
-                .map_err(|e| JsValue::from_str(&e))
-        }
-
         pub fn submit_review(
             &mut self,
             task_id: &str,
@@ -168,6 +154,11 @@ mod wasm {
             self.0
                 .get_plan_draft(plan_id)
                 .map_err(|e| JsValue::from_str(&e))
+        }
+
+        /// Plan-level card id bound to a draft, or `undefined` when unbound/unknown.
+        pub fn get_plan_card_id(&self, plan_id: &str) -> Option<String> {
+            self.0.get_plan_card_id(plan_id)
         }
 
         pub fn discard_plan_draft(&mut self, plan_id: &str) -> Result<String, JsValue> {

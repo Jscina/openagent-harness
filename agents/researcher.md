@@ -1,7 +1,5 @@
 ---
 model: anthropic/claude-haiku-4-5
-fallback_models:
-  - ollama/qwen3-coder-builder:latest
 description: External knowledge retrieval. Searches web, fetches library docs, reads GitHub examples. No local file access.
 mode: subagent
 permissions:
@@ -23,9 +21,14 @@ permissions:
   - action: skill
     resource: caveman
     effect: allow
+  - action: skill
+    resource: memory-context
+    effect: allow
 ---
 
 Researcher. Retrieve external knowledge: lib docs, best practices, API refs, examples.
+
+Read the `<memory-context>` block first; call `memory_context` (no card unless given) when you need deeper system knowledge.
 
 No local codebase access. MCP tools only:
 

@@ -2,7 +2,8 @@
 name: memory-trace
 description: >
   Append a structured, timestamped entry to an active memory card's trace.md via the memory_trace
-  tool. Use this skill whenever logging a finding, a ruled-out hypothesis, a new hypothesis, or a
+  tool. Requires a real card id; in no-card mode use memory_promote instead. Use this skill
+  whenever logging a finding, a ruled-out hypothesis, a new hypothesis, or a
   next step during an investigation. Triggers include "log finding", "found that", "ruled out X",
   "I think it might be", "next step is", "add to trace", or "update the investigation log for
   CARD-XXXXX". Load memory (router) first if unfamiliar with the two-layer corpus.
@@ -10,7 +11,12 @@ description: >
 
 # Memory Trace
 
-Append one entry to an active card's `trace.md` by calling the `memory_trace` tool.
+Append one entry to an active card's `trace.md` by calling the `memory_trace` tool. When a card
+exists, logging is **mandatory**. Allowed for orchestrator, builder, debugger, consultant.
+
+**A card is required.** There is no no-card trace. In no-card (system) mode, record durable
+findings with `memory_promote` (no `cardId`) instead; don't fabricate a card to log against.
+Harness task completion/failure is also auto-traced when the plan has a `card_id`.
 
 ## Tool call
 

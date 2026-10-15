@@ -5,12 +5,16 @@ export interface WorkflowTaskInput {
   prompt: string;
   depends_on: number[];
   model?: string;
+  /** Optional ticket/card id; absent in no-card (system-level) mode. */
+  card_id?: string;
 }
 
 export interface PlanSaveInput {
   plan_id: string;
   summary: string[];
   recommendations?: string[];
+  /** Plan-level card id; absent in no-card mode. */
+  card_id?: string;
   tasks: WorkflowTaskInput[];
 }
 
@@ -19,6 +23,8 @@ export interface PlanArtifact {
   created_at: string;
   summary: string[];
   recommendations?: string[];
+  /** Plan-level card id; absent in no-card mode and in legacy artifacts. */
+  card_id?: string;
   tasks: WorkflowTaskInput[];
 }
 
@@ -39,10 +45,5 @@ export interface SessionReuse {
 export interface EventResult {
   notifications: Notification[];
   delete_session: string | null;
-  fallback_hint?: {
-    task_id: string;
-    error_message: string;
-    has_fallbacks: boolean;
-  };
   reuse_session?: SessionReuse;
 }

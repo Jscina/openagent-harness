@@ -10,19 +10,6 @@ pub enum TaskStatus {
     Cancelled,
 }
 
-/// Classifies an error as retryable or terminal to decide whether a fallback should be attempted.
-///
-/// Produced by `classifyError` in `plugin/harness.ts` and used by the plugin to decide
-/// whether to call `try_fallback` or immediately fail the task.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "message", rename_all = "snake_case")]
-pub enum ErrorClass {
-    /// Provider unavailable, rate-limited, or timeout — may be retried.
-    Retryable(String),
-    /// Auth failure, invalid request, or content policy — cannot be retried.
-    Terminal(String),
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewStatus {
@@ -62,12 +49,8 @@ pub struct Task {
     pub output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewFeedback>,
-    /// Ordered fallback model chain for this task.
-    #[serde(default)]
-    pub fallback_models: Vec<String>,
-    /// Index into `fallback_models` currently in use (0 = primary model).
-    #[serde(default)]
-    pub model_attempt: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +77,8 @@ pub struct Workflow {
     pub tasks: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,10 +96,8 @@ pub struct WorkflowTaskSnapshot {
     pub prompt_preview: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewFeedback>,
-    /// Which index in the fallback chain is currently active (0 = primary).
-    pub model_attempt: usize,
-    /// Full fallback model chain for observability.
-    pub fallback_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +105,8 @@ pub struct WorkflowSnapshot {
     pub id: String,
     pub status: WorkflowStatus,
     pub tasks: Vec<WorkflowTaskSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +114,8 @@ pub struct WorkflowSummary {
     pub id: String,
     pub status: WorkflowStatus,
     pub task_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -139,9 +126,17 @@ pub(crate) struct WorkflowTaskInput {
     pub depends_on: Vec<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Task-level override for the fallback model chain.
+    /// Optional ticket/card id; absent outside work context ("no-card" mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback_models: Option<Vec<String>>,
+    pub card_id: Option<String>,
+}
+
+/// Normalize a card id: trim, and treat empty/whitespace as absent.
+pub(crate) fn normalize_card_id(card_id: Option<&str>) -> Option<String> {
+    card_id
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
 }
 
 /// An in-progress plan draft accumulated via repeated `append_plan_task` calls, so a
@@ -170,6 +165,8 @@ pub(crate) struct PlanDraft {
     /// the `agents` array in O(1) amortized time instead of remapping all of `tasks`
     /// on every call.
     pub agents: Vec<String>,
+    /// Plan-level card id, adopted from the first appended task that carries one.
+    pub card_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -180,8 +177,6 @@ pub(crate) struct ReadyTask {
     pub agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
-    /// Full fallback model chain so the plugin knows the complete chain.
-    pub fallback_models: Vec<String>,
     /// Pre-assigned session_id from a previous task's session reuse.
     /// When set, the plugin must skip `createSession` and use this directly.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -190,21 +185,8 @@ pub(crate) struct ReadyTask {
     /// Used by the plugin to route tasks to native-dispatch vs. plugin-dispatch workflows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<String>,
-}
-
-/// Returned inside `EventResult` on a `session.error` event, telling the plugin
-/// whether the failed task has remaining fallback models to try.
-///
-/// The plugin uses `has_fallbacks` together with `classifyError` to decide whether
-/// to call `try_fallback` or immediately fail the task.
-#[derive(Debug, Serialize)]
-pub struct FallbackHint {
-    /// ID of the task that produced the error.
-    pub task_id: String,
-    /// The raw error message from the session event payload.
-    pub error_message: String,
-    /// `true` when at least one fallback model remains in the task's chain.
-    pub has_fallbacks: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_id: Option<String>,
 }
 
 /// Instructs the plugin to reuse a completed task's session for a downstream task
@@ -221,8 +203,6 @@ pub struct SessionReuse {
 pub struct EventResult {
     pub notifications: Vec<Notification>,
     pub delete_session: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fallback_hint: Option<FallbackHint>,
     /// When set, the plugin should pre-assign the session to the next task
     /// instead of deleting it.  Mutually exclusive with `delete_session`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -308,24 +288,6 @@ mod tests {
     }
 
     #[test]
-    fn error_class_retryable_roundtrip() {
-        let e = ErrorClass::Retryable("rate limit hit".into());
-        let s = serde_json::to_string(&e).unwrap();
-        assert_eq!(s, r#"{"type":"retryable","message":"rate limit hit"}"#);
-        let back: ErrorClass = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, ErrorClass::Retryable("rate limit hit".into()));
-    }
-
-    #[test]
-    fn error_class_terminal_roundtrip() {
-        let e = ErrorClass::Terminal("auth failure".into());
-        let s = serde_json::to_string(&e).unwrap();
-        assert_eq!(s, r#"{"type":"terminal","message":"auth failure"}"#);
-        let back: ErrorClass = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, ErrorClass::Terminal("auth failure".into()));
-    }
-
-    #[test]
     fn review_status_roundtrip() {
         let s = serde_json::to_string(&ReviewStatus::Approved).unwrap();
         assert_eq!(s, r#""approved""#);
@@ -365,5 +327,47 @@ mod tests {
         };
         let val = serde_json::to_value(&fb).unwrap();
         assert!(val.get("findings").is_none());
+    }
+
+    #[test]
+    fn legacy_task_input_without_card_id_deserializes() {
+        let t: WorkflowTaskInput =
+            serde_json::from_str(r#"{"agent":"a","prompt":"p","depends_on":[0]}"#).unwrap();
+        assert_eq!(t.card_id, None);
+        assert_eq!(t.depends_on, vec![0]);
+    }
+
+    #[test]
+    fn legacy_task_without_card_id_deserializes() {
+        let t: Task = serde_json::from_str(
+            r#"{"id":"1","prompt":"p","model":"m","agent":null,"session_id":null,
+                "status":{"type":"pending"},"output":null}"#,
+        )
+        .unwrap();
+        assert_eq!(t.card_id, None);
+    }
+
+    #[test]
+    fn card_id_omitted_when_none_and_present_when_set() {
+        let mut input = WorkflowTaskInput {
+            agent: "a".into(),
+            prompt: "p".into(),
+            depends_on: vec![],
+            model: None,
+            card_id: None,
+        };
+        let v = serde_json::to_value(&input).unwrap();
+        assert!(v.get("card_id").is_none());
+        input.card_id = Some("CARD-1".into());
+        let v = serde_json::to_value(&input).unwrap();
+        assert_eq!(v["card_id"], "CARD-1");
+    }
+
+    #[test]
+    fn normalize_card_id_trims_and_drops_blank() {
+        assert_eq!(normalize_card_id(None), None);
+        assert_eq!(normalize_card_id(Some("")), None);
+        assert_eq!(normalize_card_id(Some("  \t")), None);
+        assert_eq!(normalize_card_id(Some(" C-1 ")).as_deref(), Some("C-1"));
     }
 }

@@ -3,7 +3,7 @@
  *
  * These tests load the real .wasm binary and exercise the state machine
  * directly — no mocks.  They guard against regressions in the core
- * DAG logic, fallback handling, and workflow status transitions.
+ * DAG logic and workflow status transitions.
  */
 import { describe, it, expect, beforeAll } from 'vitest';
 import { readFileSync } from 'fs';
@@ -33,10 +33,6 @@ const ONE_TASK = JSON.stringify([
   { agent: 'builder', prompt: 'Do something', depends_on: [] },
 ]);
 
-const FALLBACK_CONFIG = JSON.stringify({
-  explorer: { name: 'explorer', model: 'anthropic/claude-haiku-4-5', fallback_models: ['ollama/qwen:7b'] },
-  builder:  { name: 'builder',  model: 'anthropic/claude-sonnet-4-6', fallback_models: ['ollama/qwen:7b'] },
-});
 
 // ─── Basic workflow ───────────────────────────────────────────────────────────
 
@@ -117,162 +113,55 @@ describe('DagEngine — workflow status transitions', () => {
   });
 });
 
-// ─── Agent fallback registration ──────────────────────────────────────────────
+// ─── Task-level model override ────────────────────────────────────────────────
 
-describe('DagEngine — fallback registration', () => {
-  it('tasks receive fallback_models from the agent registry', () => {
+describe('DagEngine — task model override', () => {
+  it('task-level model flows through tick()', () => {
     const dag = newDag();
-    dag.set_agent_fallbacks(FALLBACK_CONFIG);
-    JSON.parse(dag.submit_workflow(TWO_TASKS));
-    const [task] = JSON.parse(dag.tick()) as Array<{
-      id: string;
-      agent: string;
-      fallback_models: string[];
-    }>;
-    expect(task.agent).toBe('explorer');
-    expect(task.fallback_models).toEqual(['ollama/qwen:7b']);
-    dag.free();
-  });
-
-  it('task-level fallback_models override the registry', () => {
-    const dag = newDag();
-    dag.set_agent_fallbacks(FALLBACK_CONFIG);
-    const custom = JSON.stringify([
-      {
-        agent: 'explorer',
-        prompt: 'go',
-        depends_on: [],
-        fallback_models: ['custom/model-override'],
-      },
-    ]);
-    JSON.parse(dag.submit_workflow(custom));
-    const [task] = JSON.parse(dag.tick()) as Array<{ fallback_models: string[] }>;
-    expect(task.fallback_models).toEqual(['custom/model-override']);
-    dag.free();
-  });
-
-  it('task without registry entry and no task-level fallback has empty fallback_models', () => {
-    const dag = newDag();
-    // No set_agent_fallbacks call — registry is empty
-    JSON.parse(dag.submit_workflow(ONE_TASK));
-    const [task] = JSON.parse(dag.tick()) as Array<{ fallback_models: string[] }>;
-    expect(task.fallback_models).toEqual([]);
+    dag.submit_workflow(
+      JSON.stringify([
+        { agent: 'builder', prompt: 'x', depends_on: [], model: 'custom/model-override' },
+      ]),
+    );
+    const [task] = JSON.parse(dag.tick()) as Array<{ model: string }>;
+    expect(task.model).toBe('custom/model-override');
     dag.free();
   });
 });
 
-// ─── try_fallback ─────────────────────────────────────────────────────────────
+// ─── process_event session.error ──────────────────────────────────────────────
 
-describe('DagEngine — try_fallback', () => {
-  it('advances to the next model and resets the task to Pending', () => {
+describe('DagEngine — session.error', () => {
+  it('marks the task Failed, fails the workflow and deletes the session', () => {
     const dag = newDag();
-    dag.set_agent_fallbacks(FALLBACK_CONFIG);
-    JSON.parse(dag.submit_workflow(ONE_TASK));
-    const [task] = JSON.parse(dag.tick()) as Array<{ id: string }>;
-    dag.task_started(task.id, 'ses_1');
-
-    const fb = JSON.parse(dag.try_fallback(task.id, '429 Too Many Requests')) as {
-      fallback: boolean;
-      new_model: string;
-      attempt: number;
-      session_id: string | null;
-    };
-    expect(fb.fallback).toBe(true);
-    expect(fb.new_model).toBe('ollama/qwen:7b');
-    expect(fb.attempt).toBe(1);
-    expect(fb.session_id).toBe('ses_1'); // old session for cleanup
-    dag.free();
-  });
-
-  it('task is Pending again after try_fallback — tick picks it up', () => {
-    const dag = newDag();
-    dag.set_agent_fallbacks(FALLBACK_CONFIG);
-    JSON.parse(dag.submit_workflow(ONE_TASK));
-    const [task] = JSON.parse(dag.tick()) as Array<{ id: string }>;
-    dag.task_started(task.id, 'ses_1');
-    dag.try_fallback(task.id, '429');
-
-    const retry = JSON.parse(dag.tick()) as Array<{ id: string; model: string }>;
-    expect(retry).toHaveLength(1);
-    expect(retry[0].id).toBe(task.id);
-    expect(retry[0].model).toBe('ollama/qwen:7b');
-    dag.free();
-  });
-
-  it('throws "no more fallback models" when the chain is exhausted', () => {
-    const dag = newDag();
-    dag.set_agent_fallbacks(FALLBACK_CONFIG); // one fallback: ollama/qwen:7b
-    JSON.parse(dag.submit_workflow(ONE_TASK));
-    const [task] = JSON.parse(dag.tick()) as Array<{ id: string }>;
-    dag.task_started(task.id, 'ses_1');
-
-    dag.try_fallback(task.id, '429'); // consumes the one fallback (attempt → 1)
-    JSON.parse(dag.tick());           // picks up the retried task
-    dag.task_started(task.id, 'ses_2');
-
-    expect(() => dag.try_fallback(task.id, '429')).toThrow('no more fallback models');
-    dag.free();
-  });
-});
-
-// ─── process_event session.error + fallback_hint ─────────────────────────────
-
-describe('DagEngine — session.error fallback_hint', () => {
-  it('sets has_fallbacks=true when fallbacks remain', () => {
-    const dag = newDag();
-    dag.set_agent_fallbacks(FALLBACK_CONFIG);
-    JSON.parse(dag.submit_workflow(ONE_TASK));
+    const { workflow_id } = JSON.parse(dag.submit_workflow(ONE_TASK));
     const [task] = JSON.parse(dag.tick()) as Array<{ id: string }>;
     dag.task_started(task.id, 'ses_1');
 
     const result = JSON.parse(
       dag.process_event('session.error', 'ses_1', JSON.stringify({ error: '429 Too Many Requests' })),
-    ) as { fallback_hint: { task_id: string; error_message: string; has_fallbacks: boolean } };
-
-    expect(result.fallback_hint).toBeDefined();
-    expect(result.fallback_hint.has_fallbacks).toBe(true);
-    expect(result.fallback_hint.error_message).toContain('429');
-    expect(result.fallback_hint.task_id).toBe(task.id);
-    dag.free();
-  });
-
-  it('sets has_fallbacks=false when no fallbacks are registered', () => {
-    const dag = newDag();
-    // No set_agent_fallbacks — empty registry
-    JSON.parse(dag.submit_workflow(ONE_TASK));
-    const [task] = JSON.parse(dag.tick()) as Array<{ id: string }>;
-    dag.task_started(task.id, 'ses_1');
-
-    const result = JSON.parse(
-      dag.process_event('session.error', 'ses_1', JSON.stringify({ error: '429' })),
-    ) as { fallback_hint: { has_fallbacks: boolean } };
-
-    expect(result.fallback_hint.has_fallbacks).toBe(false);
-    dag.free();
-  });
-
-  it('returns empty result (no fallback_hint) when session is unknown', () => {
-    const dag = newDag();
-    const result = JSON.parse(
-      dag.process_event('session.error', 'ses_unknown', JSON.stringify({ error: '429' })),
-    ) as { fallback_hint?: unknown; notifications: unknown[] };
-
-    expect(result.fallback_hint).toBeUndefined();
-    expect(result.notifications).toHaveLength(0);
-    dag.free();
-  });
-
-  it('sets delete_session to the erroring session id', () => {
-    const dag = newDag();
-    JSON.parse(dag.submit_workflow(ONE_TASK));
-    const [task] = JSON.parse(dag.tick()) as Array<{ id: string }>;
-    dag.task_started(task.id, 'ses_1');
-
-    const result = JSON.parse(
-      dag.process_event('session.error', 'ses_1', JSON.stringify({ error: '500' })),
     ) as { delete_session: string | null };
 
     expect(result.delete_session).toBe('ses_1');
+    const t = JSON.parse(dag.get_task(task.id)) as { status: { type: string } };
+    expect(t.status.type).toBe('failed');
+    const snapshot = JSON.parse(dag.get_workflow_snapshot(workflow_id)) as {
+      status: { type: string };
+    };
+    expect(snapshot.status.type).toBe('failed');
+    // Already terminal: the plugin must not call fail_task afterwards.
+    expect(() => dag.fail_task(task.id, 'again')).toThrow();
+    dag.free();
+  });
+
+  it('returns an empty result when the session is unknown', () => {
+    const dag = newDag();
+    const result = JSON.parse(
+      dag.process_event('session.error', 'ses_unknown', JSON.stringify({ error: '429' })),
+    ) as { delete_session: string | null; notifications: unknown[] };
+
+    expect(result.delete_session).toBeNull();
+    expect(result.notifications).toHaveLength(0);
     dag.free();
   });
 });
@@ -459,6 +348,48 @@ describe('DagEngine — cancel_workflow', () => {
   it('throws for an unknown workflow id', () => {
     const dag = newDag();
     expect(() => dag.cancel_workflow('nope')).toThrow('not found');
+    dag.free();
+  });
+});
+
+// ─── card_id ──────────────────────────────────────────────────────────────────
+
+describe('DagEngine — optional card_id', () => {
+  it('workflow card_id propagates to ready tasks and snapshot', () => {
+    const dag = newDag();
+    const { workflow_id } = JSON.parse(dag.submit_workflow(ONE_TASK, 'ses_p', 'CARD-1')) as {
+      workflow_id: string;
+    };
+    const ready = JSON.parse(dag.tick()) as Array<{ card_id?: string }>;
+    expect(ready[0].card_id).toBe('CARD-1');
+    const snap = JSON.parse(dag.get_workflow_snapshot(workflow_id)) as {
+      card_id?: string;
+      tasks: Array<{ card_id?: string }>;
+    };
+    expect(snap.card_id).toBe('CARD-1');
+    expect(snap.tasks[0].card_id).toBe('CARD-1');
+    dag.free();
+  });
+
+  it('no-card workflow omits card_id', () => {
+    const dag = newDag();
+    JSON.parse(dag.submit_workflow(ONE_TASK));
+    expect(dag.tick()).not.toContain('card_id');
+    dag.free();
+  });
+
+  it('plan draft binds the first card_id and rejects a conflicting one', () => {
+    const dag = newDag();
+    const first = JSON.parse(
+      dag.append_plan_task(JSON.stringify({ agent: 'a', prompt: 'p', card_id: 'CARD-1' })),
+    ) as { plan_id: string };
+    expect(dag.get_plan_card_id(first.plan_id)).toBe('CARD-1');
+    expect(() =>
+      dag.append_plan_task(
+        JSON.stringify({ agent: 'a', prompt: 'p', card_id: 'CARD-2' }),
+        first.plan_id,
+      ),
+    ).toThrow('already bound to card CARD-1');
     dag.free();
   });
 });

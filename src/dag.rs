@@ -21,8 +21,6 @@ pub struct DagEngine {
     nodes: HashMap<String, Node>,
     workflows: HashMap<String, Workflow>,
     session_to_task: HashMap<String, String>,
-    /// Maps agent name → ordered fallback model list (populated at startup).
-    agent_fallbacks: HashMap<String, Vec<String>>,
     /// In-progress plan drafts built incrementally via `append_plan_task`, keyed by
     /// plan_id, consumed via `get_plan_draft` + `discard_plan_draft`.
     plan_drafts: HashMap<String, PlanDraft>,
@@ -47,79 +45,8 @@ impl DagEngine {
             nodes: HashMap::new(),
             workflows: HashMap::new(),
             session_to_task: HashMap::new(),
-            agent_fallbacks: HashMap::new(),
             plan_drafts: HashMap::new(),
             next_draft_seq: 0,
-        }
-    }
-
-    /// Register per-agent fallback model chains from a JSON object keyed by agent name.
-    ///
-    /// Expected shape: `{ "agent_name": { "model": "...", "fallback_models": [...] } }`.
-    /// The plugin calls this once at startup using the output of `agent_fallback_configs_json()`.
-    /// Chains registered here are applied to every task dispatched to the named agent,
-    /// unless the task's own `fallback_models` field overrides them.
-    pub fn set_agent_fallbacks(&mut self, json: &str) {
-        let map: serde_json::Value = match serde_json::from_str(json) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-
-        let obj = match map.as_object() {
-            Some(o) => o,
-            None => return,
-        };
-
-        for (agent_name, config) in obj {
-            if let Some(fallbacks) = config.get("fallback_models").and_then(|v| v.as_array()) {
-                let models: Vec<String> = fallbacks
-                    .iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect();
-                self.agent_fallbacks.insert(agent_name.clone(), models);
-            }
-        }
-    }
-
-    /// Advance a task to its next fallback model and reset it to `Pending`.
-    ///
-    /// Atomically sets the task's `model` to the next entry in `fallback_models`,
-    /// increments `model_attempt`, clears `session_id`, and sets `status` back to
-    /// `Pending` so the tick loop picks it up on the next iteration.
-    ///
-    /// Returns JSON `{ fallback: true, new_model, attempt, session_id }` where
-    /// `session_id` is the old session to clean up.  Returns
-    /// `Err("no more fallback models")` when the chain is exhausted.
-    pub fn try_fallback(&mut self, task_id: &str, _error_msg: &str) -> Result<String, String> {
-        let node = self
-            .nodes
-            .get_mut(task_id)
-            .ok_or_else(|| format!("task {task_id} not found"))?;
-
-        if matches!(node.task.status, TaskStatus::Cancelled) {
-            return Err(format!("task {task_id} is cancelled"));
-        }
-
-        let attempt = node.task.model_attempt;
-        let fallback_len = node.task.fallback_models.len();
-
-        if attempt < fallback_len {
-            node.task.model_attempt += 1;
-            let new_model = node.task.fallback_models[node.task.model_attempt - 1].clone();
-            node.task.model = new_model.clone();
-            let old_session_id = node.task.session_id.clone();
-            node.task.session_id = None;
-            node.task.status = TaskStatus::Pending;
-
-            Ok(serde_json::json!({
-                "fallback": true,
-                "new_model": new_model,
-                "attempt": node.task.model_attempt,
-                "session_id": old_session_id,
-            })
-            .to_string())
-        } else {
-            Err("no more fallback models".to_string())
         }
     }
 
@@ -138,6 +65,21 @@ impl DagEngine {
         tasks_json: &str,
         parent_session_id: Option<&str>,
     ) -> Result<String, String> {
+        self.submit_workflow_with_card(tasks_json, parent_session_id, None)
+    }
+
+    /// Submit a workflow with an optional parent session id and optional workflow-level
+    /// card id. A task's own `card_id` overrides the workflow default; tasks without one
+    /// inherit it. Empty/whitespace card ids are treated as absent.
+    ///
+    /// Returns JSON `{workflow_id, task_ids}` or an error message string.
+    pub fn submit_workflow_with_card(
+        &mut self,
+        tasks_json: &str,
+        parent_session_id: Option<&str>,
+        card_id: Option<&str>,
+    ) -> Result<String, String> {
+        let workflow_card_id = normalize_card_id(card_id);
         let tasks: Vec<WorkflowTaskInput> =
             serde_json::from_str(tasks_json).map_err(|e| format!("invalid tasks JSON: {e}"))?;
 
@@ -174,13 +116,6 @@ impl DagEngine {
                 .filter(|m| !m.is_empty())
                 .unwrap_or(DEFAULT_MODEL)
                 .to_string();
-            // Priority: task-level fallback_models → agent registry fallbacks → empty
-            let fallback_models = task.fallback_models.clone().unwrap_or_else(|| {
-                self.agent_fallbacks
-                    .get(&task.agent)
-                    .cloned()
-                    .unwrap_or_default()
-            });
             self.nodes.insert(
                 ids[i].clone(),
                 Node {
@@ -194,8 +129,8 @@ impl DagEngine {
                         status: TaskStatus::Pending,
                         output: None,
                         review: None,
-                        fallback_models,
-                        model_attempt: 0,
+                        card_id: normalize_card_id(task.card_id.as_deref())
+                            .or_else(|| workflow_card_id.clone()),
                     },
                     depends_on: dep_ids,
                     workflow_id: Some(workflow_id.clone()),
@@ -210,6 +145,7 @@ impl DagEngine {
                 status: WorkflowStatus::Running,
                 tasks: ids.clone(),
                 parent_session_id: parent_session_id.map(|session_id| session_id.to_string()),
+                card_id: workflow_card_id,
             },
         );
 
@@ -273,6 +209,7 @@ impl DagEngine {
             if let Some(node) = self.nodes.get_mut(&id) {
                 let existing_session_id = node.task.session_id.clone();
                 let workflow_id = node.workflow_id.clone();
+                let card_id = node.task.card_id.clone();
                 node.task.status = TaskStatus::Running;
                 started.push(ReadyTask {
                     id: id.clone(),
@@ -280,9 +217,9 @@ impl DagEngine {
                     model: node.task.model.clone(),
                     agent: node.task.agent.clone(),
                     parent_session_id,
-                    fallback_models: node.task.fallback_models.clone(),
                     existing_session_id,
                     workflow_id,
+                    card_id,
                 });
             }
         }
@@ -299,12 +236,9 @@ impl DagEngine {
     /// `session_to_task` (no mapping is created), so a subsequent
     /// `process_event` for it is a guaranteed no-op.
     ///
-    /// `Pending` is bindable (not just `Running`) because two legitimate
-    /// callers bind a session while the task is still `Pending`:
-    /// `try_fallback()` resets a task to `Pending` before the tick loop picks
-    /// it back up, and the session-reuse path in `process_event`
-    /// (`session.idle` → `reuse_session`) pre-assigns a session to the next
-    /// task before that task has been through `tick()`.
+    /// `Pending` is bindable (not just `Running`) because the session-reuse
+    /// path in `process_event` (`session.idle` → `reuse_session`) pre-assigns
+    /// a session to the next task before that task has been through `tick()`.
     ///
     /// Callers on the plugin side MUST check this return value: `false` means
     /// the session was never bound to a task and is now orphaned — the caller
@@ -341,7 +275,6 @@ impl DagEngine {
         let mut result = EventResult {
             notifications: vec![],
             delete_session: None,
-            fallback_hint: None,
             reuse_session: None,
         };
 
@@ -411,18 +344,14 @@ impl DagEngine {
                     .unwrap_or("unknown error")
                     .to_string();
 
-                // Check whether the task has remaining fallbacks before deciding.
-                let has_fallbacks = self
-                    .nodes
-                    .get(&task_id)
-                    .is_some_and(|n| n.task.model_attempt < n.task.fallback_models.len());
-
-                // Leave task in Running — plugin will call try_fallback or fail_task.
-                result.fallback_hint = Some(FallbackHint {
-                    task_id: task_id.clone(),
-                    error_message: error_msg,
-                    has_fallbacks,
-                });
+                // Same semantics as `fail_task`: only a non-terminal task can fail.
+                if let Some(node) = self.nodes.get_mut(&task_id)
+                    && matches!(node.task.status, TaskStatus::Pending | TaskStatus::Running)
+                {
+                    node.task.status = TaskStatus::Failed(error_msg);
+                    let wf = self.update_workflow_status(&task_id);
+                    self.push_workflow_notification(&wf, &mut result.notifications);
+                }
 
                 self.session_to_task.remove(session_id);
                 result.delete_session = Some(session_id.to_string());
@@ -495,6 +424,7 @@ impl DagEngine {
                 id: wf.id.clone(),
                 status: wf.status.clone(),
                 task_count: wf.tasks.len(),
+                card_id: wf.card_id.clone(),
             })
             .collect();
 
@@ -680,7 +610,8 @@ impl DagEngine {
     /// Append one task to an in-progress plan draft, creating the draft if needed.
     ///
     /// `task_json` deserializes into the same shape as a `submit_workflow` task entry:
-    /// `{agent, prompt, depends_on?, model?, fallback_models?}`. `depends_on` indices
+    /// `{agent, prompt, depends_on?, model?, card_id?}`. The draft binds to the first
+    /// non-blank `card_id` seen; a different one later is rejected. `depends_on` indices
     /// refer only to tasks already appended to this draft (backward-only references —
     /// this also rejects self-references, since a task's own index does not yet exist
     /// when it is being appended).
@@ -712,8 +643,9 @@ impl DagEngine {
         task_json: &str,
         plan_id: Option<&str>,
     ) -> Result<String, String> {
-        let task: WorkflowTaskInput =
+        let mut task: WorkflowTaskInput =
             serde_json::from_str(task_json).map_err(|e| format!("invalid task JSON: {e}"))?;
+        task.card_id = normalize_card_id(task.card_id.as_deref());
 
         let target_id = match plan_id {
             Some(id) if !id.is_empty() => id.to_string(),
@@ -740,6 +672,20 @@ impl DagEngine {
         if current_count >= MAX_TASKS_PER_DRAFT {
             return Err(format!(
                 "plan draft '{target_id}' already has the maximum {MAX_TASKS_PER_DRAFT} tasks"
+            ));
+        }
+
+        // A draft binds to the first card id it sees; a different one is rejected
+        // (still read-only, so a rejected append never creates or touches a draft).
+        if let (Some(existing), Some(incoming)) = (
+            self.plan_drafts
+                .get(&target_id)
+                .and_then(|d| d.card_id.as_deref()),
+            task.card_id.as_deref(),
+        ) && existing != incoming
+        {
+            return Err(format!(
+                "plan draft '{target_id}' already bound to card {existing}; cannot append task for card {incoming}"
             ));
         }
 
@@ -771,6 +717,7 @@ impl DagEngine {
                     last_touched_seq: seq,
                     tasks: Vec::new(),
                     agents: Vec::new(),
+                    card_id: None,
                 },
             );
         } else {
@@ -786,6 +733,9 @@ impl DagEngine {
         let prompt_chars = task.prompt.chars().count();
 
         let draft = self.plan_drafts.get_mut(&target_id).unwrap();
+        if draft.card_id.is_none() {
+            draft.card_id = task.card_id.clone();
+        }
         draft.agents.push(agent.clone());
         draft.tasks.push(task);
         let plan_id_out = draft.id.clone();
@@ -793,22 +743,33 @@ impl DagEngine {
         let task_count = draft.tasks.len();
         let agents = draft.agents.clone();
 
-        Ok(serde_json::json!({
+        let mut response = serde_json::json!({
             "plan_id": plan_id_out,
             "task_index": task_index,
             "task_count": task_count,
             "agent": agent,
             "prompt_chars": prompt_chars,
             "agents": agents,
-        })
-        .to_string())
+        });
+        if let Some(card_id) = &draft.card_id {
+            response["card_id"] = serde_json::Value::String(card_id.clone());
+        }
+        Ok(response.to_string())
+    }
+
+    /// Plan-level card id bound to a draft, or `None` when the draft is unbound or
+    /// unknown (no-card mode).
+    pub fn get_plan_card_id(&self, plan_id: &str) -> Option<String> {
+        self.plan_drafts
+            .get(plan_id)
+            .and_then(|d| d.card_id.clone())
     }
 
     /// Read back a plan draft's accumulated tasks for finalization.
     ///
     /// Returns a JSON array shaped exactly like the `tasks` field of a
-    /// `submit_workflow` payload (`agent`, `prompt`, `depends_on`, optional `model`,
-    /// optional `fallback_models`) — the caller can drop this straight into the
+    /// `submit_workflow` payload (`agent`, `prompt`, `depends_on`, optional `model`)
+    /// — the caller can drop this straight into the
     /// on-disk plan artifact's `tasks` field with zero transformation.
     ///
     /// Does NOT discard or otherwise mutate the draft. Discarding is a separate,
@@ -847,7 +808,21 @@ impl DagEngine {
             }
         }
 
-        serde_json::to_string(&draft.tasks).map_err(|e| format!("failed to serialize draft: {e}"))
+        // Array shape is unchanged. When the draft is bound to a card, tasks lacking
+        // their own `card_id` are emitted with the plan-level one so the artifact
+        // carries it; with no card the output is byte-identical to before.
+        let tasks: Vec<WorkflowTaskInput> = draft
+            .tasks
+            .iter()
+            .map(|t| WorkflowTaskInput {
+                agent: t.agent.clone(),
+                prompt: t.prompt.clone(),
+                depends_on: t.depends_on.clone(),
+                model: t.model.clone(),
+                card_id: t.card_id.clone().or_else(|| draft.card_id.clone()),
+            })
+            .collect();
+        serde_json::to_string(&tasks).map_err(|e| format!("failed to serialize draft: {e}"))
     }
 
     /// Remove a plan draft from the store.
@@ -975,8 +950,7 @@ impl DagEngine {
                 output_preview: node.task.output.as_deref().and_then(Self::make_preview),
                 prompt_preview: Self::make_preview(&node.task.prompt),
                 review: node.task.review.clone(),
-                model_attempt: node.task.model_attempt,
-                fallback_models: node.task.fallback_models.clone(),
+                card_id: node.task.card_id.clone(),
             })
             .collect();
 
@@ -984,6 +958,7 @@ impl DagEngine {
             id: wf.id.clone(),
             status: wf.status.clone(),
             tasks,
+            card_id: wf.card_id.clone(),
         })
     }
 
@@ -1263,13 +1238,14 @@ mod tests {
         dag.tick();
         dag.task_started(task_id, "ses_err");
 
-        // process_event returns fallback_hint; plugin must call fail_task to finalize.
-        dag.process_event(
+        // process_event marks the task Failed directly.
+        let result: serde_json::Value = serde_json::from_str(&dag.process_event(
             "session.error",
             "ses_err",
             &serde_json::json!({"error": "rate limit"}).to_string(),
-        );
-        dag.fail_task(task_id, "rate limit").unwrap();
+        ))
+        .unwrap();
+        assert_eq!(result["delete_session"], "ses_err");
 
         let task: serde_json::Value = serde_json::from_str(&dag.get_task(task_id)).unwrap();
         assert_eq!(task["status"]["type"], "failed");
@@ -1363,13 +1339,15 @@ mod tests {
         dag.tick();
         dag.task_started(task_id, "ses_fail");
 
-        // process_event returns fallback_hint; plugin must call fail_task to finalize.
-        dag.process_event(
+        let result: serde_json::Value = serde_json::from_str(&dag.process_event(
             "session.error",
             "ses_fail",
             &serde_json::json!({"error": "model refused"}).to_string(),
-        );
-        dag.fail_task(task_id, "model refused").unwrap();
+        ))
+        .unwrap();
+        let notifs = result["notifications"].as_array().unwrap();
+        assert_eq!(notifs.len(), 1);
+        assert_eq!(notifs[0]["variant"], "error");
 
         let wf: serde_json::Value = serde_json::from_str(&dag.get_workflow(wf_id)).unwrap();
         assert_eq!(wf["status"]["type"], "failed");
@@ -1491,40 +1469,6 @@ mod tests {
 
         assert!(!dag.task_started(done_id, "ses_late_done"));
         assert!(!dag.task_started(failed_id, "ses_late_failed"));
-    }
-
-    #[test]
-    fn task_started_accepts_pending_task_reset_by_fallback() {
-        // try_fallback() resets the task to Pending; task_started() must
-        // still accept a bind while the task sits Pending awaiting the next
-        // tick(), not just once it is Running again.
-        let mut dag = DagEngine::new();
-        let tasks = serde_json::json!([{
-            "agent": "a",
-            "prompt": "p",
-            "depends_on": [],
-            "fallback_models": ["openai/gpt-4o"]
-        }]);
-        let resp: serde_json::Value =
-            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
-        let task_id = resp["task_ids"][0].as_str().unwrap();
-
-        dag.tick();
-        assert!(dag.task_started(task_id, "ses_1"));
-        dag.process_event(
-            "session.error",
-            "ses_1",
-            &serde_json::json!({"error": "rate limit"}).to_string(),
-        );
-        dag.try_fallback(task_id, "rate limit").unwrap();
-
-        let task: serde_json::Value = serde_json::from_str(&dag.get_task(task_id)).unwrap();
-        assert_eq!(task["status"]["type"], "pending");
-
-        // Bind a new session while still Pending (before the next tick()).
-        assert!(dag.task_started(task_id, "ses_2"));
-        let task: serde_json::Value = serde_json::from_str(&dag.get_task(task_id)).unwrap();
-        assert_eq!(task["session_id"], "ses_2");
     }
 
     #[test]
@@ -1758,27 +1702,6 @@ mod tests {
     }
 
     #[test]
-    fn try_fallback_rejects_cancelled_task() {
-        let mut dag = DagEngine::new();
-        let tasks = serde_json::json!([{
-            "agent": "a",
-            "prompt": "p",
-            "depends_on": [],
-            "fallback_models": ["openai/gpt-4o"]
-        }]);
-        let resp: serde_json::Value =
-            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
-        let task_id = resp["task_ids"][0].as_str().unwrap();
-
-        dag.tick();
-        dag.task_started(task_id, "ses_x");
-        dag.cancel_task(task_id).unwrap();
-
-        let err = dag.try_fallback(task_id, "some error").unwrap_err();
-        assert!(err.contains("cancelled"), "unexpected: {err}");
-    }
-
-    #[test]
     fn cancel_workflow_twice_errors() {
         let mut dag = DagEngine::new();
         let tasks = serde_json::json!([{"agent": "a", "prompt": "p", "depends_on": []}]);
@@ -2006,235 +1929,104 @@ mod tests {
         assert_eq!(ok_resp["stored"], true);
     }
 
-    // ─── Fallback model tests ──────────────────────────────────────────────────
+    // ─── Session error / model override tests ──────────────────────────────────
 
     #[test]
-    fn test_set_agent_fallbacks_populates_registry() {
+    fn session_error_fails_task_and_workflow_without_fail_task_call() {
         let mut dag = DagEngine::new();
-        let fallbacks_json = serde_json::json!({
-            "explorer": {
-                "model": "anthropic/claude-sonnet-4-6",
-                "fallback_models": ["openai/gpt-4o", "ollama/qwen3-coder:30b"]
-            }
-        })
-        .to_string();
-        dag.set_agent_fallbacks(&fallbacks_json);
-
-        // Submit a workflow using the "explorer" agent without task-level fallbacks.
-        let tasks = serde_json::json!([{"agent": "explorer", "prompt": "go", "depends_on": []}]);
+        let tasks = serde_json::json!([
+            {"agent": "a", "prompt": "p0", "depends_on": []},
+            {"agent": "b", "prompt": "p1", "depends_on": [0]},
+        ]);
         let resp: serde_json::Value =
             serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
-        let task_id = resp["task_ids"][0].as_str().unwrap();
-
-        let task: serde_json::Value = serde_json::from_str(&dag.get_task(task_id)).unwrap();
-        let fallbacks = task["fallback_models"].as_array().unwrap();
-        assert_eq!(fallbacks.len(), 2);
-        assert_eq!(fallbacks[0], "openai/gpt-4o");
-        assert_eq!(fallbacks[1], "ollama/qwen3-coder:30b");
-    }
-
-    #[test]
-    fn test_task_level_fallbacks_override_agent_fallbacks() {
-        let mut dag = DagEngine::new();
-        // Register agent-level fallbacks.
-        let fallbacks_json = serde_json::json!({
-            "explorer": {
-                "model": "anthropic/claude-sonnet-4-6",
-                "fallback_models": ["openai/gpt-4o"]
-            }
-        })
-        .to_string();
-        dag.set_agent_fallbacks(&fallbacks_json);
-
-        // Submit with task-level fallback_models — these should win.
-        let tasks = serde_json::json!([{
-            "agent": "explorer",
-            "prompt": "go",
-            "depends_on": [],
-            "fallback_models": ["ollama/qwen3-coder:30b", "mistral/mistral-large"]
-        }]);
-        let resp: serde_json::Value =
-            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
-        let task_id = resp["task_ids"][0].as_str().unwrap();
-
-        let task: serde_json::Value = serde_json::from_str(&dag.get_task(task_id)).unwrap();
-        let fallbacks = task["fallback_models"].as_array().unwrap();
-        assert_eq!(fallbacks.len(), 2);
-        assert_eq!(fallbacks[0], "ollama/qwen3-coder:30b");
-        assert_eq!(fallbacks[1], "mistral/mistral-large");
-    }
-
-    #[test]
-    fn test_try_fallback_advances_model() {
-        let mut dag = DagEngine::new();
-        let tasks = serde_json::json!([{
-            "agent": "a",
-            "prompt": "p",
-            "depends_on": [],
-            "fallback_models": ["openai/gpt-4o", "ollama/qwen3-coder:30b"]
-        }]);
-        let resp: serde_json::Value =
-            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
-        let task_id = resp["task_ids"][0].as_str().unwrap();
+        let wf_id = resp["workflow_id"].as_str().unwrap();
+        let id0 = resp["task_ids"][0].as_str().unwrap();
+        let id1 = resp["task_ids"][1].as_str().unwrap();
 
         dag.tick();
-        dag.task_started(task_id, "ses_fb");
+        dag.task_started(id0, "ses_e");
 
-        // Simulate error → try_fallback.
-        dag.process_event(
+        let result: serde_json::Value = serde_json::from_str(&dag.process_event(
             "session.error",
-            "ses_fb",
-            &serde_json::json!({"error": "rate limit"}).to_string(),
-        );
-        let fb_result: serde_json::Value =
-            serde_json::from_str(&dag.try_fallback(task_id, "rate limit").unwrap()).unwrap();
+            "ses_e",
+            &serde_json::json!({"error": "boom"}).to_string(),
+        ))
+        .unwrap();
+        assert_eq!(result["delete_session"], "ses_e");
+        assert!(result.get("fallback_hint").is_none());
 
-        assert_eq!(fb_result["fallback"], true);
-        assert_eq!(fb_result["new_model"], "openai/gpt-4o");
-        assert_eq!(fb_result["attempt"], 1);
+        let task: serde_json::Value = serde_json::from_str(&dag.get_task(id0)).unwrap();
+        assert_eq!(task["status"]["type"], "failed");
+        assert_eq!(task["status"]["message"], "boom");
 
-        let task: serde_json::Value = serde_json::from_str(&dag.get_task(task_id)).unwrap();
-        assert_eq!(task["model"], "openai/gpt-4o");
+        // Dependent never becomes ready; workflow is Failed.
+        let task: serde_json::Value = serde_json::from_str(&dag.get_task(id1)).unwrap();
         assert_eq!(task["status"]["type"], "pending");
-        assert!(task["session_id"].is_null());
+        assert_eq!(dag.tick(), "[]");
+        let wf: serde_json::Value = serde_json::from_str(&dag.get_workflow(wf_id)).unwrap();
+        assert_eq!(wf["status"]["type"], "failed");
+        assert_eq!(wf["status"]["task_id"], id0);
+        assert_eq!(wf["status"]["reason"], "boom");
+
+        // Session mapping is gone: a repeat event is a no-op.
+        let r: serde_json::Value = serde_json::from_str(&dag.process_event(
+            "session.error",
+            "ses_e",
+            &serde_json::json!({"error": "again"}).to_string(),
+        ))
+        .unwrap();
+        assert!(r["delete_session"].is_null());
+        let task: serde_json::Value = serde_json::from_str(&dag.get_task(id0)).unwrap();
+        assert_eq!(task["status"]["message"], "boom");
     }
 
     #[test]
-    fn test_try_fallback_exhausted_returns_error() {
+    fn late_session_error_after_cancel_is_noop() {
         let mut dag = DagEngine::new();
-        // No fallback_models at all.
         let tasks = serde_json::json!([{"agent": "a", "prompt": "p", "depends_on": []}]);
         let resp: serde_json::Value =
             serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
         let task_id = resp["task_ids"][0].as_str().unwrap();
 
         dag.tick();
-        dag.task_started(task_id, "ses_no_fb");
-        dag.process_event(
+        dag.task_started(task_id, "ses_x");
+        dag.cancel_task(task_id).unwrap();
+
+        let r: serde_json::Value = serde_json::from_str(&dag.process_event(
             "session.error",
-            "ses_no_fb",
-            &serde_json::json!({"error": "oops"}).to_string(),
-        );
-
-        let err = dag.try_fallback(task_id, "oops").unwrap_err();
-        assert_eq!(err, "no more fallback models");
-    }
-
-    #[test]
-    fn test_session_error_returns_fallback_hint() {
-        let mut dag = DagEngine::new();
-        let tasks = serde_json::json!([{
-            "agent": "a",
-            "prompt": "p",
-            "depends_on": [],
-            "fallback_models": ["openai/gpt-4o"]
-        }]);
-        let resp: serde_json::Value =
-            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
-        let task_id = resp["task_ids"][0].as_str().unwrap();
-
-        dag.tick();
-        dag.task_started(task_id, "ses_hint");
-
-        let result: serde_json::Value = serde_json::from_str(&dag.process_event(
-            "session.error",
-            "ses_hint",
-            &serde_json::json!({"error": "rate limit"}).to_string(),
+            "ses_x",
+            &serde_json::json!({"error": "aborted"}).to_string(),
         ))
         .unwrap();
+        assert!(r["delete_session"].is_null());
+        assert_eq!(r["notifications"].as_array().unwrap().len(), 0);
 
-        let hint = &result["fallback_hint"];
-        assert!(!hint.is_null(), "fallback_hint should be present");
-        assert_eq!(hint["task_id"], task_id);
-        assert_eq!(hint["error_message"], "rate limit");
-        assert_eq!(hint["has_fallbacks"], true);
-    }
-
-    #[test]
-    fn test_session_error_does_not_immediately_fail_task() {
-        let mut dag = DagEngine::new();
-        let tasks = serde_json::json!([{
-            "agent": "a",
-            "prompt": "p",
-            "depends_on": [],
-            "fallback_models": ["openai/gpt-4o"]
-        }]);
-        let resp: serde_json::Value =
-            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
-        let task_id = resp["task_ids"][0].as_str().unwrap();
-
-        dag.tick();
-        dag.task_started(task_id, "ses_no_fail");
-
-        dag.process_event(
-            "session.error",
-            "ses_no_fail",
-            &serde_json::json!({"error": "rate limit"}).to_string(),
-        );
-
-        // Task must still be Running, not Failed.
         let task: serde_json::Value = serde_json::from_str(&dag.get_task(task_id)).unwrap();
-        assert_eq!(task["status"]["type"], "running");
+        assert_eq!(task["status"]["type"], "cancelled");
     }
 
     #[test]
-    fn test_fallback_task_becomes_ready_on_next_tick() {
+    fn task_model_override_reaches_tick() {
         let mut dag = DagEngine::new();
-        let tasks = serde_json::json!([{
-            "agent": "a",
-            "prompt": "p",
-            "depends_on": [],
-            "fallback_models": ["openai/gpt-4o"]
-        }]);
+        let tasks = serde_json::json!([
+            {"agent": "a", "prompt": "p0", "depends_on": [], "model": "openai/gpt-4o"},
+            {"agent": "b", "prompt": "p1", "depends_on": []},
+        ]);
         let resp: serde_json::Value =
             serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
-        let task_id = resp["task_ids"][0].as_str().unwrap();
+        let id0 = resp["task_ids"][0].as_str().unwrap();
 
-        dag.tick();
-        dag.task_started(task_id, "ses_retry");
-
-        dag.process_event(
-            "session.error",
-            "ses_retry",
-            &serde_json::json!({"error": "rate limit"}).to_string(),
-        );
-        dag.try_fallback(task_id, "rate limit").unwrap();
-
-        // Task is Pending again; next tick should pick it up.
         let ready: serde_json::Value = serde_json::from_str(&dag.tick()).unwrap();
-        let ready_arr = ready.as_array().unwrap();
-        assert_eq!(ready_arr.len(), 1);
-        assert_eq!(ready_arr[0]["id"], task_id);
-        assert_eq!(ready_arr[0]["model"], "openai/gpt-4o");
-    }
-
-    #[test]
-    fn test_workflow_not_failed_while_fallback_pending() {
-        let mut dag = DagEngine::new();
-        let tasks = serde_json::json!([{
-            "agent": "a",
-            "prompt": "p",
-            "depends_on": [],
-            "fallback_models": ["openai/gpt-4o"]
-        }]);
-        let resp: serde_json::Value =
-            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
-        let wf_id = resp["workflow_id"].as_str().unwrap();
-        let task_id = resp["task_ids"][0].as_str().unwrap();
-
-        dag.tick();
-        dag.task_started(task_id, "ses_wf_retry");
-
-        dag.process_event(
-            "session.error",
-            "ses_wf_retry",
-            &serde_json::json!({"error": "rate limit"}).to_string(),
-        );
-        dag.try_fallback(task_id, "rate limit").unwrap();
-
-        // Workflow must still be Running while the fallback retry is pending.
-        let wf: serde_json::Value = serde_json::from_str(&dag.get_workflow(wf_id)).unwrap();
-        assert_eq!(wf["status"]["type"], "running");
+        for t in ready.as_array().unwrap() {
+            if t["id"] == id0 {
+                assert_eq!(t["model"], "openai/gpt-4o");
+            } else {
+                assert_eq!(t["model"], DEFAULT_MODEL);
+            }
+            assert!(t.get("fallback_models").is_none());
+        }
+        assert_eq!(ready.as_array().unwrap().len(), 2);
     }
 
     // ─── Session reuse tests ───────────────────────────────────────────────────
@@ -2567,6 +2359,7 @@ mod tests {
                 last_touched_seq: 0,
                 tasks: Vec::new(),
                 agents: Vec::new(),
+                card_id: None,
             },
         );
 
@@ -2594,9 +2387,10 @@ mod tests {
                     prompt: "p0".to_string(),
                     depends_on: vec![5],
                     model: None,
-                    fallback_models: None,
+                    card_id: None,
                 }],
                 agents: vec!["a".to_string()],
+                card_id: None,
             },
         );
 
@@ -2752,5 +2546,179 @@ mod tests {
             err.contains("not found"),
             "expected ids[1] (least-recently-touched) to be evicted, got: {err}"
         );
+    }
+
+    // ── card_id ──────────────────────────────────────────────────────────
+
+    fn append(dag: &mut DagEngine, task: serde_json::Value, plan_id: Option<&str>) -> String {
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.append_plan_task(&task.to_string(), plan_id).unwrap())
+                .unwrap();
+        resp["plan_id"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn plan_draft_adopts_first_card_id_and_accepts_same() {
+        let mut dag = DagEngine::new();
+        let plan_id = append(
+            &mut dag,
+            serde_json::json!({"agent": "a", "prompt": "p0"}),
+            None,
+        );
+        // Task without card_id on an unbound draft is fine.
+        assert_eq!(dag.get_plan_card_id(&plan_id), None);
+
+        let resp: serde_json::Value = serde_json::from_str(
+            &dag.append_plan_task(
+                &serde_json::json!({"agent": "a", "prompt": "p1", "card_id": " CARD-1 "})
+                    .to_string(),
+                Some(&plan_id),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resp["card_id"], "CARD-1");
+        assert_eq!(dag.get_plan_card_id(&plan_id).as_deref(), Some("CARD-1"));
+
+        // Same card again, and a task with no card, both succeed.
+        append(
+            &mut dag,
+            serde_json::json!({"agent": "a", "prompt": "p2", "card_id": "CARD-1"}),
+            Some(&plan_id),
+        );
+        append(
+            &mut dag,
+            serde_json::json!({"agent": "a", "prompt": "p3"}),
+            Some(&plan_id),
+        );
+
+        // Read-back: tasks lacking card_id inherit the plan-level one.
+        let tasks: Vec<serde_json::Value> =
+            serde_json::from_str(&dag.get_plan_draft(&plan_id).unwrap()).unwrap();
+        assert_eq!(tasks.len(), 4);
+        for t in &tasks {
+            assert_eq!(t["card_id"], "CARD-1");
+        }
+    }
+
+    #[test]
+    fn plan_draft_rejects_conflicting_card_id() {
+        let mut dag = DagEngine::new();
+        let plan_id = append(
+            &mut dag,
+            serde_json::json!({"agent": "a", "prompt": "p0", "card_id": "CARD-1"}),
+            None,
+        );
+        let err = dag
+            .append_plan_task(
+                &serde_json::json!({"agent": "a", "prompt": "p1", "card_id": "CARD-2"}).to_string(),
+                Some(&plan_id),
+            )
+            .unwrap_err();
+        assert!(err.contains("already bound to card CARD-1"), "got: {err}");
+        // Rejected append leaves the draft untouched.
+        let tasks: Vec<serde_json::Value> =
+            serde_json::from_str(&dag.get_plan_draft(&plan_id).unwrap()).unwrap();
+        assert_eq!(tasks.len(), 1);
+    }
+
+    #[test]
+    fn plan_draft_blank_card_id_is_none() {
+        let mut dag = DagEngine::new();
+        let plan_id = append(
+            &mut dag,
+            serde_json::json!({"agent": "a", "prompt": "p0", "card_id": "   "}),
+            None,
+        );
+        assert_eq!(dag.get_plan_card_id(&plan_id), None);
+        let raw = dag.get_plan_draft(&plan_id).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(v[0].get("card_id").is_none());
+    }
+
+    #[test]
+    fn no_card_plan_draft_output_has_no_card_id() {
+        let mut dag = DagEngine::new();
+        let plan_id = append(
+            &mut dag,
+            serde_json::json!({"agent": "a", "prompt": "p0"}),
+            None,
+        );
+        let raw = dag.get_plan_draft(&plan_id).unwrap();
+        assert!(!raw.contains("card_id"), "got: {raw}");
+    }
+
+    #[test]
+    fn submit_workflow_card_id_propagates_and_task_override_wins() {
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([
+            {"agent": "a", "prompt": "p0"},
+            {"agent": "a", "prompt": "p1", "card_id": "CARD-9", "depends_on": [0]},
+            {"agent": "a", "prompt": "p2", "card_id": "  ", "depends_on": [0]}
+        ]);
+        let resp: serde_json::Value = serde_json::from_str(
+            &dag.submit_workflow_with_card(&tasks.to_string(), None, Some("CARD-1"))
+                .unwrap(),
+        )
+        .unwrap();
+        let wf_id = resp["workflow_id"].as_str().unwrap();
+        let ids: Vec<String> = resp["task_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        let t = |i: usize| -> serde_json::Value {
+            serde_json::from_str(&dag.get_task(&ids[i])).unwrap()
+        };
+        assert_eq!(t(0)["card_id"], "CARD-1");
+        assert_eq!(t(1)["card_id"], "CARD-9");
+        assert_eq!(t(2)["card_id"], "CARD-1");
+
+        let wf: serde_json::Value = serde_json::from_str(&dag.get_workflow(wf_id)).unwrap();
+        assert_eq!(wf["card_id"], "CARD-1");
+    }
+
+    #[test]
+    fn ready_task_and_snapshot_include_card_id() {
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([{"agent": "a", "prompt": "p0"}]);
+        let resp: serde_json::Value = serde_json::from_str(
+            &dag.submit_workflow_with_card(&tasks.to_string(), Some("ses_p"), Some("CARD-7"))
+                .unwrap(),
+        )
+        .unwrap();
+        let wf_id = resp["workflow_id"].as_str().unwrap();
+
+        let ready: Vec<serde_json::Value> = serde_json::from_str(&dag.tick()).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0]["card_id"], "CARD-7");
+
+        let snap: serde_json::Value =
+            serde_json::from_str(&dag.get_workflow_snapshot(wf_id)).unwrap();
+        assert_eq!(snap["card_id"], "CARD-7");
+        assert_eq!(snap["tasks"][0]["card_id"], "CARD-7");
+
+        let summaries: Vec<serde_json::Value> =
+            serde_json::from_str(&dag.list_workflow_summaries()).unwrap();
+        assert_eq!(summaries[0]["card_id"], "CARD-7");
+    }
+
+    #[test]
+    fn no_card_workflow_json_has_no_card_id_anywhere() {
+        let mut dag = DagEngine::new();
+        let tasks = serde_json::json!([{"agent": "a", "prompt": "p0"}]);
+        let resp: serde_json::Value =
+            serde_json::from_str(&dag.submit_workflow(&tasks.to_string()).unwrap()).unwrap();
+        let wf_id = resp["workflow_id"].as_str().unwrap();
+        let task_id = resp["task_ids"][0].as_str().unwrap();
+
+        let ready = dag.tick();
+        assert!(!ready.contains("card_id"), "got: {ready}");
+        assert!(!dag.get_workflow(wf_id).contains("card_id"));
+        assert!(!dag.get_workflow_snapshot(wf_id).contains("card_id"));
+        assert!(!dag.get_task(task_id).contains("card_id"));
+        assert!(!dag.list_workflow_summaries().contains("card_id"));
     }
 }

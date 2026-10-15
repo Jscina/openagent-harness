@@ -10,6 +10,11 @@ description: >
 
 # Memory Card
 
+**Only when a real ticket/card id exists** (ADO work item, QA bug, prod issue id). **Never
+fabricate an id**, and never ask the user for one just to satisfy memory — with no ticket, work in
+no-card (system) mode using `memory_context` / `memory_promote` without `cardId`. Allowed for
+orchestrator and debugger only.
+
 Create a new investigation card under `.opencode/memory/issues/active/` (or `issues/backlog/` for
 planned-but-not-started work) by calling the `memory_card` tool.
 
@@ -48,3 +53,4 @@ rather than trying to recreate it.
 - Fill in the rest of `context.md` by hand (reproduction steps, relevant repos/files, schema
   tables, related issues) — the tool only stamps the header and symptom line.
 - Start logging findings with `memory-trace` as soon as you begin investigating — don't wait.
+- Pass the card id to the planner so it sets `card_id` on every `plan_task`.

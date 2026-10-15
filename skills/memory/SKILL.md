@@ -2,7 +2,8 @@
 name: memory
 description: >
   Router for the two-layer investigation memory system — system/ (durable, committed knowledge)
-  and issues/ (per-investigation cards) under .opencode/memory/. Use this skill for ANY
+  and issues/ (per-investigation cards) under .opencode/memory/. Memory use is mandatory; card
+  ids are optional (no-card/system mode when there is no ticket). Use this skill for ANY
   interaction with the memory_card, memory_trace, memory_context, or memory_promote tools,
   including starting or resuming an investigation, logging a finding, checking prior context,
   or promoting something durable. Routes to memory-card, memory-trace, memory-context, or
@@ -46,14 +47,45 @@ Each card directory holds:
 First call to `memory_card` auto-scaffolds the whole tree (README/BENCHMARKS/`.gitignore`/etc.) if
 it doesn't exist yet — there is no separate init tool.
 
+## Memory is mandatory; card id is optional
+
+Using memory is **required**, not optional. A card id is **not**: it exists only when real work has
+a ticket (ADO number, bug id, prod issue). Outside work context there is no card — use **no-card
+(system) mode**: call `memory_context` and `memory_promote` without `cardId`, and they read/write
+`system/` knowledge only. Never invent a card id, and never ask the user for one just to satisfy
+memory.
+
+### Auto-injected preamble
+
+Every harness task prompt is auto-prefixed with a `<memory-context>` block — the card's context if
+the plan has a `card_id`, else `system/` knowledge. Read it first. Respect its `ruled-out` entries.
+
+### Tool gating
+
+| Tool | Agents allowed | `cardId` |
+|---|---|---|
+| `memory_context` | all agents except `builder-junior` | optional |
+| `memory_card` | orchestrator, debugger | required |
+| `memory_trace` | orchestrator, builder, debugger, consultant | required |
+| `memory_promote` | orchestrator, debugger, consultant | optional |
+
+`builder-junior` has no memory tools; it only reads the injected preamble.
+
+### Ack gate
+
+The planner's `plan_task` and the orchestrator's `submit_plan` / `submit_workflow` are rejected
+until that session has called `memory_context`. Calling it with **no** `cardId` counts. Planner
+passes `card_id` on every `plan_task` when a card exists; `save_plan` persists it, and task
+completion/failure is then auto-traced to the card.
+
 ## Decision guidance
 
 | Situation | Sub-skill |
 |---|---|
-| Starting a new investigation (ticket, bug, prod issue) | `memory-card` |
-| Actively investigating — found something, ruled something out, have a hypothesis, know the next step | `memory-trace` — **log as you find it, not at the end** |
-| Resuming a session, or need prior context before repeating work | `memory-context` |
-| Closing out with something that matters beyond this one card | `memory-promote` |
+| Starting work on a real ticket/bug/prod issue that has no card yet | `memory-card` |
+| Start of any session or task (card or no card) | `memory-context` — **mandatory first step** |
+| Actively investigating a card — found something, ruled something out, have a hypothesis, know the next step | `memory-trace` — **log as you find it, not at the end** (card required) |
+| Confirmed finding that matters beyond this one card — or any durable finding in no-card mode | `memory-promote` |
 
 The most common mistake is treating `memory-trace` as an end-of-session summary step. It isn't —
 call it inline, every time you learn something, so a dropped session never loses the finding.
