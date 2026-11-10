@@ -96,6 +96,160 @@ fn clean_scalar(raw: &str) -> String {
     val.to_string()
 }
 
+/// Model provider selection for installed agent markdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Provider {
+    #[default]
+    Anthropic,
+    Openai,
+    Mixed,
+}
+
+/// Accepted `--provider` values, in `Provider` declaration order.
+pub const PROVIDER_VALUES: &[&str] = &["anthropic", "openai", "mixed"];
+
+impl Provider {
+    pub fn parse(s: &str) -> Option<Provider> {
+        match s {
+            "anthropic" => Some(Provider::Anthropic),
+            "openai" => Some(Provider::Openai),
+            "mixed" => Some(Provider::Mixed),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provider::Anthropic => "anthropic",
+            Provider::Openai => "openai",
+            Provider::Mixed => "mixed",
+        }
+    }
+}
+
+/// Per-agent model for each provider: `(agent, anthropic, openai, mixed)`.
+pub const AGENT_MODELS: &[(&str, &str, &str, &str)] = &[
+    (
+        "orchestrator",
+        "anthropic/claude-sonnet-5-5",
+        "openai/gpt-6.1-sol",
+        "anthropic/claude-sonnet-5-5",
+    ),
+    (
+        "planner",
+        "anthropic/claude-opus-5-5",
+        "openai/gpt-6-astra",
+        "anthropic/claude-opus-5-5",
+    ),
+    (
+        "consultant",
+        "anthropic/claude-opus-5-5",
+        "openai/gpt-6-astra",
+        "anthropic/claude-opus-5-5",
+    ),
+    (
+        "debugger",
+        "anthropic/claude-opus-5-5",
+        "openai/gpt-6-astra",
+        "anthropic/claude-opus-5-5",
+    ),
+    (
+        "builder",
+        "anthropic/claude-sonnet-5-5",
+        "openai/gpt-6.1-sol",
+        "openai/gpt-6.1-sol",
+    ),
+    (
+        "builder-junior",
+        "anthropic/claude-sonnet-5-5",
+        "openai/gpt-5.4-mini",
+        "openai/gpt-5.4-mini",
+    ),
+    (
+        "reviewer",
+        "anthropic/claude-sonnet-5-5",
+        "openai/gpt-6.1-sol",
+        "openai/gpt-6.1-sol",
+    ),
+    (
+        "explorer",
+        "anthropic/claude-haiku-5-5",
+        "openai/gpt-6-luna",
+        "openai/gpt-6-luna",
+    ),
+    (
+        "researcher",
+        "anthropic/claude-haiku-5-5",
+        "openai/gpt-6.1-terra",
+        "openai/gpt-6.1-terra",
+    ),
+    (
+        "docs-writer",
+        "anthropic/claude-haiku-5-5",
+        "openai/gpt-6.1-terra",
+        "openai/gpt-6.1-terra",
+    ),
+    (
+        "vision",
+        "anthropic/claude-haiku-4-5",
+        "openai/gpt-6.1-terra",
+        "openai/gpt-6.1-terra",
+    ),
+];
+
+/// Model string for `agent` under `provider`, or `None` for an unknown agent.
+pub fn model_for(agent: &str, provider: Provider) -> Option<&'static str> {
+    AGENT_MODELS
+        .iter()
+        .find(|(name, ..)| *name == agent)
+        .map(|&(_, anthropic, openai, mixed)| match provider {
+            Provider::Anthropic => anthropic,
+            Provider::Openai => openai,
+            Provider::Mixed => mixed,
+        })
+}
+
+/// Replace column-0 `model:` lines inside the frontmatter block only.
+///
+/// Returns `content` unchanged when there is no frontmatter or no such line.
+pub fn rewrite_model_line(content: &str, new_model: &str) -> String {
+    let Some(after_first) = content.strip_prefix("---\n") else {
+        return content.to_string();
+    };
+    let Some(end) = after_first.find("\n---") else {
+        return content.to_string();
+    };
+    let (frontmatter, tail) = after_first.split_at(end);
+
+    let mut out = String::with_capacity(content.len() + new_model.len());
+    out.push_str("---\n");
+    for line in frontmatter.split_inclusive('\n') {
+        if line.starts_with("model:") {
+            let body_len = line.trim_end_matches(['\r', '\n']).len();
+            out.push_str("model: ");
+            out.push_str(new_model);
+            out.push_str(&line[body_len..]);
+        } else {
+            out.push_str(line);
+        }
+    }
+    out.push_str(tail);
+    out
+}
+
+/// Apply `provider`'s model for agent `name` to its markdown `content`.
+///
+/// `Provider::Anthropic` and unknown agents return `content` unchanged.
+pub fn apply_provider(name: &str, content: &str, provider: Provider) -> String {
+    if provider == Provider::Anthropic {
+        return content.to_string();
+    }
+    match model_for(name, provider) {
+        Some(model) => rewrite_model_line(content, model),
+        None => content.to_string(),
+    }
+}
+
 /// Returns an `AgentConfig` for every embedded agent.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn all_agent_configs() -> Vec<AgentConfig> {
@@ -244,6 +398,140 @@ mod tests {
                 cfg.model
             );
         }
+    }
+
+    #[test]
+    fn rewrite_model_line_replaces_frontmatter_model_only() {
+        let md = "---\nmodel: a/b\ndescription: x\n---\n\nBody.\n";
+        assert_eq!(
+            rewrite_model_line(md, "c/d"),
+            "---\nmodel: c/d\ndescription: x\n---\n\nBody.\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_model_line_preserves_crlf_line_ending_of_model_line() {
+        let md = "---\nmodel: a/b\r\ndescription: x\n---\n";
+        assert_eq!(
+            rewrite_model_line(md, "c/d"),
+            "---\nmodel: c/d\r\ndescription: x\n---\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_model_line_without_model_line_is_unchanged() {
+        let md = "---\ndescription: x\n---\n\nBody.\n";
+        assert_eq!(rewrite_model_line(md, "c/d"), md);
+    }
+
+    #[test]
+    fn rewrite_model_line_without_frontmatter_is_unchanged() {
+        let md = "model: a/b\n\nBody.\n";
+        assert_eq!(rewrite_model_line(md, "c/d"), md);
+        let unterminated = "---\nmodel: a/b\n";
+        assert_eq!(rewrite_model_line(unterminated, "c/d"), unterminated);
+    }
+
+    #[test]
+    fn rewrite_model_line_ignores_nested_and_body_model_lines() {
+        let md =
+            "---\nmodel: a/b\npermissions:\n  model: nested/x\n---\n\nmodel: body/y\nmodel: z\n";
+        assert_eq!(
+            rewrite_model_line(md, "c/d"),
+            "---\nmodel: c/d\npermissions:\n  model: nested/x\n---\n\nmodel: body/y\nmodel: z\n"
+        );
+    }
+
+    #[test]
+    fn apply_provider_round_trips_through_parser() {
+        for provider in [Provider::Openai, Provider::Mixed] {
+            for (name, content) in AGENTS {
+                let rewritten = apply_provider(name, content, provider);
+                let expected = model_for(name, provider).unwrap();
+                assert_eq!(
+                    parse_agent_frontmatter(name, &rewritten).model,
+                    expected,
+                    "agent '{name}' provider {provider:?}"
+                );
+                let before = content.split_once("\n---").unwrap().1;
+                let after = rewritten.split_once("\n---").unwrap().1;
+                assert_eq!(before, after, "agent '{name}' body changed");
+            }
+        }
+    }
+
+    #[test]
+    fn apply_provider_anthropic_is_byte_identical() {
+        for (name, content) in AGENTS {
+            assert_eq!(apply_provider(name, content, Provider::Anthropic), *content);
+        }
+    }
+
+    #[test]
+    fn apply_provider_unknown_agent_is_unchanged() {
+        let md = "---\nmodel: a/b\n---\n";
+        assert_eq!(apply_provider("nope", md, Provider::Openai), md);
+    }
+
+    #[test]
+    fn agent_models_cover_exactly_the_embedded_agents() {
+        for (name, _) in AGENTS {
+            assert!(
+                AGENT_MODELS.iter().any(|(n, ..)| n == name),
+                "AGENT_MODELS missing '{name}'"
+            );
+        }
+        for (name, ..) in AGENT_MODELS {
+            assert!(
+                AGENTS.iter().any(|(n, _)| n == name),
+                "AGENT_MODELS has extra '{name}'"
+            );
+        }
+        assert_eq!(AGENT_MODELS.len(), AGENTS.len());
+    }
+
+    #[test]
+    fn agent_models_anthropic_column_matches_embedded_markdown() {
+        for (name, content) in AGENTS {
+            let parsed = parse_agent_frontmatter(name, content).model;
+            assert_eq!(
+                model_for(name, Provider::Anthropic),
+                Some(parsed.as_str()),
+                "agent '{name}' drifted from agents/{name}.md"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_models_mixed_is_anthropic_or_openai() {
+        for (name, anthropic, openai, mixed) in AGENT_MODELS {
+            assert!(
+                mixed == anthropic || mixed == openai,
+                "agent '{name}' mixed value '{mixed}' matches neither column"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_models_columns_use_expected_prefixes() {
+        for (name, anthropic, openai, _) in AGENT_MODELS {
+            assert!(anthropic.starts_with("anthropic/"), "agent '{name}'");
+            assert!(openai.starts_with("openai/"), "agent '{name}'");
+        }
+    }
+
+    #[test]
+    fn provider_parse_accepts_only_exact_lowercase_values() {
+        assert_eq!(Provider::parse("anthropic"), Some(Provider::Anthropic));
+        assert_eq!(Provider::parse("openai"), Some(Provider::Openai));
+        assert_eq!(Provider::parse("mixed"), Some(Provider::Mixed));
+        for bad in ["", "Anthropic", "gpt", "OPENAI", " mixed", "mixed "] {
+            assert_eq!(Provider::parse(bad), None, "{bad:?}");
+        }
+        for value in PROVIDER_VALUES {
+            assert_eq!(Provider::parse(value).unwrap().as_str(), *value);
+        }
+        assert_eq!(Provider::default(), Provider::Anthropic);
     }
 
     #[test]

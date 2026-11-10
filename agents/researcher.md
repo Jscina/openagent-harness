@@ -1,5 +1,5 @@
 ---
-model: anthropic/claude-haiku-4-5
+model: anthropic/claude-haiku-5-5
 description: External knowledge retrieval. Searches web, fetches library docs, reads GitHub examples. No local file access.
 mode: subagent
 permissions:

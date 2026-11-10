@@ -1,5 +1,5 @@
 ---
-model: anthropic/claude-haiku-4-5
+model: anthropic/claude-haiku-5-5
 description: Read-only codebase reconnaissance. Maps files, traces call chains, identifies interfaces and patterns. Never modifies anything.
 mode: subagent
 permissions:

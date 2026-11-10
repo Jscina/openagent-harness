@@ -1,3 +1,4 @@
+use crate::agents::{Provider, apply_provider};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -48,6 +49,7 @@ fn install_agents_into(
     agents_dir: &Path,
     agents: &[(&str, &str)],
     force: bool,
+    provider: Provider,
 ) -> Result<AgentInstallStats> {
     std::fs::create_dir_all(agents_dir)
         .with_context(|| format!("failed to create {}", agents_dir.display()))?;
@@ -71,7 +73,7 @@ fn install_agents_into(
                 path.display()
             );
         }
-        std::fs::write(&path, content)
+        std::fs::write(&path, apply_provider(name, content, provider))
             .with_context(|| format!("failed to write {}", path.display()))?;
         if upgrade {
             stats.upgraded += 1;
@@ -85,17 +87,18 @@ fn install_agents_into(
 }
 
 /// Write all embedded agent configs to `~/.config/opencode/agents/`.
-pub fn run(force: bool) -> Result<()> {
+pub fn run(force: bool, provider: Provider) -> Result<()> {
     let home_dir =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
     let agents_dir = agents_install_dir_from_home(&home_dir);
 
-    let stats = install_agents_into(&agents_dir, crate::AGENTS, force)?;
+    let stats = install_agents_into(&agents_dir, crate::AGENTS, force, provider)?;
 
     println!(
-        "\n{} agents installed to {}",
+        "\n{} agents installed to {} (provider: {})",
         stats.installed + stats.upgraded,
-        agents_dir.display()
+        agents_dir.display(),
+        provider.as_str()
     );
     if stats.upgraded > 0 {
         println!(
@@ -119,6 +122,7 @@ pub fn run(force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::{model_for, parse_agent_frontmatter};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -195,7 +199,7 @@ mod tests {
             ("custom", new_content),
             ("fresh", new_content),
         ];
-        let stats = install_agents_into(&dir, &agents, false).unwrap();
+        let stats = install_agents_into(&dir, &agents, false, Provider::Anthropic).unwrap();
 
         assert_eq!(
             stats,
@@ -219,11 +223,107 @@ mod tests {
         );
 
         // `--force` overwrites everything, counted as plain installs.
-        let stats = install_agents_into(&dir, &agents, true).unwrap();
+        let stats = install_agents_into(&dir, &agents, true, Provider::Anthropic).unwrap();
         assert_eq!(stats.installed, 3);
         assert_eq!(
             std::fs::read_to_string(dir.join("custom.md")).unwrap(),
             new_content
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn anthropic_install_is_byte_identical() {
+        let dir = scratch_dir();
+        install_agents_into(&dir, crate::AGENTS, false, Provider::Anthropic).unwrap();
+        for (name, content) in crate::AGENTS {
+            let written = std::fs::read(dir.join(format!("{name}.md"))).unwrap();
+            assert_eq!(written, content.as_bytes(), "agent '{name}'");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn openai_install_writes_openai_models() {
+        let dir = scratch_dir();
+        install_agents_into(&dir, crate::AGENTS, false, Provider::Openai).unwrap();
+        for (name, _) in crate::AGENTS {
+            let written = std::fs::read_to_string(dir.join(format!("{name}.md"))).unwrap();
+            let model = parse_agent_frontmatter(name, &written).model;
+            assert_eq!(
+                Some(model.as_str()),
+                model_for(name, Provider::Openai),
+                "agent '{name}'"
+            );
+            assert!(model.starts_with("openai/"), "agent '{name}': {model}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mixed_install_splits_providers_by_agent() {
+        let dir = scratch_dir();
+        install_agents_into(&dir, crate::AGENTS, false, Provider::Mixed).unwrap();
+        let model_of = |name: &str| {
+            let written = std::fs::read_to_string(dir.join(format!("{name}.md"))).unwrap();
+            parse_agent_frontmatter(name, &written).model
+        };
+        for name in ["planner", "debugger", "consultant", "orchestrator"] {
+            assert!(model_of(name).starts_with("anthropic/"), "agent '{name}'");
+        }
+        for name in [
+            "builder",
+            "builder-junior",
+            "reviewer",
+            "explorer",
+            "researcher",
+            "docs-writer",
+            "vision",
+        ] {
+            assert!(model_of(name).starts_with("openai/"), "agent '{name}'");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_and_force_logic_unchanged_under_non_default_provider() {
+        let dir = scratch_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("builder.md"), V1).unwrap();
+        let customised = format!("{V2}\nuser edit\n");
+        std::fs::write(dir.join("planner.md"), &customised).unwrap();
+
+        let agents = [
+            ("builder", "---\nmodel: a/b\npermissions: []\n---\nNew.\n"),
+            ("planner", "---\nmodel: a/b\npermissions: []\n---\nNew.\n"),
+            ("vision", "---\nmodel: a/b\npermissions: []\n---\nNew.\n"),
+        ];
+        let stats = install_agents_into(&dir, &agents, false, Provider::Openai).unwrap();
+        assert_eq!(
+            stats,
+            AgentInstallStats {
+                installed: 1,
+                upgraded: 1,
+                skipped: 1
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("planner.md")).unwrap(),
+            customised
+        );
+        let builder = std::fs::read_to_string(dir.join("builder.md")).unwrap();
+        assert_eq!(
+            parse_agent_frontmatter("builder", &builder).model,
+            "openai/gpt-6.1-sol"
+        );
+
+        let stats = install_agents_into(&dir, &agents, true, Provider::Openai).unwrap();
+        assert_eq!(stats.installed, 3);
+        let planner = std::fs::read_to_string(dir.join("planner.md")).unwrap();
+        assert_eq!(
+            parse_agent_frontmatter("planner", &planner).model,
+            "openai/gpt-6-astra"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

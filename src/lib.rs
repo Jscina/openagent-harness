@@ -22,7 +22,7 @@ pub mod agents;
 pub mod dag;
 pub mod types;
 
-pub use agents::AGENTS;
+pub use agents::{AGENTS, Provider};
 pub use dag::DagEngine;
 
 // ─── WASM bindings (wasm32-only) ──────────────────────────────────────────────

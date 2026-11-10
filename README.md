@@ -104,7 +104,7 @@ make wasm
 
 If upgrading from v1:
 
-1. Run `openagent-harness install --force` to overwrite all agent markdown files with v2 frontmatter.
+1. Run `openagent-harness install --force` to overwrite all agent markdown files with v2 frontmatter (optionally with `--provider` to select non-Anthropic models).
 2. Update your `opencode.json`:
    - Rename the `plugin` key to `plugins` (now an array).
    - Rename the `permission` key to `permissions` (object → array of rules).
@@ -127,26 +127,42 @@ If you want to install or refresh embedded agent markdown files manually (instea
 ```sh
 cargo run -- install
 cargo run -- install --force
+cargo run -- install --provider mixed
 openagent-harness install
+openagent-harness install --force --provider openai
 ```
+
+The `--provider` flag selects which provider's models to install:
+
+- `anthropic` (default) — all agents use Anthropic models (Claude family)
+- `openai` — all agents use OpenAI models (GPT family)
+- `mixed` — Anthropic models for planning/orchestration (planner, debugger, consultant, orchestrator), OpenAI models for building/implementation (builder, builder-junior, reviewer, explorer, researcher, docs-writer, vision)
+
+An invalid or missing `--provider` value prints the usage text to stderr and exits with code 1. The embedded `agents/*.md` files in the repository always remain Anthropic; provider rewriting happens only at install time on the copies written to `~/.config/opencode/agents/`.
 
 ## Agent system
 
-The checked-in agent markdown files define model defaults in frontmatter:
+The checked-in agent markdown files define model defaults in frontmatter. At install time, the `--provider` flag can rewrite these models before they are installed to `~/.config/opencode/agents/`:
 
-| Agent | Model |
-| --- | --- |
-| `orchestrator` | `anthropic/claude-sonnet-4-6` |
-| `planner` | `anthropic/claude-sonnet-4-6` |
-| `explorer` | `anthropic/claude-haiku-4-5` |
-| `researcher` | `anthropic/claude-sonnet-4-6` |
-| `vision` | `ollama/qwen2.5-vl-vision:latest` |
-| `builder` | `anthropic/claude-sonnet-4-6` |
-| `builder-junior` | `anthropic/claude-sonnet-4-6` |
-| `reviewer` | `anthropic/claude-sonnet-4-6` |
-| `consultant` | `anthropic/claude-sonnet-4-6` |
-| `debugger` | `anthropic/claude-sonnet-4-6` |
-| `docs-writer` | `anthropic/claude-haiku-4-5` |
+| Agent | Anthropic | OpenAI | Mixed |
+| --- | --- | --- | --- |
+| `orchestrator` | `anthropic/claude-sonnet-5-5` | `openai/gpt-6.1-sol` | `anthropic/claude-sonnet-5-5` |
+| `planner` | `anthropic/claude-opus-5-5` | `openai/gpt-6-astra` | `anthropic/claude-opus-5-5` |
+| `consultant` | `anthropic/claude-opus-5-5` | `openai/gpt-6-astra` | `anthropic/claude-opus-5-5` |
+| `debugger` | `anthropic/claude-opus-5-5` | `openai/gpt-6-astra` | `anthropic/claude-opus-5-5` |
+| `builder` | `anthropic/claude-sonnet-5-5` | `openai/gpt-6.1-sol` | `openai/gpt-6.1-sol` |
+| `builder-junior` | `anthropic/claude-sonnet-5-5` | `openai/gpt-5.4-mini` | `openai/gpt-5.4-mini` |
+| `reviewer` | `anthropic/claude-sonnet-5-5` | `openai/gpt-6.1-sol` | `openai/gpt-6.1-sol` |
+| `explorer` | `anthropic/claude-haiku-5-5` | `openai/gpt-6-luna` | `openai/gpt-6-luna` |
+| `researcher` | `anthropic/claude-haiku-5-5` | `openai/gpt-6.1-terra` | `openai/gpt-6.1-terra` |
+| `docs-writer` | `anthropic/claude-haiku-5-5` | `openai/gpt-6.1-terra` | `openai/gpt-6.1-terra` |
+| `vision` | `anthropic/claude-haiku-4-5` | `openai/gpt-6.1-terra` | `openai/gpt-6.1-terra` |
+
+**Provider modes:**
+
+- **Anthropic** — All agents use Anthropic models (Claude Sonnet 5.5 for orchestration, Opus 5.5 for planning/consulting, Haiku 5.5 for research/exploration). Stable, default choice.
+- **OpenAI** — All agents use OpenAI models (GPT-6.1-sol for orchestration, GPT-6-astra for planning, etc.). Requires OpenAI API access.
+- **Mixed** — Hybrid: Anthropic models for planning agents (orchestrator, planner, debugger, consultant) to ensure robust planning, OpenAI models for implementation agents (builder, builder-junior, reviewer, explorer, researcher, docs-writer, vision) to leverage their speed and specialized capabilities.
 
 The typical delivery flow is: `orchestrator` → `planner` → implementation agents such as `builder` and `docs-writer`, with `reviewer` and `consultant` acting as read-only quality/review agents, and `explorer`, `researcher`, `vision`, `builder-junior`, and `debugger` used as specialized subagents.
 

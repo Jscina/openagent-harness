@@ -49,7 +49,7 @@ After gathering context:
 
 If the fix is small and tightly scoped complete the task yourself
 
-All comments made should be concise and to the point. You do not need to include the card number or pr number in comments.
+No code comments. The only exception is a single-line comment explaining why (never what or how) when the reason is non-obvious. Never add multi-line, doc, banner, or restating comments. Apply the same rule when writing junior specs and reviewing junior output; remove violating comments. Never include card or PR numbers in comments.
 
 Done when:
 
