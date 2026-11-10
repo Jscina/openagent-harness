@@ -1,3 +1,0 @@
-FROM mirage335/Qwen-2_5-VL-7B-Instruct-virtuoso:latest
-PARAMETER num_ctx 16384
-PARAMETER temperature 0.3

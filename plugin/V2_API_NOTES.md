@@ -40,7 +40,7 @@ type Cleanup = () => Promise<void> | void;
 
 - All helpers take `ctx.session` (type `SessionClient`, a `Pick` of the six used methods) instead of a client.
 - `parseModel` is unchanged (`{providerID, modelID}`, no `#` handling). New `toModelRef` converts to the v2 shape and splits `#variant` at the first `#` after the provider slash (same rule as `Model.Ref.parse`); no `#` means no variant.
-- `sendMessage` = `switchAgent` (if agent) -> `switchModel` (if model) -> `prompt({sessionID, text})`. Agent first, because switching agent can reset the model. Sessions are reused across fallback attempts, so the model must be applied per send. These are extra awaited requests but none wait for the turn.
+- `sendMessage` = `switchAgent` (if agent) -> `switchModel` (if model) -> `prompt({sessionID, text})`. Agent first, because switching agent can reset the model. The model is applied per send. These are extra awaited requests but none wait for the turn.
 - `abortSession` -> `interrupt`; returns `true` on any successful request (including `interrupted: false`), `false` on error.
 - `deleteSession` -> `remove`. `createSession` reads `result.id`.
 - `showToast(title, message, variant, duration?)` no longer takes a client and is a logged no-op (`console.info`).
@@ -52,7 +52,7 @@ type Cleanup = () => Promise<void> | void;
 - `session.idle`: `data: { sessionID }`
 - `session.status`: `data: { sessionID, status: {type:"idle"} | {type:"busy"} | {type:"retry", attempt, message, next, action?} }`
 - **There is no `session.error` event.** Failures are `session.execution.failed`: `data: { sessionID, error: { type, message, status?, response?: {body} } }`. Related: `session.execution.succeeded` (`data.sessionID`), `session.execution.interrupted` (`data: { sessionID, reason: "user"|"shutdown"|"superseded"|"inactivity" }`), `session.step.failed` (`data.error`, per step), `session.retry.scheduled` (`data: { sessionID, attempt, at, error }`), `session.deleted` (`data.sessionID`).
-- `error` is a plain structured object (`message`, optional HTTP `status`), not v1's `{ name, data: {message} }`; `classifyError` must be adapted in the harness task.
+- `error` is a plain structured object (`message`, optional HTTP `status`), not v1's `{ name, data: {message} }`; `extractErrorMessage` flattens it to a string.
 
 ## ctx.tool (`dist/promise/tool.d.ts`, `@opencode/schema/dist/tool.d.ts`)
 
@@ -97,13 +97,12 @@ Implemented in core, not in `node_modules`; this section is from `anomalyco/open
 - **Tools** are registered in one `ctx.tool.transform` callback with plain JSON Schema inputs (`plugin/json-schema.ts`: closed objects, required unless `optional()`). `execute` returns `{ content: <string> }`. Agent gating uses `context.agent` (orchestrator: `submit_workflow`/`submit_plan`; planner: `plan_task`/`save_plan`).
 - **Events** (payload in `event.data`; the Rust engine still receives the v1 names):
   - `session.idle` and `session.status` with `status.type === "idle"` -> `process_event("session.idle", sessionID, JSON(data))`. De-duplicated per session: a second idle within 2s with no `busy`/`retry` status in between is dropped (a busy/retry status resets the marker so reused sessions are never swallowed).
-  - `session.execution.failed` -> `process_event("session.error", sessionID, {"sessionID", "error": <string>})`. The error string comes from `extractErrorMessage` in `errors.ts` (`<type|name>: <message> (HTTP <status>)`; also accepts the v1 `{ name, data: { message, statusCode } }` union). The Rust engine reads `payload.error` as a string, so passing a string (v1 passed an object) also fixes the old "unknown error" fallback.
+  - `session.execution.failed` -> `process_event("session.error", sessionID, {"sessionID", "error": <string>})`. The engine marks the task Failed itself (no `fail_task` follow-up). The error string comes from `extractErrorMessage` in `errors.ts` (`<type|name>: <message> (HTTP <status>)`; also accepts the v1 `{ name, data: { message, statusCode } }` union).
   - `session.execution.interrupted` / `succeeded` / `retry.scheduled` are ignored.
   - `orphanedIdleEvents`, `orphanedErrorEvents` and the `cancelledSessions` guard are kept. The guard is applied after the idle de-dupe so the second idle signal of a cancelled session is not buffered as an orphan.
-- **Error classification** (`classifyError`): terminal patterns (`ProviderAuthError`, `ContextOverflowError`, `MessageAbortedError`, content policy/filter, invalid API key, `HTTP 401/403`) are checked before retryable ones. Retryable also matches `HTTP 5xx`.
 - **tool.execute.after** -> `ctx.tool.hook("execute.after", ...)`; forwards `{ tool, callID: event.id, args: event.input, result }` where `result` is the string flattened from `result.content` (string, or joined text parts) falling back to a string `result.output`; no result for `status: "error"`. `tool.execute.before` was an empty no-op and is dropped.
-- **Native dispatch** text now names the `subagent` tool (`agent`, `description`, `prompt`) and tells the orchestrator to read the child id from `<subagent sessionID="ses_..." state="completed">` or `Subagent failed (sessionID: ses_...)`. `agents/orchestrator.md` already described this format. Fallback model for a re-spawned native task can now be passed as the `subagent` tool's `model` input.
-- **Rust/WASM**: untouched (`src/*.rs`, `plugin/wasm/`).
+- **Native dispatch** text now names the `subagent` tool (`agent`, `description`, `prompt`) and tells the orchestrator to read the child id from `<subagent sessionID="ses_..." state="completed">` or `Subagent failed (sessionID: ses_...)`. `agents/orchestrator.md` already described this format.
+- **Rust/WASM**: modified to remove fallback model system; `src/*.rs` contains the simplified DAG engine, and `plugin/wasm/` holds the generated WASM artifacts (committed to the repo).
 
 ## Agent frontmatter and install (v2)
 
@@ -115,8 +114,8 @@ Sources: https://opencode.ai/v2/docs/{agents,permissions,skills}, `@opencode/sch
   - Skill grant: `{ action: skill, resource: <skill-id>, effect: allow }`.
   - Plugin tools (`plan_task`, `save_plan`, `harness_cancel`): `{ action: <tool>, resource: "*", effect: allow }`.
 - The base policy is `* * allow` and the last matching rule wins, so these allow rules are explicit grants, not an allowlist. Planner's `subagent` rules keep the broad deny first, then explorer/researcher/vision allows. A true "only plan_task/save_plan" tool allowlist would need a leading `* * deny`, which was not added because it would also block the read/glob/grep tools the agents use. Verify against a running opencode before tightening.
-- Model: `provider/model[#variant]`. `fallback_models` is harness-specific (not an opencode field), read only by `src/agents.rs`; confirm opencode tolerates the unknown frontmatter key.
-- `parse_agent_frontmatter` reads only column-0 `model:` / `fallback_models:` keys, so the `permissions:` list is ignored. It keeps `#variant` (`#` starts a comment only after whitespace), strips quotes and trailing comments, and accepts flow lists. The plugin's `parseModel` does not split `#variant`; `toModelRef` in `plugin/client.ts` does.
+- Model: `provider/model[#variant]`.
+- `parse_agent_frontmatter` reads only the column-0 `model:` key, so the `permissions:` list is ignored. It keeps `#variant` (`#` starts a comment only after whitespace), strips quotes and trailing comments, and accepts flow lists. The plugin's `parseModel` does not split `#variant`; `toModelRef` in `plugin/client.ts` does.
 - Discovery paths unchanged: `~/.config/opencode/agents/<name>.md` and `~/.config/opencode/skills/<id>/SKILL.md` (project `.opencode/...`; `~/.claude/skills` and `~/.agents/skills` are compatibility sources).
 - Stale v1 agents: `src/install.rs` `is_stale_v1_agent` (top-level `permission:` key in frontmatter) makes `install` overwrite an existing file without `--force`. The plugin-side equivalent is `isStaleV1Agent` / `installAgentsInto` in `plugin/agent-install.ts` (used by `installAgentsIfNeeded`): same column-0 frontmatter rule, overwrites with a log line.
 - Body references: the `task` tool is now `subagent`; the child session id is the `sessionID` attribute of `<subagent sessionID="..." state="completed">`, not a `task_id:` prefix.
